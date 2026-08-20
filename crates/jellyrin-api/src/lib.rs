@@ -25078,8 +25078,9 @@ async fn invoke_plugin_vod_provider_action(
 /// path and its metadata only carry the opaque provider reference, so every stream asks the
 /// provider plugin for a fresh signed URL through a one-shot grant on the `provider-secret`
 /// lane. The signed URL is never logged or persisted: it returns as a `SensitiveUrl` that only
-/// the internal proxy may expose. VOD playback is limited to direct-proxy MPEG-TS delivery (no
-/// HLS remux); callers must enforce `opaque_live_tv_delivery_is_safe_for_direct_proxy`.
+/// the internal proxy may expose. The provider contract remains direct-proxy MPEG-TS; Jellyrin may
+/// feed those bytes to FFmpeg through its unguessable loopback relay when a browser requires HLS.
+/// Callers must enforce `opaque_live_tv_delivery_is_safe_for_direct_proxy` before either path.
 async fn resolve_plugin_vod_playback(
     db: &Database,
     plugin_id: &str,
@@ -25960,6 +25961,31 @@ async fn send_sensitive_remote_live_request_with_proxy(
     configured_proxy: Option<&str>,
     header_timeout: StdDuration,
 ) -> Result<reqwest::Response, ApiError> {
+    send_sensitive_remote_request_with_proxy(
+        source_url,
+        requires_provider_egress,
+        configured_proxy,
+        header_timeout,
+        None,
+        true,
+        None,
+    )
+    .await
+}
+
+/// Opens one provider URL through the SSRF-filtered direct path or the explicitly configured
+/// provider-egress boundary. Only byte-seeking validators may cross from the client-facing
+/// request, and callers opt into those headers explicitly; opaque live streams continue to fetch
+/// from byte zero so their manifest guard cannot be bypassed.
+async fn send_sensitive_remote_request_with_proxy(
+    source_url: &str,
+    requires_provider_egress: bool,
+    configured_proxy: Option<&str>,
+    header_timeout: StdDuration,
+    request_headers: Option<&HeaderMap>,
+    include_body: bool,
+    range_override: Option<&str>,
+) -> Result<reqwest::Response, ApiError> {
     let open = async {
         let mut target = validated_remote_media_url(source_url)?;
         for redirect_count in 0..=SENSITIVE_REMOTE_LIVE_MAX_REDIRECTS {
@@ -25976,22 +26002,36 @@ async fn send_sensitive_remote_live_request_with_proxy(
                 // This client disables environment proxies and pins every allowed origin address.
                 validated_remote_media_client(target.as_str()).await?
             };
-            // Opaque live sources are non-seekable. Always fetch from byte zero so the manifest
-            // guard cannot be bypassed with a partial Range request that starts after `#EXTM3U`.
-            let response = client
-                .get(url.clone())
-                .header(header::ACCEPT_ENCODING, "identity")
-                .send()
-                .await
-                .map_err(|error| {
-                    tracing::warn!(
-                        timeout = error.is_timeout(),
-                        connect = error.is_connect(),
-                        provider_egress = requires_provider_egress,
-                        "opaque Live TV direct proxy request failed"
-                    );
-                    ApiError::service_unavailable("Live TV provider source is unavailable")
-                })?;
+            let mut request = if include_body {
+                client.get(url.clone())
+            } else {
+                client.head(url.clone())
+            };
+            request = request.header(header::ACCEPT_ENCODING, "identity");
+            if let Some(request_headers) = request_headers {
+                for name in [header::RANGE, header::IF_RANGE, header::IF_NONE_MATCH] {
+                    if name == header::RANGE
+                        && let Some(range) = range_override
+                    {
+                        request = request.header(header::RANGE, range);
+                        continue;
+                    }
+                    if let Some(value) = request_headers.get(&name) {
+                        request = request.header(name, value);
+                    }
+                }
+            }
+            let response = request.send().await.map_err(|error| {
+                // reqwest errors contain their URL. Never include the error itself because these
+                // URLs carry short-lived provider authorization in their path or query.
+                tracing::warn!(
+                    timeout = error.is_timeout(),
+                    connect = error.is_connect(),
+                    provider_egress = requires_provider_egress,
+                    "sensitive provider proxy request failed"
+                );
+                ApiError::service_unavailable("provider source is unavailable")
+            })?;
             if !matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
                 return Ok(response);
             }
@@ -26022,10 +26062,30 @@ async fn send_sensitive_remote_live_request_with_proxy(
             tracing::warn!(
                 timeout = true,
                 provider_egress = requires_provider_egress,
-                "opaque Live TV direct proxy request timed out before response headers"
+                "sensitive provider proxy request timed out before response headers"
             );
-            ApiError::service_unavailable("Live TV provider source timed out")
+            ApiError::service_unavailable("provider source timed out")
         })?
+}
+
+async fn send_sensitive_remote_vod_request_with_proxy(
+    source_url: &str,
+    requires_provider_egress: bool,
+    configured_proxy: Option<&str>,
+    request_headers: &HeaderMap,
+    include_body: bool,
+    range_override: Option<&str>,
+) -> Result<reqwest::Response, ApiError> {
+    send_sensitive_remote_request_with_proxy(
+        source_url,
+        requires_provider_egress,
+        configured_proxy,
+        LIVE_TV_REMOTE_CONTROL_TIMEOUT,
+        Some(request_headers),
+        include_body,
+        range_override,
+    )
+    .await
 }
 
 async fn stream_sensitive_remote_live(
@@ -37981,7 +38041,7 @@ async fn playback_transcode_info_response(
     let disk_reservation = reserve_transcode_disk_capacity().await?;
     let layout = HlsTranscodeLayout::new(transcode_temp_root(), &play_session_id);
     tokio::fs::create_dir_all(&layout.session_dir).await?;
-    let input_relay = if is_xtream_remote_media(metadata) {
+    let input_relay = if is_xtream_remote_media(metadata) || is_plugin_vod_remote_media(metadata) {
         Some(register_internal_remote_relay(
             state,
             InternalRemoteRelayTarget::MediaItem(item.id),
@@ -38003,7 +38063,13 @@ async fn playback_transcode_info_response(
     // resume. The HLS command's bounded interleave window prevents a sparse text track from holding
     // back A/V segments. Other languages remain independent renditions and are extracted only when
     // the user switches to them.
-    let ffmpeg_selection = selection.clone();
+    let mut ffmpeg_selection = selection.clone();
+    if is_plugin_vod_remote_media(metadata) {
+        // Plugin VOD subtitles are separate, JIT-resolved resources rather than streams in the
+        // provider's MPEG-TS payload. Keep the public selection on the transcode session (and in
+        // PlaybackInfo), but never ask FFmpeg to map that public index from the media input.
+        ffmpeg_selection.subtitle_stream_index = Some(-1);
+    }
     let mut request = HlsTranscodeRequest::new(
         input_path,
         layout.media_playlist_path.to_string_lossy().to_string(),
@@ -38017,7 +38083,7 @@ async fn playback_transcode_info_response(
     request.video_mode = decision.video;
     request.audio_mode = decision.audio;
     apply_playback_output_constraints(&mut request, decision.output);
-    if is_xtream_remote_media(metadata) {
+    if is_xtream_remote_media(metadata) || is_plugin_vod_remote_media(metadata) {
         let (readrate_percent, initial_burst_seconds) = remote_vod_readrate();
         request.input_readrate_percent = readrate_percent;
         request.input_readrate_initial_burst_seconds = initial_burst_seconds;
@@ -41146,27 +41212,11 @@ fn playback_delivery_decision_with_ffmpeg_mode(
 ) -> TranscodeDecision {
     let plugin_vod_remote = is_plugin_vod_remote_media(metadata);
     let is_remote = is_xtream_remote_media(metadata) || plugin_vod_remote;
-    // A plugin-VOD source is an opaque, short-lived URL which may only enter the sensitive byte
-    // proxy. It cannot be handed to a local/direct-file path or an unprepared FFmpeg pipeline.
-    // The provider has already constrained the container to MPEG-TS; advertise that exact proxy
-    // whenever the client permits direct delivery, otherwise fail closed.
-    if plugin_vod_remote {
-        return TranscodeDecision {
-            delivery: if options.enable_direct_stream {
-                DeliveryMode::DirectProxy
-            } else {
-                DeliveryMode::Unsupported
-            },
-            video: if item.media_type == "Video" {
-                HlsStreamMode::Copy
-            } else {
-                HlsStreamMode::Drop
-            },
-            audio: HlsStreamMode::Copy,
-            reasons: Vec::new(),
-            output: PlaybackOutputConstraints::default(),
-        };
-    }
+    // Plugin-VOD sources use the same compatibility decision as other remote media. A native
+    // client whose profile accepts MPEG-TS may keep the cheap direct proxy. Browsers normally do
+    // not advertise TS direct play, so they fall through to the existing HLS remux/transcode
+    // planner. The signed provider URL still never enters this decision or an FFmpeg argv: the
+    // transcode input is an unguessable loopback relay registered below.
     let selected_audio_needs_transcode = selected_audio_stream_needs_transcode(item, options);
     let selected_subtitle_requires_processing = options
         .subtitle_stream_index
@@ -42452,6 +42502,7 @@ async fn hls_media_playlist_response_for(
     let readiness_timeout = if is_live_tv_channel_id(item_id)
         || burns_image_subtitle
         || is_xtream_virtual_item(&session.item)
+        || is_plugin_vod_virtual_item(&session.item)
     {
         std::time::Duration::from_secs(LIVE_HLS_READINESS_TIMEOUT_SECS)
     } else {
@@ -42717,7 +42768,7 @@ async fn generate_missing_hls_segment(
     request.audio_mode = audio_mode;
     let output = playback_output_constraints_from_dedupe_key(session.dedupe_key.as_deref());
     apply_playback_output_constraints(&mut request, output);
-    if is_xtream_virtual_item(&session.item) {
+    if is_xtream_virtual_item(&session.item) || is_plugin_vod_virtual_item(&session.item) {
         let (readrate_percent, initial_burst_seconds) = remote_vod_readrate();
         request.input_readrate_percent = readrate_percent;
         request.input_readrate_initial_burst_seconds = initial_burst_seconds;
@@ -44836,7 +44887,12 @@ pub(crate) async fn subtitle_stream_response(
     } else {
         None
     };
-    let output = if requested_format == "vtt"
+    // Plugin VOD subtitles are JIT-resolved external resources and are never mapped into the
+    // FFmpeg input. Prefer that authoritative output even when the request carries an HLS play
+    // session; an empty placeholder VTT file from the A/V-only remux must not shadow it.
+    let output = if let Some(output) = plugin_vod_output {
+        output
+    } else if requested_format == "vtt"
         && let Some(output) =
             subtitle_output_from_transcode_vtt_segment(state, &query, index, start_position_ticks)
                 .await?
@@ -44846,8 +44902,6 @@ pub(crate) async fn subtitle_stream_response(
         && let Some(output) =
             subtitle_output_from_transcode_vtt_segments(state, &query, index).await?
     {
-        output
-    } else if let Some(output) = plugin_vod_output {
         output
     } else if let Some(path) = stream
         .as_ref()
@@ -46335,6 +46389,22 @@ pub(crate) async fn stream_resolved_media_item(
             .ok_or_else(|| {
                 ApiError::service_unavailable("VOD provider playback route is unavailable")
             })?;
+        return stream_plugin_vod_media(state, &reference, headers, include_body).await;
+    }
+
+    stream_media_item(item, headers, include_body).await
+}
+
+/// Resolves and proxies one opaque plugin-VOD source. A CDN authorization rejection gets exactly
+/// one fresh `ResolvePlayback` invocation and one retry. The retry carries the same byte-range
+/// validators, while neither signed URL is persisted, returned, or included in diagnostics.
+async fn stream_plugin_vod_media(
+    state: &AppState,
+    reference: &PluginVodRemoteReference,
+    headers: &HeaderMap,
+    include_body: bool,
+) -> Result<axum::response::Response, ApiError> {
+    for attempt in 0..2 {
         let playback = resolve_plugin_vod_playback(
             &state.db,
             &reference.plugin_id,
@@ -46342,28 +46412,169 @@ pub(crate) async fn stream_resolved_media_item(
             &reference.provider_reference,
         )
         .await?;
-        // Plugin-VOD playback is limited to direct-proxy MPEG-TS delivery: there is no HLS
-        // remux or transcode path for signed provider URLs, so any other delivery contract
-        // fails closed instead of leaking the URL into an unsupported pipeline.
         if !opaque_live_tv_delivery_is_safe_for_direct_proxy(&playback) {
             return Err(ApiError::service_unavailable(
                 "VOD provider did not authorize a safe direct stream",
             ));
         }
-        let mut response = stream_sensitive_remote_live(
-            playback.source_url,
-            headers,
+        let configured_proxy = if playback.delivery.requires_provider_egress {
+            Some(
+                std::env::var("JELLYRIN_PROVIDER_EGRESS_PROXY").map_err(|_| {
+                    ApiError::service_unavailable("VOD provider egress proxy is not configured")
+                })?,
+            )
+        } else {
+            None
+        };
+        let mut upstream = send_sensitive_remote_vod_request_with_proxy(
+            playback.source_url.expose_secret(),
             playback.delivery.requires_provider_egress,
+            configured_proxy.as_deref(),
+            headers,
+            include_body,
             None,
         )
         .await?;
-        if !include_body {
-            *response.body_mut() = Body::empty();
+        if !include_body
+            && matches!(
+                upstream.status(),
+                reqwest::StatusCode::METHOD_NOT_ALLOWED | reqwest::StatusCode::NOT_IMPLEMENTED
+            )
+        {
+            // Some media CDNs reject HEAD while supporting byte ranges. Probe one byte, but keep
+            // the client response bodyless as required by the original HEAD request.
+            upstream = send_sensitive_remote_vod_request_with_proxy(
+                playback.source_url.expose_secret(),
+                playback.delivery.requires_provider_egress,
+                configured_proxy.as_deref(),
+                headers,
+                true,
+                Some("bytes=0-0"),
+            )
+            .await?;
         }
-        return Ok(response);
+        if matches!(
+            upstream.status(),
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ) && attempt == 0
+        {
+            // Dropping both the response and playback value zeroizes the rejected sensitive URL
+            // before asking the provider for a replacement.
+            continue;
+        }
+        return plugin_vod_upstream_response(upstream, headers, include_body).await;
+    }
+    Err(ApiError::service_unavailable(
+        "VOD provider authorization was rejected",
+    ))
+}
+
+async fn plugin_vod_upstream_response(
+    mut upstream: reqwest::Response,
+    request_headers: &HeaderMap,
+    include_body: bool,
+) -> Result<axum::response::Response, ApiError> {
+    let status = StatusCode::from_u16(upstream.status().as_u16())
+        .map_err(|_| ApiError::service_unavailable("invalid VOD provider response"))?;
+    if !status.is_success()
+        && status != StatusCode::NOT_MODIFIED
+        && status != StatusCode::RANGE_NOT_SATISFIABLE
+    {
+        tracing::warn!(%status, "VOD provider source rejected the request");
+        return Err(ApiError::service_unavailable(
+            "VOD provider source is unavailable",
+        ));
+    }
+    if upstream
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(is_hls_manifest_content_type)
+    {
+        return Err(ApiError::service_unavailable(
+            "VOD provider returned an unsupported manifest",
+        ));
     }
 
-    stream_media_item(item, headers, include_body).await
+    let mut response_headers = HeaderMap::new();
+    for name in [
+        header::CONTENT_TYPE,
+        header::CONTENT_LENGTH,
+        header::CONTENT_RANGE,
+        header::ACCEPT_RANGES,
+        header::ETAG,
+        header::LAST_MODIFIED,
+        header::CACHE_CONTROL,
+    ] {
+        if let Some(value) = upstream.headers().get(&name) {
+            response_headers.insert(name, value.clone());
+        }
+    }
+    if !response_headers.contains_key(header::CONTENT_TYPE) {
+        response_headers.insert(
+            header::CONTENT_TYPE,
+            "video/mp2t".parse().expect("static content type is valid"),
+        );
+    }
+
+    let body = if include_body
+        && status != StatusCode::NOT_MODIFIED
+        && status != StatusCode::RANGE_NOT_SATISFIABLE
+    {
+        use futures_util::StreamExt as _;
+
+        // A full response (or a range beginning at byte zero) can be classified before streaming
+        // so a provider cannot turn its signed URL into an HLS-manifest oracle. Non-zero ranges
+        // are safe byte delivery under the already validated MPEG-TS provider contract.
+        let range_starts_at_zero = request_headers
+            .get(header::RANGE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.trim_start().starts_with("bytes=0-"));
+        let classify_prefix = status == StatusCode::OK || range_starts_at_zero;
+        if classify_prefix {
+            let first_byte_deadline =
+                tokio::time::Instant::now() + LIVE_TV_REMOTE_FIRST_BYTE_TIMEOUT;
+            let mut prefix = bytes::BytesMut::new();
+            let mut reached_eof = false;
+            while hls_manifest_prefix_classification(&prefix).is_none() && prefix.len() < 64 {
+                let chunk = tokio::time::timeout_at(first_byte_deadline, upstream.chunk())
+                    .await
+                    .map_err(|_| ApiError::service_unavailable("VOD provider source timed out"))?
+                    .map_err(|_| {
+                        ApiError::service_unavailable("VOD provider stream interrupted")
+                    })?;
+                let Some(chunk) = chunk else {
+                    reached_eof = true;
+                    break;
+                };
+                prefix.extend_from_slice(&chunk);
+            }
+            let classification = hls_manifest_prefix_classification(&prefix);
+            if classification == Some(true)
+                || (classification.is_none() && !reached_eof && prefix.len() >= 64)
+            {
+                return Err(ApiError::service_unavailable(
+                    "VOD provider returned an unsupported manifest",
+                ));
+            }
+            let first = futures_util::stream::iter(
+                (!prefix.is_empty()).then(|| Ok::<Bytes, std::io::Error>(prefix.freeze())),
+            );
+            let remaining = live_tv_chunk_idle_timeout_stream(
+                upstream.bytes_stream(),
+                LIVE_TV_REMOTE_CHUNK_IDLE_TIMEOUT,
+            );
+            Body::from_stream(first.chain(remaining))
+        } else {
+            Body::from_stream(live_tv_chunk_idle_timeout_stream(
+                upstream.bytes_stream(),
+                LIVE_TV_REMOTE_CHUNK_IDLE_TIMEOUT,
+            ))
+        }
+    } else {
+        Body::empty()
+    };
+    Ok((status, response_headers, body).into_response())
 }
 
 async fn internal_remote_media_get(
@@ -55997,7 +56208,7 @@ pub(crate) async fn media_process_input(
     item: &MediaItem,
     relay_ttl: StdDuration,
 ) -> Result<MediaProcessInput, ApiError> {
-    if !is_xtream_virtual_item(item) {
+    if !is_xtream_virtual_item(item) && !is_plugin_vod_virtual_item(item) {
         return Ok(MediaProcessInput {
             path: item.path.clone(),
             _relay: None,
@@ -56007,7 +56218,7 @@ pub(crate) async fn media_process_input(
     let metadata = metadata_by_item
         .get(&item.id)
         .ok_or_else(|| ApiError::service_unavailable("remote media metadata unavailable"))?;
-    if !is_xtream_remote_media(Some(metadata)) {
+    if !is_xtream_remote_media(Some(metadata)) && !is_plugin_vod_remote_media(Some(metadata)) {
         return Err(ApiError::service_unavailable(
             "remote media reference unavailable",
         ));
@@ -62569,6 +62780,240 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     #[serial(plugin_host)]
+    async fn plugin_vod_web_profile_serves_real_hls_with_selected_tracks() {
+        let plugin_id = "66666666-7777-4888-9999-000000000021";
+        let (db, tmp, api_key, movie_id) = prepare_vod_playback_environment(plugin_id).await;
+        let ts_path = tmp.path().join("web-hls-input.ts");
+        generate_plugin_vod_hls_fixture(&ts_path).await;
+        let (upstream_base, upstream_requests, upstream_connections) =
+            start_expired_then_ts_upstream(tokio::fs::read(&ts_path).await.unwrap()).await;
+        let (subtitle_base, _) =
+            start_fixed_ts_upstream(b"1\n00:00:01,000 --> 00:00:03,000\nHola HLS\n\n".to_vec())
+                .await;
+        let signed_url = format!("{upstream_base}/vod/web.ts?signature=signed-vod-secret");
+        let signed_subtitle_url =
+            format!("{subtitle_base}/vod/web.srt?signature=signed-subtitle-secret");
+        tokio::fs::write(tmp.path().join("vod-source-url"), &signed_url)
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("vod-subtitle-url"), &signed_subtitle_url)
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("vod-delivery-mode"), "mpegts")
+            .await
+            .unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = router(AppState {
+            db: db.clone(),
+            web_dir: ".".into(),
+            log_dir: tmp.path().join("logs"),
+            local_address: format!("http://{address}"),
+        });
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let base = format!("http://{address}");
+        let client = reqwest::Client::new();
+        let web_profile = json!({
+            "EnableDirectPlay": true,
+            "EnableDirectStream": true,
+            "EnableTranscoding": true,
+            "AudioStreamIndex": 2,
+            "SubtitleStreamIndex": 3,
+            "DeviceProfile": {
+                "DirectPlayProfiles": [{
+                    "Type": "Video",
+                    "Container": "mp4",
+                    "VideoCodec": "h264",
+                    "AudioCodec": "aac"
+                }],
+                "TranscodingProfiles": [{
+                    "Type": "Video",
+                    "Context": "Streaming",
+                    "Protocol": "hls",
+                    "Container": "ts",
+                    "VideoCodec": "h264",
+                    "AudioCodec": "aac"
+                }],
+                "SubtitleProfiles": [{ "Format": "vtt", "Method": "External" }]
+            }
+        });
+        let response = client
+            .post(format!("{base}/Items/{}/PlaybackInfo", movie_id.simple()))
+            .header("X-Emby-Token", &api_key)
+            .header(header::CONTENT_TYPE.as_str(), "application/json")
+            .body(web_profile.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.bytes().await.unwrap();
+        let body_text = String::from_utf8_lossy(&body);
+        for secret in [
+            "signed-vod-secret",
+            "signed-subtitle-secret",
+            "vod-user",
+            "vod-pass",
+            "vod-canary-token-0123456789",
+        ] {
+            assert!(!body_text.contains(secret), "{body_text}");
+        }
+        let playback: Value = serde_json::from_slice(&body).unwrap();
+        let source = &playback["MediaSources"][0];
+        assert_eq!(source["SupportsDirectPlay"], false);
+        assert_eq!(source["SupportsTranscoding"], true);
+        assert!(source.get("DirectStreamUrl").is_none());
+        assert_eq!(source["TranscodingSubProtocol"], "hls");
+        assert_eq!(source["DefaultAudioStreamIndex"], 2);
+        assert_eq!(source["DefaultSubtitleStreamIndex"], 3);
+        assert_eq!(source["MediaStreams"][2]["Language"], "eng");
+        assert_eq!(source["MediaStreams"][3]["Language"], "spa");
+        assert_eq!(source["MediaStreams"][3]["DeliveryMethod"], "External");
+        let subtitle_url = source["MediaStreams"][3]["DeliveryUrl"].as_str().unwrap();
+        assert!(subtitle_url.starts_with("/Videos/"));
+        assert!(!subtitle_url.contains("signed"));
+
+        let transcode_url = source["TranscodingUrl"].as_str().unwrap();
+        assert!(transcode_url.starts_with("/Videos/"));
+        assert!(!transcode_url.contains("signed"));
+        let master = client
+            .get(format!("{base}{transcode_url}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(master.status(), StatusCode::OK);
+        assert_eq!(
+            master
+                .headers()
+                .get(header::CONTENT_TYPE.as_str())
+                .and_then(|value| value.to_str().ok()),
+            Some("application/vnd.apple.mpegurl")
+        );
+        let master = master.text().await.unwrap();
+        assert!(master.starts_with("#EXTM3U\n"), "{master}");
+        assert!(!master.contains("signed-vod-secret"));
+        let media_url = master
+            .lines()
+            .find(|line| !line.is_empty() && !line.starts_with('#'))
+            .expect("HLS master did not contain a media playlist");
+        let media_url = if media_url.starts_with('/') {
+            format!("{base}{media_url}")
+        } else {
+            format!("{base}/Videos/{}/{media_url}", movie_id.simple())
+        };
+        let media = client.get(&media_url).send().await.unwrap();
+        assert_eq!(media.status(), StatusCode::OK);
+        let media = media.text().await.unwrap();
+        assert!(media.starts_with("#EXTM3U\n"), "{media}");
+        assert!(!media.contains("signed-vod-secret"));
+        let segment_url = media
+            .lines()
+            .find(|line| !line.is_empty() && !line.starts_with('#'))
+            .expect("HLS media playlist did not contain a segment");
+        let segment_url = if segment_url.starts_with('/') {
+            format!("{base}{segment_url}")
+        } else {
+            format!("{base}/Videos/{}/{segment_url}", movie_id.simple())
+        };
+        let segment = client.get(segment_url).send().await.unwrap();
+        assert_eq!(segment.status(), StatusCode::OK);
+        assert_eq!(
+            segment
+                .headers()
+                .get(header::CONTENT_TYPE.as_str())
+                .and_then(|value| value.to_str().ok()),
+            Some("video/mp2t")
+        );
+        let segment = segment.bytes().await.unwrap();
+        assert!(segment.len() >= 188);
+        assert_eq!(segment[0], 0x47);
+        assert!(
+            upstream_connections.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "HLS relay did not retry the expired provider authorization"
+        );
+        {
+            let upstream_requests = upstream_requests.lock().unwrap();
+            assert!(upstream_requests.len() >= 2);
+            assert!(upstream_requests.iter().all(|request| {
+                !request.contains("vod-user")
+                    && !request.contains("vod-pass")
+                    && !request.contains("vod-canary-token-0123456789")
+            }));
+        }
+
+        let subtitle = client
+            .get(format!("{base}{subtitle_url}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(subtitle.status(), StatusCode::OK);
+        let subtitle = subtitle.text().await.unwrap();
+        assert!(subtitle.starts_with("WEBVTT"), "{subtitle}");
+        assert!(subtitle.contains("Hola HLS"), "{subtitle}");
+
+        let sessions = db.transcode_sessions().await.unwrap();
+        let session = sessions
+            .iter()
+            .find(|session| session.item.id == movie_id)
+            .expect("plugin VOD HLS session was not persisted");
+        assert_eq!(session.audio_stream_index, Some(2));
+        assert_eq!(session.subtitle_stream_index, Some(3));
+        let persisted_session = serde_json::to_string(&json!({
+            "DedupeKey": session.dedupe_key,
+            "OutputPath": session.output_path,
+            "MediaSourceId": session.media_source_id,
+        }))
+        .unwrap();
+        assert!(!persisted_session.contains("signed-vod-secret"));
+        assert!(!persisted_session.contains(&upstream_base));
+
+        let invokes = tokio::fs::read_to_string(tmp.path().join("external-invokes"))
+            .await
+            .unwrap();
+        let resolve_playback_count = invokes
+            .lines()
+            .filter(|line| line.contains("\"Action\":\"ResolvePlayback\""))
+            .count();
+        assert!(
+            resolve_playback_count >= 3,
+            "PlaybackInfo plus the HLS relay retry must re-resolve playback"
+        );
+        assert!(!invokes.contains("signed-vod-secret"));
+
+        tokio::time::timeout(StdDuration::from_secs(15), async {
+            loop {
+                let terminal = db
+                    .transcode_sessions()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .find(|session| session.item.id == movie_id)
+                    .is_some_and(|session| {
+                        matches!(session.status.as_str(), "completed" | "failed")
+                    });
+                if terminal {
+                    break;
+                }
+                tokio::time::sleep(StdDuration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("plugin VOD HLS process did not terminate after the finite fixture");
+
+        server.abort();
+        super::stop_external_plugin_host(plugin_id).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial(plugin_host)]
     async fn vod_library_import_chains_after_plugin_tuner_channel_import() {
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let user = db
@@ -62890,6 +63335,179 @@ mod tests {
     }
 
     #[cfg(unix)]
+    async fn start_expired_then_ts_upstream(
+        payload: Vec<u8>,
+    ) -> (
+        String,
+        Arc<std::sync::Mutex<Vec<String>>>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::sync::atomic::Ordering;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let captured = requests.clone();
+        let counter = connections.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let attempt = counter.fetch_add(1, Ordering::SeqCst);
+                let payload = payload.clone();
+                let captured = captured.clone();
+                tokio::spawn(async move {
+                    let mut buffer = Vec::new();
+                    let mut scratch = [0_u8; 1024];
+                    loop {
+                        let Ok(read) = stream.read(&mut scratch).await else {
+                            return;
+                        };
+                        if read == 0 {
+                            return;
+                        }
+                        buffer.extend_from_slice(&scratch[..read]);
+                        if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    captured
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&buffer).to_string());
+                    if attempt == 0 {
+                        let _ = stream
+                            .write_all(
+                                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            )
+                            .await;
+                        return;
+                    }
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nETag: \"fresh-etag\"\r\nConnection: close\r\n\r\n",
+                        payload.len()
+                    );
+                    if stream.write_all(response.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    let _ = stream.write_all(&payload).await;
+                });
+            }
+        });
+        (format!("http://{addr}"), requests, connections)
+    }
+
+    #[cfg(unix)]
+    async fn start_expired_then_range_upstream(
+        payload: Vec<u8>,
+    ) -> (String, tokio::sync::oneshot::Receiver<Vec<String>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (requests_tx, requests_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buffer = Vec::new();
+                let mut scratch = [0_u8; 1024];
+                loop {
+                    let read = stream.read(&mut scratch).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    buffer.extend_from_slice(&scratch[..read]);
+                    if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                requests.push(String::from_utf8_lossy(&buffer).to_string());
+                if attempt == 0 {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                } else {
+                    let response = format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp2t\r\nContent-Length: {}\r\nContent-Range: bytes 188-375/752\r\nAccept-Ranges: bytes\r\nETag: \"fresh-etag\"\r\nCache-Control: private, max-age=30\r\nConnection: close\r\n\r\n",
+                        payload.len()
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                    stream.write_all(&payload).await.unwrap();
+                }
+            }
+            let _ = requests_tx.send(requests);
+        });
+        (format!("http://{addr}"), requests_rx)
+    }
+
+    #[cfg(unix)]
+    async fn generate_plugin_vod_hls_fixture(path: &std::path::Path) {
+        // The production Jellyrin binary may intentionally be a copy/remux-only FFmpeg build.
+        // Prefer the distribution binary for generating this synthetic fixture, then exercise
+        // the configured production binary against the resulting H264/AAC MPEG-TS input.
+        let fixture_ffmpeg = if std::path::Path::new("/usr/bin/ffmpeg").is_file() {
+            "/usr/bin/ffmpeg"
+        } else {
+            "ffmpeg"
+        };
+        let output = tokio::process::Command::new(fixture_ffmpeg)
+            .args([
+                "-hide_banner",
+                "-nostdin",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=160x90:rate=24",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=48000",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=880:sample_rate=48000",
+                "-t",
+                "5",
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-map",
+                "2:a:0",
+                "-metadata:s:a:0",
+                "language=spa",
+                "-metadata:s:a:1",
+                "language=eng",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-pix_fmt",
+                "yuv420p",
+                "-g",
+                "24",
+                "-c:a",
+                "aac",
+                "-f",
+                "mpegts",
+            ])
+            .arg(path)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "ffmpeg failed to create plugin VOD HLS fixture: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
     async fn install_active_vod_playback_plugin(
         db: &Database,
         root: &std::path::Path,
@@ -63128,6 +63746,90 @@ mod tests {
             resolve["Payload"]["Arguments"]["SecretGrant"]["TunerId"],
             "vod-tuner"
         );
+        super::stop_external_plugin_host(plugin_id).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial(plugin_host)]
+    async fn plugin_vod_proxy_re_resolves_once_and_preserves_range_validators() {
+        let plugin_id = "66666666-7777-4888-9999-000000000022";
+        let payload = vec![0x47_u8; 188];
+        let (upstream_base, upstream_requests) =
+            start_expired_then_range_upstream(payload.clone()).await;
+        let (db, tmp, api_key, movie_id) = prepare_vod_playback_environment(plugin_id).await;
+        let signed_url = format!("{upstream_base}/vod/range.ts?signature=range-secret");
+        tokio::fs::write(tmp.path().join("vod-source-url"), &signed_url)
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("vod-delivery-mode"), "mpegts")
+            .await
+            .unwrap();
+
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: tmp.path().join("logs"),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Videos/{}/stream.ts", movie_id.simple()))
+                    .header("X-Emby-Token", &api_key)
+                    .header(header::RANGE, "bytes=188-375")
+                    .header(header::IF_RANGE, "\"old-etag\"")
+                    .header(header::IF_NONE_MATCH, "\"cached-etag\"")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_RANGE)
+                .and_then(|value| value.to_str().ok()),
+            Some("bytes 188-375/752")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ETAG)
+                .and_then(|value| value.to_str().ok()),
+            Some("\"fresh-etag\"")
+        );
+        for value in response.headers().values() {
+            let value = value.to_str().unwrap_or_default();
+            assert!(!value.contains("range-secret"));
+            assert!(!value.contains("vod-canary-token-0123456789"));
+        }
+        let response_body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(response_body.as_ref(), payload.as_slice());
+
+        let requests = upstream_requests.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in requests {
+            let request = request.to_ascii_lowercase();
+            assert!(request.contains("range: bytes=188-375\r\n"), "{request}");
+            assert!(request.contains("if-range: \"old-etag\"\r\n"), "{request}");
+            assert!(
+                request.contains("if-none-match: \"cached-etag\"\r\n"),
+                "{request}"
+            );
+        }
+        let invokes = tokio::fs::read_to_string(tmp.path().join("external-invokes"))
+            .await
+            .unwrap();
+        assert_eq!(
+            invokes
+                .lines()
+                .filter(|line| line.contains("\"Action\":\"ResolvePlayback\""))
+                .count(),
+            2
+        );
+        assert!(!invokes.contains("range-secret"));
         super::stop_external_plugin_host(plugin_id).await;
     }
 
@@ -102720,6 +103422,72 @@ done
                 ]
             }
         })
+    }
+
+    #[test]
+    fn plugin_vod_uses_web_hls_but_keeps_native_mpegts_direct_proxy() {
+        let mut item = playback_profile_test_item();
+        item.path = "plugin-vod://movies/provider-item/stream.ts".to_string();
+        item.media_streams = vec![
+            json!({ "Type": "Video", "Index": 0, "Codec": "h264" }),
+            json!({ "Type": "Audio", "Index": 1, "Codec": "aac", "Language": "spa", "IsDefault": true }),
+        ];
+        let metadata = json!({
+            "Provider": "plugin:66666666-7777-4888-9999-000000000099",
+            "TunerId": "vod-tuner",
+            "ProviderReference": "provider:v1:movie-1"
+        });
+        let web = playback_info_options_from_body(&json!({
+            "EnableDirectPlay": true,
+            "EnableDirectStream": true,
+            "EnableTranscoding": true,
+            "DeviceProfile": {
+                "DirectPlayProfiles": [{
+                    "Type": "Video",
+                    "Container": "mp4",
+                    "VideoCodec": "h264",
+                    "AudioCodec": "aac"
+                }],
+                "TranscodingProfiles": [{
+                    "Type": "Video",
+                    "Context": "Streaming",
+                    "Protocol": "hls",
+                    "Container": "ts",
+                    "VideoCodec": "h264",
+                    "AudioCodec": "aac"
+                }]
+            }
+        }));
+        let web_decision = playback_delivery_decision_with_ffmpeg_mode(
+            &item,
+            Some(&metadata),
+            &web,
+            FfmpegMode::Enabled,
+        );
+        assert_eq!(web_decision.delivery, DeliveryMode::HlsRemux);
+        assert_eq!(web_decision.video, HlsStreamMode::Copy);
+        assert_eq!(web_decision.audio, HlsStreamMode::Copy);
+
+        let native = playback_info_options_from_body(&json!({
+            "EnableDirectPlay": true,
+            "EnableDirectStream": true,
+            "EnableTranscoding": true,
+            "DeviceProfile": {
+                "DirectPlayProfiles": [{
+                    "Type": "Video",
+                    "Container": "ts",
+                    "VideoCodec": "h264",
+                    "AudioCodec": "aac"
+                }]
+            }
+        }));
+        let native_decision = playback_delivery_decision_with_ffmpeg_mode(
+            &item,
+            Some(&metadata),
+            &native,
+            FfmpegMode::Enabled,
+        );
+        assert_eq!(native_decision.delivery, DeliveryMode::DirectProxy);
     }
 
     #[test]
