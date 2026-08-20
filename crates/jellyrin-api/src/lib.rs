@@ -41581,7 +41581,13 @@ fn playback_output_constraints(
                 );
             }
         } else {
-            let has_audio = selected_audio_codec(item, options).is_some();
+            // Codec evidence and stream presence are separate concerns. Plugin VOD may expose
+            // an ordered audio track before it knows the elementary codec; that track still
+            // consumes output bandwidth when FFmpeg encodes it to AAC.
+            let has_audio = options
+                .audio_stream_index
+                .or_else(|| default_audio_stream_index(&media_item_streams(item)))
+                .is_some();
             let audio_budget = if has_audio {
                 let suggested = max_total_bitrate
                     .saturating_div(5)
@@ -104891,6 +104897,31 @@ done
         assert!(
             decision.output.video_bitrate.unwrap() + decision.output.audio_bitrate.unwrap()
                 <= 4_000_000
+        );
+    }
+
+    #[test]
+    fn unknown_audio_codec_still_reserves_total_bitrate_budget() {
+        let mut item = playback_profile_test_item();
+        item.media_streams[1]
+            .as_object_mut()
+            .unwrap()
+            .remove("Codec");
+        let options = PlaybackInfoOptions {
+            max_streaming_bitrate: Some(2_000_000),
+            ..PlaybackInfoOptions::default()
+        };
+
+        let decision =
+            playback_delivery_decision_with_ffmpeg_mode(&item, None, &options, FfmpegMode::Enabled);
+        assert_eq!(decision.delivery, DeliveryMode::HlsTranscode);
+        assert_eq!(decision.video, HlsStreamMode::Encode);
+        assert_eq!(decision.audio, HlsStreamMode::Encode);
+        assert_eq!(decision.output.audio_bitrate, Some(192_000));
+        assert_eq!(decision.output.video_bitrate, Some(1_808_000));
+        assert!(
+            decision.output.video_bitrate.unwrap() + decision.output.audio_bitrate.unwrap()
+                <= 2_000_000
         );
     }
 
