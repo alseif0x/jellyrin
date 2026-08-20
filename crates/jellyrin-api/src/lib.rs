@@ -63510,6 +63510,25 @@ mod tests {
     async fn plugin_vod_web_profile_serves_real_hls_with_selected_tracks() {
         let plugin_id = "66666666-7777-4888-9999-000000000021";
         let (db, tmp, api_key, movie_id) = prepare_vod_playback_environment(plugin_id).await;
+        let movie = db
+            .media_item_by_id_visible(movie_id)
+            .await
+            .unwrap()
+            .expect("fixture movie remains visible");
+        let metadata = super::metadata_payload_for_item(&db, movie_id)
+            .await
+            .unwrap();
+        db.update_media_item_media_info_and_metadata(
+            movie_id,
+            Some(50_000_000),
+            movie.bitrate,
+            movie.width,
+            movie.height,
+            movie.media_streams,
+            metadata,
+        )
+        .await
+        .unwrap();
         let ts_path = tmp.path().join("web-hls-input.ts");
         generate_plugin_vod_hls_fixture(&ts_path).await;
         let (upstream_base, upstream_requests, upstream_connections) =
@@ -68360,7 +68379,7 @@ while IFS= read -r line; do
           printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"MediaItems":[{"ItemType":"Episode","ProviderReference":"provider:v1:episode-1","Name":"Pilot","SeriesReference":"provider:v1:series-1","SeriesName":"Show One","SeasonNumber":1,"EpisodeNumber":1}],"EpisodeCount":1}}}\n' "$corr"
           ;;
         *'"Action":"ImportMedia"'*)
-          printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"MediaItems":[{"ItemType":"Movie","ProviderReference":"provider:v1:movie-1","Name":"Movie One","RuntimeTicks":50000000},{"ItemType":"Series","ProviderReference":"provider:v1:series-1","Name":"Show One"}],"MovieCount":1,"SeriesCount":1,"ContinuationToken":"vod-page-2","HasMore":true}}}\n' "$corr"
+          printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"MediaItems":[{"ItemType":"Movie","ProviderReference":"provider:v1:movie-1","Name":"Movie One"},{"ItemType":"Series","ProviderReference":"provider:v1:series-1","Name":"Show One"}],"MovieCount":1,"SeriesCount":1,"ContinuationToken":"vod-page-2","HasMore":true}}}\n' "$corr"
           ;;
         *'"Action":"ImportChannels"'*)
           printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"Channels":[{"Id":"one","Name":"One","ProviderReference":"provider:v1:one"}],"Categories":[{"Id":"all","Name":"All"}]}}}\n' "$corr"
