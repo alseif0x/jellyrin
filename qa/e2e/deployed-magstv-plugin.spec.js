@@ -19,6 +19,10 @@ const catalogueCandidateLimit = positiveIntegerEnvironment(
   'JELLYRIN_E2E_MAGSTV_CANDIDATE_LIMIT',
   8,
 );
+const liveProbeTimeoutMs = positiveIntegerEnvironment(
+  'JELLYRIN_E2E_MAGSTV_LIVE_PROBE_TIMEOUT_MS',
+  45_000,
+);
 const verifyOnly = process.env.JELLYRIN_E2E_MAGSTV_VERIFY_ONLY === '1';
 
 // Unlike ordinary deployed tests, every failure artifact is disabled here: authenticated
@@ -70,7 +74,16 @@ test.describe('deployed MAGSTV plugin settings, catalogue, and playback', () => 
     expect(snapshot.channels.total).toBe(Number(persisted.PersistedChannelCount));
 
     await verifyHomeAndOpenViews(page, snapshot.views);
+    // Stop the rendered lists from issuing background image/catalogue requests while the three
+    // playback probes run strictly one after another.
+    await page.goto('about:blank');
 
+    const liveResult = await probeScopedLiveTvPlayback(
+      request,
+      baseURL,
+      auth,
+      snapshot.channels.items[0],
+    );
     const movieResult = await probeFirstPlayable(
       snapshot.movies.items,
       (movie) => probeVodWebExperience(request, baseURL, auth, movie, 'movie'),
@@ -82,6 +95,7 @@ test.describe('deployed MAGSTV plugin settings, catalogue, and playback', () => 
       'Mags Series episode',
     );
 
+    expect(liveResult.bytes).toBeGreaterThan(0);
     expect(movieResult.hlsSegmentBytes).toBeGreaterThan(0);
     expect(episodeResult.hlsSegmentBytes).toBeGreaterThan(0);
     expect(
@@ -100,6 +114,8 @@ test.describe('deployed MAGSTV plugin settings, catalogue, and playback', () => 
         episodes: snapshot.episodes.total,
       },
       playback: {
+        liveTvBytes: liveResult.bytes,
+        liveTvDelivery: liveResult.delivery,
         movieHlsSegmentBytes: movieResult.hlsSegmentBytes,
         episodeHlsSegmentBytes: episodeResult.hlsSegmentBytes,
         movieAudioTracks: movieResult.audioTracks,
@@ -509,6 +525,49 @@ async function probeFirstPlayable(items, probe, label) {
   );
 }
 
+async function probeScopedLiveTvPlayback(request, baseURL, auth, channel) {
+  if (!channel?.Id) throw new Error('Mags Live TV scoped view has no first channel');
+  if (channel.TunerHostId !== TUNER_ID) {
+    throw new Error('Mags Live TV first scoped channel belongs to another tuner');
+  }
+
+  const sessions = [];
+  try {
+    const playback = await requestLiveTvPlaybackInfo(request, auth, channel.Id);
+    const source = playback.MediaSources?.[0];
+    sessions.push({ item: channel, playback, source, method: 'Transcode' });
+    if (!playback.PlaySessionId || !source) {
+      throw new Error('Mags Live TV PlaybackInfo is unavailable');
+    }
+
+    if (source.SupportsTranscoding === true && source.TranscodingUrl) {
+      const bytes = await probeHlsSegment(
+        request,
+        baseURL,
+        auth.AccessToken,
+        source.TranscodingUrl,
+        'Mags Live TV',
+        liveProbeTimeoutMs,
+      );
+      return { bytes, delivery: 'hls' };
+    }
+    if (source.SupportsDirectStream === true && source.DirectStreamUrl) {
+      sessions[0].method = 'DirectStream';
+      const bytes = await probeDirectLiveTvBytes(
+        baseURL,
+        auth.AccessToken,
+        source.DirectStreamUrl,
+      );
+      return { bytes, delivery: 'direct' };
+    }
+    throw new Error('Mags Live TV PlaybackInfo exposed no supported delivery');
+  } catch (error) {
+    throw new Error(`Mags Live TV playback failed (${safeErrorReason(error)})`);
+  } finally {
+    await stopPlaybackSessions(request, auth, sessions);
+  }
+}
+
 async function probeVodWebExperience(request, baseURL, auth, item, expectedType) {
   const sessions = [];
   try {
@@ -597,11 +656,12 @@ async function probeVodWebExperience(request, baseURL, auth, item, expectedType)
     }
     if (!source.TranscodingUrl) throw new Error('VOD Web HLS URL is unavailable');
 
-    const hlsSegmentBytes = await probeVodHls(
+    const hlsSegmentBytes = await probeHlsSegment(
       request,
       baseURL,
       auth.AccessToken,
       source.TranscodingUrl,
+      'VOD',
     );
 
     if (Number(source.DefaultSubtitleStreamIndex) !== Number(selectedSubtitle.Index)) {
@@ -771,6 +831,32 @@ async function requestPlaybackInfo(request, auth, itemId, options) {
   return response.json();
 }
 
+async function requestLiveTvPlaybackInfo(request, auth, itemId) {
+  const response = await request.post(
+    `/Items/${encodeURIComponent(itemId)}/PlaybackInfo?UserId=${encodeURIComponent(auth.User.Id)}`,
+    {
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Emby-Token': auth.AccessToken,
+      },
+      data: {
+        UserId: auth.User.Id,
+        IsPlayback: true,
+        AutoOpenLiveStream: true,
+        EnableDirectPlay: true,
+        EnableDirectStream: true,
+        EnableTranscoding: true,
+        DeviceProfile: webHlsDeviceProfile(),
+      },
+      timeout: liveProbeTimeoutMs,
+    },
+  );
+  if (response.status() !== 200) {
+    throw new Error(`Mags Live TV PlaybackInfo returned HTTP ${response.status()}`);
+  }
+  return response.json();
+}
+
 function nativeMpegTsDeviceProfile() {
   return {
     Name: 'MAGSTV QA native MPEG-TS discovery',
@@ -813,42 +899,94 @@ function webHlsDeviceProfile() {
   };
 }
 
-async function probeVodHls(request, baseURL, token, transcodingUrl) {
+async function probeHlsSegment(
+  request,
+  baseURL,
+  token,
+  transcodingUrl,
+  label,
+  timeoutMs = 45_000,
+) {
+  const deadline = Date.now() + timeoutMs;
   const masterUrl = sameOriginUrl(baseURL, transcodingUrl);
   const masterText = await getPlaylistWithRetry(
     request,
     masterUrl,
     token,
-    'VOD HLS master playlist',
+    `${label} HLS master playlist`,
     true,
+    deadline,
   );
   let mediaUrl = masterUrl;
   let mediaText = masterText;
   if (masterText.includes('#EXT-X-STREAM-INF')) {
     const mediaReference = firstPlaylistReference(masterText);
-    if (!mediaReference) throw new Error('VOD HLS master playlist has no media reference');
+    if (!mediaReference) throw new Error(`${label} HLS master playlist has no media reference`);
     mediaUrl = new URL(mediaReference, masterUrl).toString();
     mediaText = await getPlaylistWithRetry(
       request,
       mediaUrl,
       token,
-      'VOD HLS media playlist',
+      `${label} HLS media playlist`,
       true,
+      deadline,
     );
   }
   const segmentReference = firstPlaylistReference(mediaText);
-  if (!segmentReference) throw new Error('VOD HLS media playlist has no segment');
+  if (!segmentReference) throw new Error(`${label} HLS media playlist has no segment`);
   const segmentUrl = sameOriginUrl(baseURL, new URL(segmentReference, mediaUrl).toString());
+  const remainingMs = deadline - Date.now();
+  if (remainingMs < 1) throw new Error(`${label} HLS probe timed out`);
   const segmentResponse = await request.get(segmentUrl, {
     headers: { 'X-Emby-Token': token },
-    timeout: 45_000,
+    timeout: remainingMs,
   });
   if (segmentResponse.status() !== 200) {
-    throw new Error(`VOD HLS segment returned HTTP ${segmentResponse.status()}`);
+    throw new Error(`${label} HLS segment returned HTTP ${segmentResponse.status()}`);
   }
   const bytes = await segmentResponse.body();
-  if (bytes.length < 188) throw new Error('VOD HLS segment is empty or truncated');
+  if (bytes.length < 188) throw new Error(`${label} HLS segment is empty or truncated`);
   return bytes.length;
+}
+
+async function probeDirectLiveTvBytes(baseURL, token, directStreamUrl) {
+  const url = sameOriginUrl(baseURL, directStreamUrl);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), liveProbeTimeoutMs);
+  try {
+    let response;
+    try {
+      response = await fetch(url, {
+        headers: {
+          'X-Emby-Token': token,
+          Range: 'bytes=0-1315',
+        },
+        redirect: 'error',
+        signal: controller.signal,
+      });
+    } catch {
+      throw new Error('Mags Live TV direct stream request failed');
+    }
+    if (![200, 206].includes(response.status)) {
+      throw new Error(`Mags Live TV direct stream returned HTTP ${response.status}`);
+    }
+    const reader = response.body?.getReader();
+    if (!reader) throw new Error('Mags Live TV direct stream has no body');
+    let first;
+    try {
+      first = await reader.read();
+    } catch {
+      throw new Error('Mags Live TV direct stream returned no bytes');
+    } finally {
+      await reader.cancel().catch(() => {});
+    }
+    const bytes = first.value?.byteLength || 0;
+    if (bytes < 1) throw new Error('Mags Live TV direct stream returned no bytes');
+    return bytes;
+  } finally {
+    clearTimeout(timeout);
+    controller.abort();
+  }
 }
 
 async function verifyJitSubtitle(request, baseURL, token, stream) {
@@ -894,23 +1032,30 @@ async function stopPlaybackSessions(request, auth, sessions) {
   }
 }
 
-async function getPlaylistWithRetry(request, url, token, label, requireReference) {
+async function getPlaylistWithRetry(request, url, token, label, requireReference, deadline) {
   let lastStatus = 0;
-  for (let attempt = 0; attempt < 60; attempt += 1) {
-    const response = await request.get(url, {
-      headers: { 'X-Emby-Token': token },
-      timeout: 45_000,
-    });
-    lastStatus = response.status();
-    const text = await response.text();
-    if (lastStatus === 200
-      && text.includes('#EXTM3U')
-      && (!requireReference || firstPlaylistReference(text))) {
-      return text;
+  while (Date.now() < deadline) {
+    const remainingMs = deadline - Date.now();
+    try {
+      const response = await request.get(url, {
+        headers: { 'X-Emby-Token': token },
+        timeout: Math.max(1, Math.min(10_000, remainingMs)),
+      });
+      lastStatus = response.status();
+      const text = await response.text();
+      if (lastStatus === 200
+        && text.includes('#EXTM3U')
+        && (!requireReference || firstPlaylistReference(text))) {
+        return text;
+      }
+    } catch {
+      lastStatus = 0;
     }
-    await delay(500);
+    const retryDelayMs = Math.min(500, Math.max(0, deadline - Date.now()));
+    if (retryDelayMs > 0) await delay(retryDelayMs);
   }
-  throw new Error(`${label} did not become ready; final HTTP status ${lastStatus}`);
+  const finalStatus = lastStatus || 'unavailable';
+  throw new Error(`${label} did not become ready; final HTTP status ${finalStatus}`);
 }
 
 function firstPlaylistReference(playlist) {
@@ -954,6 +1099,7 @@ function safeErrorReason(error) {
   const message = String(error?.message || error);
   const status = message.match(/HTTP \d{3}/i)?.[0];
   const categorized = [
+    [/live tv|direct stream/i, 'Live TV stream unavailable'],
     [/metadata|overview/i, 'metadata unavailable'],
     [/artwork|image/i, 'artwork unavailable'],
     [/audio/i, 'alternate audio/language unavailable'],
