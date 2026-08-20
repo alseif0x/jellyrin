@@ -100,11 +100,78 @@ use telemetry::{DatabaseOperation, DatabaseTelemetry};
 pub type ProductionDatabase = PostgresDatabase;
 
 const TV_SERIES_CATALOG_PROJECTION_VERSION: i32 = 2;
+const CATALOG_LOCK_RETRY_ATTEMPTS: usize = 6;
+const CATALOG_LOCK_RETRY_BASE_DELAY_MS: u64 = 25;
+const CATALOG_LOCK_RETRY_MAX_DELAY_MS: u64 = 400;
 use query_filter_projection::{
     MEDIA_ITEM_QUERY_FILTER_PROJECTION_VERSION, MediaItemQueryFilterProjection,
     MediaItemQueryFilterProjectionSource, encode_media_item_query_filter_position,
     extract_media_item_query_filter_projection,
 };
+
+fn transient_catalog_lock_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|source| {
+        let Some(sqlx::Error::Database(database_error)) = source.downcast_ref::<sqlx::Error>()
+        else {
+            return false;
+        };
+        let Some(code) = database_error.code() else {
+            return false;
+        };
+        if matches!(code.as_ref(), "55P03" | "40P01" | "40001") {
+            return true;
+        }
+        code.parse::<i32>()
+            .is_ok_and(|sqlite_code| matches!(sqlite_code & 0xff, 5 | 6))
+    })
+}
+
+fn catalog_lock_retry_delay(attempt: usize, jitter_seed: u64) -> StdDuration {
+    let exponent = u32::try_from(attempt.min(8)).unwrap_or(8);
+    let base = CATALOG_LOCK_RETRY_BASE_DELAY_MS
+        .saturating_mul(1_u64 << exponent)
+        .min(CATALOG_LOCK_RETRY_MAX_DELAY_MS);
+    // SplitMix64 gives each catalogue/folder a stable but different retry cadence. The retry stays
+    // deterministic in tests while concurrent publishers avoid waking on the same millisecond.
+    let mut mixed = jitter_seed
+        ^ u64::try_from(attempt)
+            .unwrap_or(u64::MAX)
+            .wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    mixed ^= mixed >> 31;
+    let jitter = mixed % (base / 2 + 1);
+    StdDuration::from_millis(base.saturating_add(jitter))
+}
+
+fn catalog_lock_jitter_seed(id: Uuid) -> u64 {
+    let value = id.as_u128();
+    (value as u64) ^ u64::try_from(value >> 64).unwrap_or_default()
+}
+
+async fn retry_transient_catalog_lock<T, F, Fut>(
+    jitter_seed: u64,
+    mut attempt_operation: F,
+) -> anyhow::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    for attempt in 0..CATALOG_LOCK_RETRY_ATTEMPTS {
+        match attempt_operation().await {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if attempt + 1 < CATALOG_LOCK_RETRY_ATTEMPTS
+                    && transient_catalog_lock_error(&error) =>
+            {
+                let delay = catalog_lock_retry_delay(attempt, jitter_seed);
+                tokio::time::sleep(delay).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("catalogue lock retry loop always returns")
+}
 
 #[cfg(test)]
 pub type Database = SqliteDatabase;
@@ -9685,6 +9752,16 @@ impl SqliteDatabase {
         &self,
         virtual_folder_id: Uuid,
     ) -> anyhow::Result<bool> {
+        retry_transient_catalog_lock(catalog_lock_jitter_seed(virtual_folder_id), || {
+            self.ensure_tv_series_catalog_projection_once(virtual_folder_id)
+        })
+        .await
+    }
+
+    async fn ensure_tv_series_catalog_projection_once(
+        &self,
+        virtual_folder_id: Uuid,
+    ) -> anyhow::Result<bool> {
         let simple = virtual_folder_id.simple().to_string();
         let dashed = virtual_folder_id.to_string();
         let mut tx = self.pool.begin().await?;
@@ -11075,7 +11152,17 @@ impl SqliteDatabase {
         &self,
         stage: &RemoteMediaCatalogStage,
     ) -> anyhow::Result<Vec<VirtualFolder>> {
-        stage.parsed_id()?;
+        let stage_id = stage.parsed_id()?;
+        retry_transient_catalog_lock(catalog_lock_jitter_seed(stage_id), || {
+            self.publish_remote_media_catalog_stage_once(stage)
+        })
+        .await
+    }
+
+    async fn publish_remote_media_catalog_stage_once(
+        &self,
+        stage: &RemoteMediaCatalogStage,
+    ) -> anyhow::Result<Vec<VirtualFolder>> {
         let now = format_time(OffsetDateTime::now_utc())?;
         let mut tx = self.pool.begin().await?;
         let locked = sqlx::query(
@@ -17231,7 +17318,10 @@ fn stable_plugin_model_id(kind: &str, value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
+    use std::{
+        collections::{HashMap, HashSet},
+        time::Duration as StdDuration,
+    };
 
     use super::{
         ActivityLogFilter, ActivityLogSortField, Database, DatabaseDriver, DatabasePoolRole,
@@ -20482,6 +20572,158 @@ mod tests {
             .unwrap();
         db.publish_remote_media_catalog_stage(&stage).await.unwrap();
         assert_eq!(db.media_items().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn sqlite_durable_stage_retries_busy_publication_without_partial_visibility() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("catalog-lock-retry.db");
+        std::fs::File::create(&path).unwrap();
+        let db = Database::connect(&format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        let specs = || {
+            vec![
+                RemoteMediaLibraryStageSpec {
+                    key: "movies".to_string(),
+                    library_name: "Busy Movies".to_string(),
+                    collection_type: "movies".to_string(),
+                    source_location: "provider://busy/movies".to_string(),
+                },
+                RemoteMediaLibraryStageSpec {
+                    key: "series".to_string(),
+                    library_name: "Busy Series".to_string(),
+                    collection_type: "tvshows".to_string(),
+                    source_location: "provider://busy/series".to_string(),
+                },
+            ]
+        };
+        let episode = |generation: usize, index: usize| {
+            let item_id = Uuid::new_v4();
+            let series_id = Uuid::new_v4();
+            RemoteMediaItemUpsert {
+                id: item_id.to_string(),
+                name: format!("Generation {generation} Episode {index}"),
+                path: format!("provider://busy/series/{generation}/{index}.mp4"),
+                media_type: "Video".to_string(),
+                collection_type: "tvshows".to_string(),
+                runtime_ticks: None,
+                bitrate: None,
+                width: None,
+                height: None,
+                media_streams: Vec::new(),
+                metadata: json!({
+                    "SeriesId": series_id.simple().to_string(),
+                    "SeriesName": format!("Generation {generation} Series {index}")
+                }),
+            }
+        };
+
+        let old = db.begin_remote_media_catalog_stage(specs()).await.unwrap();
+        db.append_remote_media_catalog_stage(
+            &old,
+            "series",
+            (0..2).map(|index| episode(1, index)).collect(),
+        )
+        .await
+        .unwrap();
+        db.complete_remote_media_catalog_stage(&old).await.unwrap();
+        db.publish_remote_media_catalog_stage(&old).await.unwrap();
+
+        let replacement = db.begin_remote_media_catalog_stage(specs()).await.unwrap();
+        db.append_remote_media_catalog_stage(
+            &replacement,
+            "series",
+            (0..64).map(|index| episode(2, index)).collect(),
+        )
+        .await
+        .unwrap();
+        db.complete_remote_media_catalog_stage(&replacement)
+            .await
+            .unwrap();
+
+        // Busy timeout is connection-local. Configure every pool slot before taking the write
+        // lock so the first publication attempt deterministically receives SQLITE_BUSY quickly.
+        let mut connections = Vec::new();
+        for _ in 0..super::SQLITE_MAX_CONNECTIONS {
+            connections.push(db.pool.acquire().await.unwrap());
+        }
+        for connection in &mut connections {
+            sqlx::query("PRAGMA busy_timeout = 20")
+                .execute(&mut **connection)
+                .await
+                .unwrap();
+        }
+        drop(connections);
+
+        let mut blocker = db.pool.acquire().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        let publishing_db = db.clone();
+        let publishing_stage = replacement.clone();
+        let publishing = tokio::spawn(async move {
+            publishing_db
+                .publish_remote_media_catalog_stage(&publishing_stage)
+                .await
+        });
+
+        tokio::time::sleep(StdDuration::from_millis(100)).await;
+        assert!(
+            !publishing.is_finished(),
+            "the first SQLITE_BUSY escaped instead of scheduling a fresh transaction"
+        );
+        let visible_during_lock: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM media_items AS item JOIN virtual_folders AS folder \
+             ON folder.id = item.virtual_folder_id WHERE folder.name = 'Busy Series' \
+             AND item.missing_since IS NULL",
+        )
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+        assert_eq!(
+            visible_during_lock, 2,
+            "a partial generation became visible"
+        );
+
+        sqlx::query("COMMIT").execute(&mut *blocker).await.unwrap();
+        drop(blocker);
+        let folders = tokio::time::timeout(StdDuration::from_secs(5), publishing)
+            .await
+            .expect("publication retry did not finish")
+            .expect("publication retry task panicked")
+            .expect("publication retry failed");
+        let series_folder = folders
+            .iter()
+            .find(|folder| folder.name == "Busy Series")
+            .unwrap();
+        let published = sqlx::query_as::<_, (i64, i64, i64)>(
+            "SELECT count(item.id), count(DISTINCT series.series_id), coverage.series_count \
+             FROM media_items AS item \
+             JOIN media_item_tv_series_members AS member ON member.item_id = item.id \
+             JOIN media_item_tv_series AS series ON series.virtual_folder_id = member.virtual_folder_id \
+                AND series.series_id = member.series_id \
+             JOIN media_item_tv_series_coverage AS coverage \
+                ON coverage.virtual_folder_id = item.virtual_folder_id \
+             WHERE item.virtual_folder_id = ?1 AND item.missing_since IS NULL \
+             GROUP BY coverage.series_count",
+        )
+        .bind(series_folder.id.to_string())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(published, (64, 64, 64));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM remote_media_catalog_stages WHERE id = ?1",
+            )
+            .bind(replacement.id())
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]

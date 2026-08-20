@@ -28,13 +28,14 @@ use super::{
     RemoteMediaCatalogStage, RemoteMediaItemUpsert, RemoteMediaLibrarySnapshot,
     RemoteMediaLibraryStageSpec, SortDirection, TV_SERIES_CATALOG_PROJECTION_VERSION,
     TvSeriesCatalogKey, TvSeriesCatalogNameFilter, TvSeriesCatalogNamePatterns,
-    TvSeriesCatalogPage, catalog_sync_duration_millis, encode_media_item_query_filter_position,
-    extract_media_item_facets, extract_media_item_filter_selectors,
-    extract_media_item_genre_selectors, extract_media_item_query_filter_projection,
-    is_upcoming_media_item_entry, nonnegative_count, normalized_facet_query_values,
-    prepare_remote_media_library_stage_specs, remote_media_stage_source_revision,
-    retain_entries_with_effective_types, telemetry::DatabaseOperation,
-    upcoming_media_item_premiere_parts, validate_remote_media_catalog_stage_append,
+    TvSeriesCatalogPage, catalog_lock_jitter_seed, catalog_sync_duration_millis,
+    encode_media_item_query_filter_position, extract_media_item_facets,
+    extract_media_item_filter_selectors, extract_media_item_genre_selectors,
+    extract_media_item_query_filter_projection, is_upcoming_media_item_entry, nonnegative_count,
+    normalized_facet_query_values, prepare_remote_media_library_stage_specs,
+    remote_media_stage_source_revision, retain_entries_with_effective_types,
+    retry_transient_catalog_lock, telemetry::DatabaseOperation, upcoming_media_item_premiere_parts,
+    validate_remote_media_catalog_stage_append,
 };
 
 const REMOTE_SNAPSHOT_INSERT_CHUNK_SIZE: usize = 1_000;
@@ -2394,7 +2395,25 @@ impl PostgresDatabase {
         &self,
         virtual_folder_id: Uuid,
     ) -> anyhow::Result<bool> {
+        retry_transient_catalog_lock(catalog_lock_jitter_seed(virtual_folder_id), || {
+            self.ensure_tv_series_catalog_projection_once(virtual_folder_id)
+        })
+        .await
+    }
+
+    async fn ensure_tv_series_catalog_projection_once(
+        &self,
+        virtual_folder_id: Uuid,
+    ) -> anyhow::Result<bool> {
         let mut tx = self.worker_pool.begin().await?;
+        // This is a background repair, not an interactive request. A complete remote catalogue
+        // publication can legitimately own the same serialization lock for minutes, so give each
+        // bounded attempt enough time to bridge that transaction instead of inheriting the 3 s
+        // point-write budget. `retry_transient_catalog_lock` starts a fresh transaction after a
+        // timeout; no failed or partial projection is ever reused.
+        sqlx::query("SET LOCAL lock_timeout = '30s'")
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
             .bind(format!("jellyrin-tv-series-projection:{virtual_folder_id}"))
             .execute(&mut *tx)
@@ -3743,6 +3762,16 @@ impl PostgresDatabase {
         stage: &RemoteMediaCatalogStage,
     ) -> anyhow::Result<Vec<VirtualFolder>> {
         let stage_id = stage.parsed_id()?;
+        retry_transient_catalog_lock(catalog_lock_jitter_seed(stage_id), || {
+            self.publish_remote_media_catalog_stage_once(stage_id)
+        })
+        .await
+    }
+
+    async fn publish_remote_media_catalog_stage_once(
+        &self,
+        stage_id: Uuid,
+    ) -> anyhow::Result<Vec<VirtualFolder>> {
         let mut tx = self.worker_pool.begin().await?;
         // Publishing a remote snapshot intentionally writes an entire library in one atomic
         // transaction. Large Xtream catalogues can exceed the worker pool's general-purpose
