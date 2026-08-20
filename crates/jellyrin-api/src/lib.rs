@@ -25689,17 +25689,42 @@ fn remove_plugin_vod_external_image_fields(metadata: &mut serde_json::Value) -> 
 }
 
 async fn fetch_plugin_vod_remote_image(source_url: &str) -> Result<Vec<u8>, ApiError> {
-    let proxy = std::env::var("JELLYRIN_PROVIDER_EGRESS_PROXY").map_err(|_| {
-        ApiError::service_unavailable("VOD provider egress proxy is not configured")
-    })?;
-    let response = send_sensitive_remote_live_request_with_proxy(
+    if let Err(error) = validated_remote_media_url(source_url) {
+        log_plugin_vod_artwork_failure(PluginVodArtworkFailure::InvalidSource);
+        return Err(error);
+    }
+    let proxy = match std::env::var("JELLYRIN_PROVIDER_EGRESS_PROXY") {
+        Ok(proxy) => proxy,
+        Err(_) => {
+            log_plugin_vod_artwork_failure(PluginVodArtworkFailure::MissingProxy);
+            return Err(ApiError::service_unavailable(
+                "VOD provider egress proxy is not configured",
+            ));
+        }
+    };
+    let response = match send_sensitive_remote_live_request_with_proxy(
         source_url,
         true,
         Some(&proxy),
         StdDuration::from_secs(15),
     )
-    .await?;
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            log_plugin_vod_artwork_failure(plugin_vod_artwork_request_failure(&error));
+            return Err(error);
+        }
+    };
     if !response.status().is_success() {
+        let failure = if response.status().is_client_error() {
+            PluginVodArtworkFailure::UpstreamClientError
+        } else if response.status().is_server_error() {
+            PluginVodArtworkFailure::UpstreamServerError
+        } else {
+            PluginVodArtworkFailure::UpstreamOtherStatus
+        };
+        log_plugin_vod_artwork_failure(failure);
         return Err(ApiError::service_unavailable(
             "VOD provider artwork is unavailable",
         ));
@@ -25722,20 +25747,124 @@ async fn fetch_plugin_vod_remote_image(source_url: &str) -> Result<Vec<u8>, ApiE
                 | "application/octet-stream"
         )
     }) {
+        log_plugin_vod_artwork_failure(PluginVodArtworkFailure::UnsupportedContentType);
         return Err(ApiError::service_unavailable(
             "VOD provider artwork content type is invalid",
         ));
     }
-    let bytes = read_bounded_remote_image_body(response, IMAGE_UPLOAD_LIMIT_BYTES).await?;
-    if bytes.is_empty()
-        || image_format_from_bytes(&bytes).extension == "bin"
-        || !safe_remote_image_dimensions(&bytes)
-    {
+    let bytes = match read_bounded_remote_image_body(response, IMAGE_UPLOAD_LIMIT_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let failure = if error.status() == StatusCode::BAD_REQUEST {
+                PluginVodArtworkFailure::BodyTooLarge
+            } else {
+                PluginVodArtworkFailure::BodyInterrupted
+            };
+            log_plugin_vod_artwork_failure(failure);
+            return Err(error);
+        }
+    };
+    if bytes.is_empty() {
+        log_plugin_vod_artwork_failure(PluginVodArtworkFailure::EmptyBody);
+        return Err(ApiError::service_unavailable(
+            "VOD provider artwork payload is invalid",
+        ));
+    }
+    if image_format_from_bytes(&bytes).extension == "bin" {
+        log_plugin_vod_artwork_failure(PluginVodArtworkFailure::UnknownFormat);
+        return Err(ApiError::service_unavailable(
+            "VOD provider artwork payload is invalid",
+        ));
+    }
+    if !safe_remote_image_dimensions(&bytes) {
+        log_plugin_vod_artwork_failure(PluginVodArtworkFailure::InvalidDimensions);
         return Err(ApiError::service_unavailable(
             "VOD provider artwork payload is invalid",
         ));
     }
     Ok(bytes)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PluginVodArtworkFailure {
+    InvalidSource,
+    MissingProxy,
+    InvalidRequest,
+    RequestDenied,
+    RequestUnavailable,
+    RequestFailed,
+    UpstreamClientError,
+    UpstreamServerError,
+    UpstreamOtherStatus,
+    UnsupportedContentType,
+    BodyTooLarge,
+    BodyInterrupted,
+    EmptyBody,
+    UnknownFormat,
+    InvalidDimensions,
+    CacheWriteFailed,
+}
+
+impl PluginVodArtworkFailure {
+    const fn labels(self) -> (&'static str, &'static str) {
+        match self {
+            Self::InvalidSource => ("source_validation", "invalid_source"),
+            Self::MissingProxy => ("egress_configuration", "missing_proxy"),
+            Self::InvalidRequest => ("egress_request", "invalid_request"),
+            Self::RequestDenied => ("egress_request", "request_denied"),
+            Self::RequestUnavailable => ("egress_request", "request_unavailable"),
+            Self::RequestFailed => ("egress_request", "request_failed"),
+            Self::UpstreamClientError => ("upstream_status", "upstream_client_error"),
+            Self::UpstreamServerError => ("upstream_status", "upstream_server_error"),
+            Self::UpstreamOtherStatus => ("upstream_status", "upstream_other_status"),
+            Self::UnsupportedContentType => ("content_type", "unsupported_content_type"),
+            Self::BodyTooLarge => ("body", "body_too_large"),
+            Self::BodyInterrupted => ("body", "body_interrupted"),
+            Self::EmptyBody => ("payload", "empty_body"),
+            Self::UnknownFormat => ("payload", "unknown_format"),
+            Self::InvalidDimensions => ("payload", "invalid_dimensions"),
+            Self::CacheWriteFailed => ("cache_write", "cache_write_failed"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PluginVodArtworkFailureTelemetry {
+    action: &'static str,
+    phase: &'static str,
+    reason: &'static str,
+}
+
+fn plugin_vod_artwork_failure_telemetry(
+    failure: PluginVodArtworkFailure,
+) -> PluginVodArtworkFailureTelemetry {
+    let (phase, reason) = failure.labels();
+    PluginVodArtworkFailureTelemetry {
+        action: "ResolveArtwork",
+        phase,
+        reason,
+    }
+}
+
+fn plugin_vod_artwork_request_failure(error: &ApiError) -> PluginVodArtworkFailure {
+    match error.status() {
+        StatusCode::BAD_REQUEST => PluginVodArtworkFailure::InvalidRequest,
+        StatusCode::FORBIDDEN => PluginVodArtworkFailure::RequestDenied,
+        StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT => {
+            PluginVodArtworkFailure::RequestUnavailable
+        }
+        _ => PluginVodArtworkFailure::RequestFailed,
+    }
+}
+
+fn log_plugin_vod_artwork_failure(failure: PluginVodArtworkFailure) {
+    let telemetry = plugin_vod_artwork_failure_telemetry(failure);
+    tracing::warn!(
+        action = telemetry.action,
+        phase = telemetry.phase,
+        reason = telemetry.reason,
+        "VOD artwork pipeline failed"
+    );
 }
 
 fn safe_remote_image_dimensions(bytes: &[u8]) -> bool {
@@ -25926,6 +26055,7 @@ async fn ensure_plugin_vod_metadata(
         )
         .await
         {
+            log_plugin_vod_artwork_failure(PluginVodArtworkFailure::CacheWriteFailed);
             persist_plugin_vod_metadata(state, target, metadata, runtime_ticks).await?;
             return Err(error);
         }
@@ -62689,6 +62819,84 @@ mod tests {
             )),
             "RuntimeFailure"
         );
+    }
+
+    #[test]
+    fn plugin_vod_artwork_failure_telemetry_is_allowlisted_and_secret_free() {
+        let canary = "private-title private-item-id https://provider.invalid/image?signature=secret image/private HTTP 599";
+        for (error, expected_reason) in [
+            (
+                ApiError::bad_request(canary),
+                super::PluginVodArtworkFailure::InvalidRequest,
+            ),
+            (
+                ApiError::forbidden(canary),
+                super::PluginVodArtworkFailure::RequestDenied,
+            ),
+            (
+                ApiError::service_unavailable(canary),
+                super::PluginVodArtworkFailure::RequestUnavailable,
+            ),
+            (
+                ApiError::internal(canary),
+                super::PluginVodArtworkFailure::RequestFailed,
+            ),
+        ] {
+            let failure = super::plugin_vod_artwork_request_failure(&error);
+            assert_eq!(failure, expected_reason);
+            let telemetry = super::plugin_vod_artwork_failure_telemetry(failure);
+            assert_eq!(telemetry.action, "ResolveArtwork");
+            assert_eq!(telemetry.phase, "egress_request");
+            assert!(matches!(
+                telemetry.reason,
+                "invalid_request" | "request_denied" | "request_unavailable" | "request_failed"
+            ));
+            let rendered = format!("{telemetry:?}");
+            for secret in [
+                canary,
+                "private-title",
+                "private-item-id",
+                "provider.invalid",
+                "signature",
+                "image/private",
+                "599",
+            ] {
+                assert!(!rendered.contains(secret));
+            }
+        }
+
+        for (failure, expected_phase, expected_reason) in [
+            (
+                super::PluginVodArtworkFailure::InvalidSource,
+                "source_validation",
+                "invalid_source",
+            ),
+            (
+                super::PluginVodArtworkFailure::UpstreamServerError,
+                "upstream_status",
+                "upstream_server_error",
+            ),
+            (
+                super::PluginVodArtworkFailure::UnsupportedContentType,
+                "content_type",
+                "unsupported_content_type",
+            ),
+            (
+                super::PluginVodArtworkFailure::InvalidDimensions,
+                "payload",
+                "invalid_dimensions",
+            ),
+            (
+                super::PluginVodArtworkFailure::CacheWriteFailed,
+                "cache_write",
+                "cache_write_failed",
+            ),
+        ] {
+            let telemetry = super::plugin_vod_artwork_failure_telemetry(failure);
+            assert_eq!(telemetry.action, "ResolveArtwork");
+            assert_eq!(telemetry.phase, expected_phase);
+            assert_eq!(telemetry.reason, expected_reason);
+        }
     }
 
     #[test]
