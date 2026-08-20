@@ -197,7 +197,7 @@ use tower_http::{
     trace::{DefaultOnRequest, DefaultOnResponse, TraceLayer},
 };
 use uuid::Uuid;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 use zip::{CompressionMethod, ZipArchive};
 
 const COMPATIBLE_SERVER_VERSION: &str = "12.0.0";
@@ -11919,11 +11919,16 @@ async fn invoke_plugin_capability_via_runtime_host_path_with_timeout(
     };
     if runtime == PluginRuntime::ExternalProcess {
         let isolated_catalog_call = is_external_catalog_import_call(capability, &arguments);
+        let reusable_provider_metadata_call =
+            is_external_provider_metadata_call(capability, &arguments);
         let contains_secret_grant =
             json_field_case_insensitive(&arguments, "SecretGrant").is_some();
-        let one_shot = isolated_catalog_call || contains_secret_grant;
+        let one_shot =
+            isolated_catalog_call || (contains_secret_grant && !reusable_provider_metadata_call);
         let lane = if isolated_catalog_call {
             "catalog-import"
+        } else if reusable_provider_metadata_call {
+            "provider-metadata"
         } else if contains_secret_grant {
             "provider-secret"
         } else {
@@ -11976,8 +11981,10 @@ async fn invoke_plugin_capability_via_runtime_host_path_with_timeout(
                 ));
             }
         }
-        // Catalog imports and every provider-secret grant use a one-shot process. This keeps slow
-        // imports off the normal lane and makes the grant lifetime enforceable by the host.
+        // Catalogue and playback grants remain one-shot. ResolveMetadata has a dedicated,
+        // serial reusable lane so a page of artwork can reuse its provider session; request JSON
+        // and credentials are still zeroized after every call, and grant scope/revision remains
+        // pinned by the runtime for the process lifetime.
         if one_shot {
             host_lease.shutdown().await;
         }
@@ -12662,6 +12669,12 @@ fn is_external_catalog_import_call(capability: &str, arguments: &serde_json::Val
             json_string_field(arguments, field)
                 .is_some_and(|action| action.eq_ignore_ascii_case("ImportChannels"))
         })
+}
+
+fn is_external_provider_metadata_call(capability: &str, arguments: &serde_json::Value) -> bool {
+    capability.eq_ignore_ascii_case(CAPABILITY_VOD_LIBRARY_PROVIDER)
+        && json_string_field(arguments, "Action")
+            .is_some_and(|action| action.eq_ignore_ascii_case("ResolveMetadata"))
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -21179,6 +21192,7 @@ fn vod_library_media_item_upsert(
     tuner_id: &str,
     item: &VodMediaItem,
     series_name: Option<&str>,
+    series_overview: Option<&str>,
     series_image_url: Option<&str>,
 ) -> RemoteMediaItemUpsert {
     let kind = match item.item_type.as_str() {
@@ -21265,6 +21279,12 @@ fn vod_library_media_item_upsert(
         if let Some(series_image_url) = series_image_url {
             metadata["SeriesImageUrl"] = serde_json::json!(series_image_url);
         }
+        if let Some(series_overview) = series_overview {
+            metadata["SeriesOverview"] = serde_json::json!(series_overview);
+            // MAGSTV exposes one series synopsis rather than distinct season copy. Reusing it is
+            // preferable to a blank synthetic Season detail and remains safe plain metadata.
+            metadata["SeasonOverview"] = serde_json::json!(series_overview);
+        }
     }
     let is_series = item.item_type == VOD_ITEM_TYPE_SERIES;
     RemoteMediaItemUpsert {
@@ -21317,9 +21337,16 @@ struct VodPluginCatalogStageWriter<'a> {
     stage: &'a RemoteMediaCatalogStage,
     plugin_id: &'a str,
     tuner_id: &'a str,
-    series_index: HashMap<String, (String, Option<String>)>,
+    series_index: HashMap<String, VodPluginSeriesMetadata>,
     counts: VodLibraryPluginImportCounts,
     seen_remote_items: usize,
+}
+
+#[derive(Clone)]
+struct VodPluginSeriesMetadata {
+    name: String,
+    overview: Option<String>,
+    image_url: Option<String>,
 }
 
 impl<'a> VodPluginCatalogStageWriter<'a> {
@@ -21365,7 +21392,11 @@ impl<'a> VodPluginCatalogStageWriter<'a> {
             if item.item_type == VOD_ITEM_TYPE_SERIES {
                 match self.series_index.entry(item.provider_reference.clone()) {
                     std::collections::hash_map::Entry::Vacant(entry) => {
-                        entry.insert((item.name.clone(), item.image_url.clone()));
+                        entry.insert(VodPluginSeriesMetadata {
+                            name: item.name.clone(),
+                            overview: item.overview.clone(),
+                            image_url: item.image_url.clone(),
+                        });
                         new_series.push(item.clone());
                     }
                     std::collections::hash_map::Entry::Occupied(_) => {}
@@ -21377,7 +21408,7 @@ impl<'a> VodPluginCatalogStageWriter<'a> {
         let mut series_items = new_series
             .iter()
             .map(|item| {
-                vod_library_media_item_upsert(self.plugin_id, self.tuner_id, item, None, None)
+                vod_library_media_item_upsert(self.plugin_id, self.tuner_id, item, None, None, None)
             })
             .collect::<Vec<_>>();
         let mut episode_count = 0usize;
@@ -21388,6 +21419,7 @@ impl<'a> VodPluginCatalogStageWriter<'a> {
                         self.plugin_id,
                         self.tuner_id,
                         &item,
+                        None,
                         None,
                         None,
                     ));
@@ -21401,8 +21433,9 @@ impl<'a> VodPluginCatalogStageWriter<'a> {
                         self.plugin_id,
                         self.tuner_id,
                         &item,
-                        series_entry.map(|(name, _)| name.as_str()),
-                        series_entry.and_then(|(_, image_url)| image_url.as_deref()),
+                        series_entry.map(|series| series.name.as_str()),
+                        series_entry.and_then(|series| series.overview.as_deref()),
+                        series_entry.and_then(|series| series.image_url.as_deref()),
                     ));
                     episode_count = episode_count.saturating_add(1);
                 }
@@ -25221,6 +25254,576 @@ async fn resolve_plugin_vod_subtitle(
         format,
         _language: language,
         requires_provider_egress,
+    })
+}
+
+struct PluginVodResolvedMetadata {
+    overview: Option<String>,
+    image_url: Option<Zeroizing<String>>,
+}
+
+const PLUGIN_VOD_METADATA_CACHE_TTL_SECONDS: i64 = 24 * 60 * 60;
+
+#[derive(Clone)]
+struct PluginVodMetadataTarget {
+    owner_id: String,
+    source_item_id: Uuid,
+    scope: &'static str,
+    overview_field: &'static str,
+    resolved_at_field: &'static str,
+    image_available_field: &'static str,
+}
+
+fn plugin_vod_metadata_resolution_is_fresh(
+    metadata: &serde_json::Value,
+    target: &PluginVodMetadataTarget,
+) -> bool {
+    json_field_case_insensitive(metadata, target.resolved_at_field)
+        .and_then(serde_json::Value::as_i64)
+        .is_some_and(|resolved_at| {
+            let age = OffsetDateTime::now_utc()
+                .unix_timestamp()
+                .saturating_sub(resolved_at);
+            (0..PLUGIN_VOD_METADATA_CACHE_TTL_SECONDS).contains(&age)
+        })
+}
+
+fn plugin_vod_metadata_overview(
+    metadata: &serde_json::Value,
+    target: &PluginVodMetadataTarget,
+) -> Option<String> {
+    json_field_case_insensitive(metadata, target.overview_field)
+        .and_then(serde_json::Value::as_str)
+        .and_then(|overview| safe_live_tv_plugin_text(overview, 16 * 1024))
+}
+
+fn plugin_vod_image_resolution_complete(
+    metadata: &serde_json::Value,
+    target: &PluginVodMetadataTarget,
+    cached_image_present: bool,
+) -> bool {
+    match json_field_case_insensitive(metadata, target.image_available_field)
+        .and_then(serde_json::Value::as_bool)
+    {
+        Some(true) => cached_image_present,
+        Some(false) => true,
+        None => false,
+    }
+}
+
+fn apply_safe_plugin_vod_resolution(
+    metadata: &mut serde_json::Value,
+    target: &PluginVodMetadataTarget,
+    overview: Option<&str>,
+    image_available: bool,
+    resolved_at: i64,
+) {
+    remove_plugin_vod_external_image_fields(metadata);
+    if let Some(overview) = overview {
+        metadata[target.overview_field] = serde_json::Value::String(overview.to_string());
+    }
+    metadata[target.image_available_field] = serde_json::Value::Bool(image_available);
+    metadata[target.resolved_at_field] = serde_json::json!(resolved_at);
+}
+
+fn remove_plugin_vod_external_image_fields(metadata: &mut serde_json::Value) -> bool {
+    let Some(object) = metadata.as_object_mut() else {
+        return false;
+    };
+    let previous_len = object.len();
+    object.retain(|key, _| {
+        let normalized = key
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect::<String>();
+        !matches!(
+            normalized.as_str(),
+            "imageurl"
+                | "primaryimageurl"
+                | "seriesimageurl"
+                | "seriesprimaryimageurl"
+                | "backdropimageurl"
+                | "parentbackdropimageurl"
+        )
+    });
+    object.len() != previous_len
+}
+
+async fn fetch_plugin_vod_remote_image(source_url: &str) -> Result<Vec<u8>, ApiError> {
+    let proxy = std::env::var("JELLYRIN_PROVIDER_EGRESS_PROXY").map_err(|_| {
+        ApiError::service_unavailable("VOD provider egress proxy is not configured")
+    })?;
+    let response = send_sensitive_remote_live_request_with_proxy(
+        source_url,
+        true,
+        Some(&proxy),
+        StdDuration::from_secs(15),
+    )
+    .await?;
+    if !response.status().is_success() {
+        return Err(ApiError::service_unavailable(
+            "VOD provider artwork is unavailable",
+        ));
+    }
+    let declared_content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .map(str::to_ascii_lowercase);
+    if declared_content_type.as_deref().is_some_and(|value| {
+        !matches!(
+            value,
+            "image/jpeg"
+                | "image/jpg"
+                | "image/png"
+                | "image/webp"
+                | "image/gif"
+                | "application/octet-stream"
+        )
+    }) {
+        return Err(ApiError::service_unavailable(
+            "VOD provider artwork content type is invalid",
+        ));
+    }
+    let bytes = read_bounded_remote_image_body(response, IMAGE_UPLOAD_LIMIT_BYTES).await?;
+    if bytes.is_empty()
+        || image_format_from_bytes(&bytes).extension == "bin"
+        || !safe_remote_image_dimensions(&bytes)
+    {
+        return Err(ApiError::service_unavailable(
+            "VOD provider artwork payload is invalid",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn safe_remote_image_dimensions(bytes: &[u8]) -> bool {
+    const MAX_DIMENSION: u32 = 16_384;
+    const MAX_PIXELS: u64 = 100_000_000;
+    image_dimensions_from_bytes(bytes).is_some_and(|(width, height)| {
+        width > 0
+            && height > 0
+            && width <= MAX_DIMENSION
+            && height <= MAX_DIMENSION
+            && u64::from(width).saturating_mul(u64::from(height)) <= MAX_PIXELS
+    })
+}
+
+fn image_dimensions_from_bytes(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.starts_with(&[137, 80, 78, 71, 13, 10, 26, 10]) && bytes.len() >= 24 {
+        return Some((
+            u32::from_be_bytes(bytes[16..20].try_into().ok()?),
+            u32::from_be_bytes(bytes[20..24].try_into().ok()?),
+        ));
+    }
+    if (bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) && bytes.len() >= 10 {
+        return Some((
+            u16::from_le_bytes(bytes[6..8].try_into().ok()?).into(),
+            u16::from_le_bytes(bytes[8..10].try_into().ok()?).into(),
+        ));
+    }
+    if bytes.len() >= 30 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        if &bytes[12..16] == b"VP8X" {
+            let width = 1 + u32::from_le_bytes([bytes[24], bytes[25], bytes[26], 0]);
+            let height = 1 + u32::from_le_bytes([bytes[27], bytes[28], bytes[29], 0]);
+            return Some((width, height));
+        }
+        if &bytes[12..16] == b"VP8 " && bytes.len() >= 30 && bytes[23..26] == [0x9d, 0x01, 0x2a] {
+            let width = u16::from_le_bytes(bytes[26..28].try_into().ok()?) & 0x3fff;
+            let height = u16::from_le_bytes(bytes[28..30].try_into().ok()?) & 0x3fff;
+            return Some((width.into(), height.into()));
+        }
+        if &bytes[12..16] == b"VP8L" && bytes.len() >= 25 && bytes[20] == 0x2f {
+            let bits = u32::from_le_bytes(bytes[21..25].try_into().ok()?);
+            return Some(((bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1));
+        }
+    }
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        let mut offset = 2_usize;
+        while offset.saturating_add(4) <= bytes.len() {
+            if bytes[offset] != 0xff {
+                offset = offset.saturating_add(1);
+                continue;
+            }
+            let marker = bytes[offset + 1];
+            offset = offset.saturating_add(2);
+            if matches!(marker, 0xd8 | 0xd9) || (0xd0..=0xd7).contains(&marker) {
+                continue;
+            }
+            if offset.saturating_add(2) > bytes.len() {
+                return None;
+            }
+            let segment_len = usize::from(u16::from_be_bytes(
+                bytes[offset..offset + 2].try_into().ok()?,
+            ));
+            if segment_len < 2 || offset.saturating_add(segment_len) > bytes.len() {
+                return None;
+            }
+            if matches!(
+                marker,
+                0xc0 | 0xc1
+                    | 0xc2
+                    | 0xc3
+                    | 0xc5
+                    | 0xc6
+                    | 0xc7
+                    | 0xc9
+                    | 0xca
+                    | 0xcb
+                    | 0xcd
+                    | 0xce
+                    | 0xcf
+            ) && segment_len >= 7
+            {
+                let height = u16::from_be_bytes(bytes[offset + 3..offset + 5].try_into().ok()?);
+                let width = u16::from_be_bytes(bytes[offset + 5..offset + 7].try_into().ok()?);
+                return Some((width.into(), height.into()));
+            }
+            offset = offset.saturating_add(segment_len);
+        }
+    }
+    None
+}
+
+/// Resolves safe copy and artwork together. The only durable values are the synopsis, a bounded
+/// resolution timestamp and cached image bytes; the provider URL remains in zeroizing memory.
+async fn ensure_plugin_vod_metadata(
+    state: &AppState,
+    target: &PluginVodMetadataTarget,
+) -> Result<Option<String>, ApiError> {
+    let lock_path = stored_image_owner_dir(state, ImageOwner::Item(&target.owner_id))
+        .join(".plugin-vod-metadata");
+    let lock = trickplay_tile_lock(&lock_path).await;
+    let _guard = lock.lock().await;
+
+    let mut metadata = metadata_payload_for_item(&state.db, target.source_item_id).await?;
+    if plugin_vod_remote_reference(&metadata).is_none() {
+        return Ok(None);
+    }
+    let removed_external_image_fields = remove_plugin_vod_external_image_fields(&mut metadata);
+    let overview = plugin_vod_metadata_overview(&metadata, target);
+    let cached_image =
+        find_stored_image(state, ImageOwner::Item(&target.owner_id), "Primary", 0).await?;
+    let image_resolution_complete =
+        plugin_vod_image_resolution_complete(&metadata, target, cached_image.is_some());
+    if plugin_vod_metadata_resolution_is_fresh(&metadata, target) && image_resolution_complete {
+        if removed_external_image_fields {
+            state
+                .db
+                .update_media_item_metadata(target.source_item_id, metadata)
+                .await
+                .map_err(ApiError::from)?;
+        }
+        return Ok(overview);
+    }
+
+    let resolved = resolve_plugin_vod_metadata(&state.db, &metadata, target.scope).await?;
+    let resolved_overview = resolved.overview.or(overview);
+    if let Some(overview) = resolved_overview.as_deref() {
+        metadata[target.overview_field] = serde_json::Value::String(overview.to_string());
+    }
+
+    let image_available = if let Some(image_url) = resolved.image_url.as_deref() {
+        let bytes = match fetch_plugin_vod_remote_image(image_url).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                // Synopsis resolution remains useful even when artwork egress/cache is
+                // unavailable. Persist only that safe field; omitting the success marker allows a
+                // later image request to retry without another login once the cache is writable.
+                state
+                    .db
+                    .update_media_item_metadata(target.source_item_id, metadata)
+                    .await
+                    .map_err(ApiError::from)?;
+                return Err(error);
+            }
+        };
+        // Validate and fetch before touching the cache. A read-only/misconfigured cache is a
+        // recoverable presentation failure at the caller and must never expose the source URL.
+        if let Err(error) = store_image_bytes(
+            state,
+            ImageOwner::Item(&target.owner_id),
+            "Primary",
+            0,
+            bytes,
+        )
+        .await
+        {
+            state
+                .db
+                .update_media_item_metadata(target.source_item_id, metadata)
+                .await
+                .map_err(ApiError::from)?;
+            return Err(error);
+        }
+        true
+    } else {
+        false
+    };
+    apply_safe_plugin_vod_resolution(
+        &mut metadata,
+        target,
+        resolved_overview.as_deref(),
+        image_available,
+        OffsetDateTime::now_utc().unix_timestamp(),
+    );
+    state
+        .db
+        .update_media_item_metadata(target.source_item_id, metadata)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(resolved_overview)
+}
+
+fn plugin_vod_item_metadata_target(
+    item: &MediaItem,
+    metadata: &serde_json::Value,
+) -> Option<PluginVodMetadataTarget> {
+    plugin_vod_remote_reference(metadata)?;
+    Some(PluginVodMetadataTarget {
+        owner_id: item.id.simple().to_string(),
+        source_item_id: item.id,
+        scope: "Item",
+        overview_field: "Overview",
+        resolved_at_field: "PluginVodMetadataResolvedAt",
+        image_available_field: "PluginVodImageAvailable",
+    })
+}
+
+async fn plugin_vod_virtual_metadata_target(
+    db: &Database,
+    owner_id: &str,
+    season: bool,
+) -> Result<Option<PluginVodMetadataTarget>, ApiError> {
+    // New catalogues persist a provider-backed Series anchor even when the series has no
+    // episodes. Prefer that authoritative reference; the episode snapshot below remains the
+    // compatibility path for catalogues created before anchors were introduced.
+    if !season {
+        if let Ok(owner_uuid) = Uuid::parse_str(owner_id) {
+            if let Some(anchor) = db
+                .media_item_by_id_visible(owner_uuid)
+                .await
+                .map_err(ApiError::from)?
+            {
+                let metadata = metadata_payload_for_item(db, anchor.id).await?;
+                let is_series = json_field_case_insensitive(&metadata, "PluginVodKind")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|kind| kind.eq_ignore_ascii_case("series"));
+                if is_series && plugin_vod_remote_reference(&metadata).is_some() {
+                    return Ok(Some(PluginVodMetadataTarget {
+                        owner_id: owner_id.to_string(),
+                        source_item_id: anchor.id,
+                        scope: "Series",
+                        overview_field: "SeriesOverview",
+                        resolved_at_field: "SeriesPluginVodMetadataResolvedAt",
+                        image_available_field: "SeriesPluginVodImageAvailable",
+                    }));
+                }
+            }
+        }
+    }
+    let snapshot = if season {
+        tv_episode_catalog_snapshot_for_season(db, owner_id).await?
+    } else {
+        tv_episode_catalog_snapshot_for_series(db, owner_id).await?
+    };
+    let Some(snapshot) = snapshot else {
+        return Ok(None);
+    };
+    let Some(source_item_id) = snapshot.items.iter().find_map(|item| {
+        snapshot
+            .metadata_by_item
+            .get(&item.id)
+            .and_then(plugin_vod_remote_reference)
+            .map(|_| item.id)
+    }) else {
+        return Ok(None);
+    };
+    Ok(Some(if season {
+        PluginVodMetadataTarget {
+            owner_id: owner_id.to_string(),
+            source_item_id,
+            scope: "Series",
+            overview_field: "SeasonOverview",
+            resolved_at_field: "SeasonPluginVodMetadataResolvedAt",
+            image_available_field: "SeasonPluginVodImageAvailable",
+        }
+    } else {
+        PluginVodMetadataTarget {
+            owner_id: owner_id.to_string(),
+            source_item_id,
+            scope: "Series",
+            overview_field: "SeriesOverview",
+            resolved_at_field: "SeriesPluginVodMetadataResolvedAt",
+            image_available_field: "SeriesPluginVodImageAvailable",
+        }
+    }))
+}
+
+async fn enrich_plugin_vod_item_metadata(
+    state: &AppState,
+    item: &MediaItem,
+    metadata: &mut serde_json::Value,
+) {
+    let Some(target) = plugin_vod_item_metadata_target(item, metadata) else {
+        return;
+    };
+    remove_plugin_vod_external_image_fields(metadata);
+    match ensure_plugin_vod_metadata(state, &target).await {
+        Ok(Some(overview)) => {
+            metadata["Overview"] = serde_json::Value::String(overview);
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(
+                status = %error.status(),
+                "VOD metadata enrichment was unavailable"
+            );
+        }
+    }
+}
+
+async fn enrich_plugin_vod_virtual_metadata(
+    state: &AppState,
+    item_id: &str,
+    season: bool,
+    metadata: &mut serde_json::Value,
+) {
+    remove_plugin_vod_external_image_fields(metadata);
+    let target = match plugin_vod_virtual_metadata_target(&state.db, item_id, season).await {
+        Ok(Some(target)) => target,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(status = %error.status(), "VOD virtual metadata lookup failed");
+            return;
+        }
+    };
+    match ensure_plugin_vod_metadata(state, &target).await {
+        Ok(Some(overview)) => metadata["Overview"] = serde_json::Value::String(overview),
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(
+                status = %error.status(),
+                "VOD virtual metadata enrichment was unavailable"
+            );
+        }
+    }
+}
+
+async fn resolve_plugin_vod_metadata(
+    db: &Database,
+    metadata: &serde_json::Value,
+    scope: &str,
+) -> Result<PluginVodResolvedMetadata, ApiError> {
+    if !matches!(scope, "Item" | "Series") {
+        return Err(ApiError::bad_request("VOD metadata scope is invalid"));
+    }
+    let reference = plugin_vod_remote_reference(metadata)
+        .ok_or_else(|| ApiError::service_unavailable("VOD metadata route is unavailable"))?;
+    let _admission_guard =
+        external_plugin_host_admission_slot(&reference.plugin_id, "provider-metadata")
+            .await
+            .acquire_owned()
+            .await
+            .map_err(|_| ApiError::service_unavailable("VOD metadata provider is unavailable"))?;
+    let security_slot = external_plugin_security_slot(&reference.plugin_id).await;
+    let _security_guard = security_slot.read_owned().await;
+    let tuner = db
+        .live_tv_tuner_configuration_by_id(&reference.tuner_id)
+        .await?
+        .ok_or_else(|| ApiError::service_unavailable("VOD metadata tuner is unavailable"))?;
+    if contains_plaintext_provider_secret(&tuner) {
+        return Err(ApiError::service_unavailable(
+            "VOD metadata tuner must use an external secret reference",
+        ));
+    }
+    let tuner_type = json_string_field(&tuner, "Type")
+        .ok_or_else(|| ApiError::service_unavailable("VOD metadata tuner route is unavailable"))?;
+    if !live_tv_plugin_id_from_payload(&tuner, &tuner_type)
+        .is_some_and(|plugin_id| plugin_id.eq_ignore_ascii_case(&reference.plugin_id))
+    {
+        return Err(ApiError::service_unavailable(
+            "VOD metadata tuner binding is invalid",
+        ));
+    }
+    let plugin = db
+        .installed_plugin_json(&reference.plugin_id)
+        .await?
+        .filter(|plugin| {
+            json_string_field(plugin, "Status").as_deref() == Some("Active")
+                && plugin_string_array(plugin.get("Capabilities"))
+                    .iter()
+                    .any(|capability| {
+                        capability.eq_ignore_ascii_case(CAPABILITY_VOD_LIBRARY_PROVIDER)
+                    })
+        })
+        .ok_or_else(|| ApiError::service_unavailable("VOD metadata provider is unavailable"))?;
+    let Some((runtime, runtime_name, error_prefix, host_path)) = plugin_runtime_host_path(&plugin)
+    else {
+        return Err(ApiError::service_unavailable(
+            "VOD metadata runtime is unavailable",
+        ));
+    };
+    let request = vod_library_plugin_provider_request(
+        db,
+        &plugin,
+        &tuner,
+        "ResolveMetadata",
+        serde_json::json!({
+            "ProviderReference": reference.provider_reference,
+            "Scope": scope,
+        }),
+    )
+    .await
+    .map_err(|_| ApiError::service_unavailable("VOD metadata credentials are unavailable"))?;
+    let arguments = serde_json::to_value(request)
+        .map_err(|_| ApiError::internal("invalid VOD metadata request"))?;
+    let result = invoke_plugin_capability_via_runtime_host_path_with_timeout(
+        &plugin,
+        CAPABILITY_VOD_LIBRARY_PROVIDER,
+        arguments,
+        runtime,
+        runtime_name,
+        error_prefix,
+        host_path,
+        StdDuration::from_secs(15),
+    )
+    .await
+    .map_err(|_| ApiError::service_unavailable("VOD metadata resolution failed"))?
+    .ok_or_else(|| ApiError::service_unavailable("VOD metadata runtime is unavailable"))?;
+    let result = ZeroizingJsonValue(result.value);
+    if result
+        .0
+        .get("Status")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|status| !status.eq_ignore_ascii_case("Executed"))
+    {
+        return Err(ApiError::service_unavailable(
+            "VOD metadata provider rejected resolution",
+        ));
+    }
+    let payload = result
+        .0
+        .get("Metadata")
+        .or_else(|| result.0.get("Result"))
+        .unwrap_or(&result.0);
+    let overview = safe_live_tv_plugin_string_field(payload, "Overview", 16 * 1024)
+        .map_err(|_| ApiError::service_unavailable("VOD metadata response is invalid"))?;
+    let image_url = json_field_case_insensitive(payload, "ImageUrl")
+        .map(|value| {
+            let value = value
+                .as_str()
+                .ok_or_else(|| ApiError::service_unavailable("VOD metadata response is invalid"))?;
+            validated_remote_media_url(value)?;
+            Ok::<_, ApiError>(Zeroizing::new(value.to_string()))
+        })
+        .transpose()?;
+    Ok(PluginVodResolvedMetadata {
+        overview,
+        image_url,
     })
 }
 
@@ -33394,6 +33997,7 @@ async fn item_detail(
                 .await?
                 .item;
         }
+        enrich_plugin_vod_item_metadata(&state, &item, &mut metadata).await;
         return Ok(Json(media_item_to_json_with_playback_and_metadata(
             &item,
             &server_id,
@@ -33407,12 +34011,14 @@ async fn item_detail(
     if let Some(channel) = live_tv_channel_json_by_id(&state.db, &item_id).await? {
         return Ok(Json(channel));
     }
-    if let Some(summary) = tv_series_summary_by_id(&state.db, &item_id, None).await? {
+    if let Some(mut summary) = tv_series_summary_by_id(&state.db, &item_id, None).await? {
+        enrich_plugin_vod_virtual_metadata(&state, &item_id, false, &mut summary.metadata).await;
         return Ok(Json(tv_series_json(&server_id, summary)));
     }
-    if let Some((series_name, series_id, summary)) =
+    if let Some((series_name, series_id, mut summary)) =
         tv_season_summary_by_id(&state.db, &item_id, None).await?
     {
+        enrich_plugin_vod_virtual_metadata(&state, &item_id, true, &mut summary.metadata).await;
         return Ok(Json(tv_season_json(
             &server_id,
             &series_name,
@@ -33501,6 +34107,7 @@ async fn current_user_item_detail(
                 .await?
                 .item;
         }
+        enrich_plugin_vod_item_metadata(&state, &item, &mut metadata).await;
         return Ok(Json(media_item_to_json_with_playback_and_metadata(
             &item,
             &server_id,
@@ -33514,14 +34121,16 @@ async fn current_user_item_detail(
     if let Some(channel) = live_tv_channel_json_by_id(&state.db, &item_id).await? {
         return Ok(Json(channel));
     }
-    if let Some(summary) =
+    if let Some(mut summary) =
         tv_series_summary_by_id(&state.db, &item_id, Some(requested_user_id)).await?
     {
+        enrich_plugin_vod_virtual_metadata(&state, &item_id, false, &mut summary.metadata).await;
         return Ok(Json(tv_series_json(&server_id, summary)));
     }
-    if let Some((series_name, series_id, summary)) =
+    if let Some((series_name, series_id, mut summary)) =
         tv_season_summary_by_id(&state.db, &item_id, Some(requested_user_id)).await?
     {
+        enrich_plugin_vod_virtual_metadata(&state, &item_id, true, &mut summary.metadata).await;
         return Ok(Json(tv_season_json(
             &server_id,
             &series_name,
@@ -33596,6 +34205,7 @@ async fn user_item_detail(
                 .await?
                 .item;
         }
+        enrich_plugin_vod_item_metadata(&state, &item, &mut metadata).await;
         return Ok(Json(media_item_to_json_with_playback_and_metadata(
             &item,
             &server_id,
@@ -33609,12 +34219,14 @@ async fn user_item_detail(
     if let Some(channel) = live_tv_channel_json_by_id(&state.db, &item_id).await? {
         return Ok(Json(channel));
     }
-    if let Some(summary) = tv_series_summary_by_id(&state.db, &item_id, Some(user_id)).await? {
+    if let Some(mut summary) = tv_series_summary_by_id(&state.db, &item_id, Some(user_id)).await? {
+        enrich_plugin_vod_virtual_metadata(&state, &item_id, false, &mut summary.metadata).await;
         return Ok(Json(tv_series_json(&server_id, summary)));
     }
-    if let Some((series_name, series_id, summary)) =
+    if let Some((series_name, series_id, mut summary)) =
         tv_season_summary_by_id(&state.db, &item_id, Some(user_id)).await?
     {
+        enrich_plugin_vod_virtual_metadata(&state, &item_id, true, &mut summary.metadata).await;
         return Ok(Json(tv_season_json(
             &server_id,
             &series_name,
@@ -57744,6 +58356,22 @@ async fn item_image_or_placeholder(
     {
         return Ok(response);
     }
+    if image_index == 0
+        && normalize_image_type(image_type) == "primary"
+        && let Some(target) = plugin_vod_item_metadata_target(&item, &metadata)
+    {
+        if let Err(error) = ensure_plugin_vod_metadata(state, &target).await {
+            tracing::warn!(
+                status = %error.status(),
+                "VOD artwork resolution was unavailable; using placeholder"
+            );
+        }
+        if let Some(path) =
+            find_stored_image(state, ImageOwner::Item(item_id), "Primary", 0).await?
+        {
+            return stored_image_response(path).await;
+        }
+    }
     if let Some(local_image) = find_local_item_image(&item, image_type, image_index).await? {
         return stored_image_response(local_image).await;
     }
@@ -57766,7 +58394,7 @@ async fn find_local_item_image(
     image_type: &str,
     image_index: usize,
 ) -> Result<Option<PathBuf>, ApiError> {
-    if is_xtream_virtual_item(item) {
+    if is_xtream_virtual_item(item) || is_plugin_vod_virtual_item(item) {
         return Ok(None);
     }
     let media_path = media_item_path(item);
@@ -57890,7 +58518,7 @@ async fn find_generated_video_item_image(
     image_type: &str,
     image_index: usize,
 ) -> Result<Option<PathBuf>, ApiError> {
-    if is_xtream_virtual_item(item) {
+    if is_xtream_virtual_item(item) || is_plugin_vod_virtual_item(item) {
         return Ok(None);
     }
     if !item.media_type.eq_ignore_ascii_case("Video")
@@ -58076,6 +58704,23 @@ async fn virtual_tv_item_image_response(
                 Err(error) => {
                     tracing::warn!(?error, "failed to cache remote series image candidate");
                 }
+            }
+        }
+    }
+    if normalize_image_type(image_type) == "primary" {
+        let season = item_type == "Season";
+        if let Some(target) = plugin_vod_virtual_metadata_target(&state.db, item_id, season).await?
+        {
+            if let Err(error) = ensure_plugin_vod_metadata(state, &target).await {
+                tracing::warn!(
+                    status = %error.status(),
+                    "VOD virtual artwork resolution was unavailable; using placeholder"
+                );
+            }
+            if let Some(path) =
+                find_stored_image(state, ImageOwner::Item(item_id), "Primary", 0).await?
+            {
+                return stored_image_response(path).await.map(Some);
             }
         }
     }
@@ -58556,13 +59201,11 @@ pub(crate) async fn find_stored_image(
 }
 
 pub(crate) fn stored_image_owner_dir(state: &AppState, owner: ImageOwner<'_>) -> PathBuf {
-    let base = state
-        .log_dir
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or(&state.log_dir)
-        .join("metadata")
-        .join("images");
+    stored_image_owner_dir_from_cache_root(&api_cache_root(&state.log_dir), owner)
+}
+
+fn stored_image_owner_dir_from_cache_root(cache_root: &FsPath, owner: ImageOwner<'_>) -> PathBuf {
+    let base = cache_root.join("metadata").join("images");
     let [kind, id] = owner.directory_segments();
     base.join(kind).join(sanitize_image_path_segment(id))
 }
@@ -60651,6 +61294,84 @@ mod tests {
         );
     }
 
+    #[test]
+    fn stored_images_use_writable_cache_root_not_read_only_log_parent() {
+        let path = super::stored_image_owner_dir_from_cache_root(
+            std::path::Path::new("/var/cache/jellyrin"),
+            super::ImageOwner::Item("movie-1"),
+        );
+        assert_eq!(
+            path,
+            std::path::PathBuf::from("/var/cache/jellyrin/metadata/images/items/movie-1")
+        );
+        assert!(!path.starts_with("/var/log"));
+    }
+
+    #[test]
+    fn plugin_vod_metadata_cache_hit_and_negative_hit_are_explicit() {
+        let target = super::PluginVodMetadataTarget {
+            owner_id: "movie-1".to_string(),
+            source_item_id: uuid::Uuid::nil(),
+            scope: "Item",
+            overview_field: "Overview",
+            resolved_at_field: "PluginVodMetadataResolvedAt",
+            image_available_field: "PluginVodImageAvailable",
+        };
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let mut metadata = json!({
+            "ImageUrl": "https://images.provider.invalid/poster.jpg?token=secret",
+            "SeriesImageUrl": "https://images.provider.invalid/series.jpg?signature=secret",
+        });
+        super::apply_safe_plugin_vod_resolution(
+            &mut metadata,
+            &target,
+            Some("Safe synopsis"),
+            true,
+            now,
+        );
+        assert!(super::plugin_vod_metadata_resolution_is_fresh(
+            &metadata, &target
+        ));
+        assert!(super::plugin_vod_image_resolution_complete(
+            &metadata, &target, true
+        ));
+        assert!(!super::plugin_vod_image_resolution_complete(
+            &metadata, &target, false
+        ));
+
+        super::apply_safe_plugin_vod_resolution(
+            &mut metadata,
+            &target,
+            Some("Safe synopsis"),
+            false,
+            now,
+        );
+        assert!(super::plugin_vod_image_resolution_complete(
+            &metadata, &target, false
+        ));
+        // The mutator deliberately has no URL input and scrubs legacy provider artwork fields:
+        // only safe copy/cache markers can reach DB or later item JSON.
+        assert!(
+            !serde_json::to_string(&metadata)
+                .unwrap()
+                .contains("images.provider.invalid")
+        );
+    }
+
+    #[test]
+    fn provider_artwork_dimensions_are_bounded_before_cache_write() {
+        let mut png = vec![0_u8; 24];
+        png[..8].copy_from_slice(&[137, 80, 78, 71, 13, 10, 26, 10]);
+        png[16..20].copy_from_slice(&480_u32.to_be_bytes());
+        png[20..24].copy_from_slice(&720_u32.to_be_bytes());
+        assert_eq!(super::image_dimensions_from_bytes(&png), Some((480, 720)));
+        assert!(super::safe_remote_image_dimensions(&png));
+
+        png[16..20].copy_from_slice(&20_000_u32.to_be_bytes());
+        assert!(!super::safe_remote_image_dimensions(&png));
+        assert!(!super::safe_remote_image_dimensions(b"not-an-image"));
+    }
+
     async fn published_plugin_package_fixture(
         root: &std::path::Path,
     ) -> (
@@ -61095,6 +61816,22 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn provider_metadata_has_a_dedicated_reusable_runtime_lane() {
+        assert!(super::is_external_provider_metadata_call(
+            super::CAPABILITY_VOD_LIBRARY_PROVIDER,
+            &json!({ "Action": "ResolveMetadata" }),
+        ));
+        assert!(!super::is_external_provider_metadata_call(
+            super::CAPABILITY_VOD_LIBRARY_PROVIDER,
+            &json!({ "Action": "ResolvePlayback" }),
+        ));
+        assert!(!super::is_external_provider_metadata_call(
+            super::CAPABILITY_LIVE_TV_PROVIDER,
+            &json!({ "Action": "ResolveMetadata" }),
+        ));
+    }
+
     #[tokio::test]
     async fn generic_runtime_loader_rejects_external_process() {
         let result = super::load_plugin_runtime_host_with_path(
@@ -61503,6 +62240,7 @@ mod tests {
             "ItemType": "Series",
             "ProviderReference": "provider:v1:series-1",
             "Name": "Show One",
+            "Overview": "A staged series overview.",
             "ImageUrl": "https://images.example.invalid/show.jpg"
         }));
         page.push(json!({
@@ -61568,13 +62306,18 @@ mod tests {
                 .len(),
             super::REMOTE_MEDIA_CATALOG_STAGE_MAX_APPEND_ITEMS + 1
         );
-        assert_eq!(
-            db.media_items_for_virtual_folders(&[series.id])
-                .await
-                .unwrap()
-                .len(),
-            3
-        );
+        let episode_items = db
+            .media_items_for_virtual_folders(&[series.id])
+            .await
+            .unwrap();
+        assert_eq!(episode_items.len(), 3);
+        let episode = episode_items
+            .iter()
+            .find(|item| item.name == "Pilot")
+            .unwrap();
+        let episode_metadata = super::metadata_payload_for_item(&db, episode.id)
+            .await
+            .unwrap();
         let page = db
             .tv_series_catalog_page(Some(series.id), 0, 20)
             .await
@@ -61625,6 +62368,18 @@ mod tests {
             empty_summary.metadata["SeriesPrimaryImageUrl"],
             "https://images.example.invalid/empty.jpg"
         );
+        assert_eq!(
+            episode_metadata["SeriesOverview"],
+            "A staged series overview."
+        );
+        assert_eq!(
+            episode_metadata["SeasonOverview"],
+            "A staged series overview."
+        );
+        assert_eq!(
+            episode_metadata["SeriesImageUrl"],
+            "https://images.example.invalid/show.jpg"
+        );
     }
 
     #[tokio::test]
@@ -61661,6 +62416,7 @@ mod tests {
                     format!("provider:v1:probe-{attempt}"),
                     format!("Probe {attempt}"),
                 ),
+                None,
                 None,
                 None,
             );
