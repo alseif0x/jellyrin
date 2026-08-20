@@ -22,9 +22,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@d8dfd7155fea72af4ad34a8fe97364d210e2d020 # 1.94.0
+      - uses: dtolnay/rust-toolchain@35d8a35b823d6c20db516f5c35eb0a9640942c17 # 1.94.0
         with:
-          toolchain: 1.94.0
           components: rustfmt
       - run: cargo fmt --all -- --check
 
@@ -35,9 +34,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Supply-chain lock policy
         run: node qa/supply-chain.js
-      - uses: dtolnay/rust-toolchain@d8dfd7155fea72af4ad34a8fe97364d210e2d020 # 1.94.0
+      - uses: dtolnay/rust-toolchain@35d8a35b823d6c20db516f5c35eb0a9640942c17 # 1.94.0
         with:
-          toolchain: 1.94.0
           components: clippy
       - run: cargo check --locked -p jellyrin-server
       - run: cargo check --locked --workspace --all-targets --all-features
@@ -52,9 +50,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@d8dfd7155fea72af4ad34a8fe97364d210e2d020 # 1.94.0
-        with:
-          toolchain: 1.94.0
+      - uses: dtolnay/rust-toolchain@35d8a35b823d6c20db516f5c35eb0a9640942c17 # 1.94.0
       - run: cargo test --locked --workspace --all-targets --all-features
       - name: Verify counts-only runtime hygiene gate
         run: node qa/runtime-hygiene-smoke.js
@@ -80,9 +76,7 @@ jobs:
       JELLYRIN_TEST_POSTGRES_URL: postgresql://jellyrin_test:local-ci-only@127.0.0.1:5432/jellyrin_test
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@d8dfd7155fea72af4ad34a8fe97364d210e2d020 # 1.94.0
-        with:
-          toolchain: 1.94.0
+      - uses: dtolnay/rust-toolchain@35d8a35b823d6c20db516f5c35eb0a9640942c17 # 1.94.0
       - run: cargo test --locked -p jellyrin-db --all-features -- --test-threads=4
       - run: cargo test --locked -p jellyrin-migrate --all-features -- --test-threads=2
       - name: Verify counts-only provider URL retention gate
@@ -118,9 +112,7 @@ jobs:
           POSTGRES_MIGRATOR_PASSWORD: ci-compose-migrator
           POSTGRES_RUNTIME_PASSWORD: ci-compose-runtime
         run: docker compose config --quiet
-      - uses: dtolnay/rust-toolchain@d8dfd7155fea72af4ad34a8fe97364d210e2d020 # 1.94.0
-        with:
-          toolchain: 1.94.0
+      - uses: dtolnay/rust-toolchain@35d8a35b823d6c20db516f5c35eb0a9640942c17 # 1.94.0
       - name: Build locked release image
         shell: bash
         run: |

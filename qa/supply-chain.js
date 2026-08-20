@@ -280,10 +280,11 @@ async function main() {
         workflow.includes(`actions/upload-artifact@${lock.ACTIONS_UPLOAD_ARTIFACT_SHA}`),
     ),
     check(
-      'ci-rust-toolchain-is-explicit',
+      'ci-rust-toolchain-is-sha-pinned',
       rustToolchainUses.length > 0 &&
         rustToolchainSteps.length === rustToolchainUses.length &&
-        rustToolchainSteps.every((step) => /^\s{10}toolchain:\s*1\.94\.0\s*$/m.test(step)),
+        rustToolchainUses.every((match) => match[1] === lock.DTOLNAY_RUST_TOOLCHAIN_SHA) &&
+        rustToolchainSteps.every((step) => !/^\s{10}toolchain:/m.test(step)),
     ),
     check(
       'rust-lock-excludes-rsa',
