@@ -38421,6 +38421,13 @@ async fn playback_transcode_info_response(
     request.start_position_ticks = options.start_position_ticks;
     align_hls_request_segment_timeline(&mut request);
     request.include_video = include_video;
+    // FFmpeg's `vod` HLS playlist is not published until the finite input reaches EOF. Most
+    // library items have a duration, so Jellyrin can serve its synthetic seekable playlist while
+    // FFmpeg fills segments in the background. Opaque provider items may legitimately have no
+    // duration, though; in that case the media-playlist route has to serve FFmpeg's physical
+    // playlist. Use the incrementally published `event` form so Web receives it after the first
+    // segment instead of waiting for the entire movie to transcode.
+    request.event_playlist = hls_event_playlist_required(item.runtime_ticks);
     request.burn_in_subtitle = options.burn_in_subtitle;
     request.video_mode = decision.video;
     request.audio_mode = decision.audio;
@@ -38486,6 +38493,10 @@ async fn playback_transcode_info_response(
         &options,
         &decision,
     )
+}
+
+fn hls_event_playlist_required(runtime_ticks: Option<i64>) -> bool {
+    runtime_ticks.is_none_or(|runtime_ticks| runtime_ticks <= 0)
 }
 
 /// Stop a device's other in-flight transcodes before starting a new one.
@@ -42898,6 +42909,24 @@ async fn hls_media_playlist_response_for(
         && let Some(playlist) =
             render_seekable_hls_media_playlist(&session, item_id, raw_query, route.route_media_type)
     {
+        // A synthetic VOD playlist is available as soon as the provider supplies a duration, but
+        // its first URI must not outrun the remote FFmpeg writer. Plugin byte-range startup can
+        // spend several seconds resolving and probing a protected MPEG-TS source. Returning the
+        // playlist immediately makes Web request segment zero, whose on-demand fallback then
+        // stops the almost-ready continuous writer. Hold only plugin VOD here; local media and the
+        // already-tuned Xtream path retain their existing zero-wait behavior.
+        if is_plugin_vod_virtual_item(&session.item) {
+            let initial_segment_id = hls_start_segment_number(session.start_position_ticks);
+            let ready = wait_for_hls_segment_ready(
+                &layout.segment_path(initial_segment_id),
+                &layout.segment_path(initial_segment_id.saturating_add(1)),
+                std::time::Duration::from_secs(LIVE_HLS_READINESS_TIMEOUT_SECS),
+            )
+            .await?;
+            if !ready {
+                return Err(ApiError::not_found("HLS playlist is not ready"));
+            }
+        }
         return playlist_response(playlist, include_body);
     }
 
@@ -61607,10 +61636,11 @@ mod tests {
         external_id_infos_for_item_type, ffmpeg_job_allowed_for_mode, ffmpeg_listing_components,
         filter_package_list, format_time_for_json, generate_missing_hls_segment,
         get_valid_filename, hdhomerun_bool_field, hls_effective_start_position_ticks,
-        hls_on_demand_generation_lock, hls_segment_start_position_ticks, hls_segment_ticks,
-        hls_start_segment_number, hls_storage_segment_id, hls_subtitle_language_tag,
-        hls_transcode_dedupe_key, hls_transcode_session_input_path, internal_remote_relay_target,
-        is_live_tv_channel_id, json_string_field, json_value_i64, last_system_lifecycle_command,
+        hls_event_playlist_required, hls_on_demand_generation_lock,
+        hls_segment_start_position_ticks, hls_segment_ticks, hls_start_segment_number,
+        hls_storage_segment_id, hls_subtitle_language_tag, hls_transcode_dedupe_key,
+        hls_transcode_session_input_path, internal_remote_relay_target, is_live_tv_channel_id,
+        json_string_field, json_value_i64, last_system_lifecycle_command,
         live_hls_session_registry, live_tv_channel_is_remote, live_tv_channel_media_source,
         live_tv_channel_stable_uuid, live_tv_configuration_json, live_tv_guide_info,
         live_tv_hls_transcoding_profile_supported, live_tv_lookup_id,
@@ -63412,6 +63442,7 @@ mod tests {
         }
         let playback: Value = serde_json::from_slice(&body).unwrap();
         let source = &playback["MediaSources"][0];
+        assert_eq!(source["RunTimeTicks"], 50_000_000);
         assert_eq!(source["SupportsDirectPlay"], false);
         assert_eq!(source["SupportsTranscoding"], true);
         assert!(source.get("DirectStreamUrl").is_none());
@@ -63457,6 +63488,7 @@ mod tests {
         assert_eq!(media.status(), StatusCode::OK);
         let media = media.text().await.unwrap();
         assert!(media.starts_with("#EXTM3U\n"), "{media}");
+        assert!(media.contains("#EXT-X-PLAYLIST-TYPE:VOD"), "{media}");
         assert!(!media.contains("signed-vod-secret"));
         let segment_url = media
             .lines()
@@ -68039,7 +68071,7 @@ while IFS= read -r line; do
           printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"MediaItems":[{"ItemType":"Episode","ProviderReference":"provider:v1:episode-1","Name":"Pilot","SeriesReference":"provider:v1:series-1","SeriesName":"Show One","SeasonNumber":1,"EpisodeNumber":1}],"EpisodeCount":1}}}\n' "$corr"
           ;;
         *'"Action":"ImportMedia"'*)
-          printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"MediaItems":[{"ItemType":"Movie","ProviderReference":"provider:v1:movie-1","Name":"Movie One"},{"ItemType":"Series","ProviderReference":"provider:v1:series-1","Name":"Show One"}],"MovieCount":1,"SeriesCount":1,"ContinuationToken":"vod-page-2","HasMore":true}}}\n' "$corr"
+          printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"MediaItems":[{"ItemType":"Movie","ProviderReference":"provider:v1:movie-1","Name":"Movie One","RuntimeTicks":50000000},{"ItemType":"Series","ProviderReference":"provider:v1:series-1","Name":"Show One"}],"MovieCount":1,"SeriesCount":1,"ContinuationToken":"vod-page-2","HasMore":true}}}\n' "$corr"
           ;;
         *'"Action":"ImportChannels"'*)
           printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"Channels":[{"Id":"one","Name":"One","ProviderReference":"provider:v1:one"}],"Categories":[{"Id":"all","Name":"All"}]}}}\n' "$corr"
@@ -105265,6 +105297,14 @@ done
             .unwrap();
 
         assert_eq!(output.as_deref(), Some(b"WEBVTT\n\n".as_slice()));
+    }
+
+    #[test]
+    fn unknown_hls_runtime_requires_incremental_event_playlist() {
+        assert!(hls_event_playlist_required(None));
+        assert!(hls_event_playlist_required(Some(0)));
+        assert!(hls_event_playlist_required(Some(-1)));
+        assert!(!hls_event_playlist_required(Some(1)));
     }
 
     #[test]
