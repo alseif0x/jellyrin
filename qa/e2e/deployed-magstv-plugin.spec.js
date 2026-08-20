@@ -704,6 +704,11 @@ async function probeVodWebExperience(request, baseURL, auth, item, expectedType)
     if (!discovery.PlaySessionId || !discoverySource) {
       throw new Error('VOD PlaybackInfo track discovery is unavailable');
     }
+    if (!(Number(discoverySource.RunTimeTicks) > 0)
+      || discoverySource.IsInfiniteStream === true
+      || discoverySource.CanSeek !== true) {
+      throw new Error('VOD finite seekable timeline is unavailable');
+    }
 
     const discoveryStreams = Array.isArray(discoverySource.MediaStreams)
       ? discoverySource.MediaStreams
