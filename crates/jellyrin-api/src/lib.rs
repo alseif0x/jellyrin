@@ -145,13 +145,13 @@ use jellyrin_db::{
     MediaItemFavoriteFilter, MediaItemMetadata, MediaItemQueryFilterSelection,
     MediaItemQueryFilterValues, MediaList, MediaListItem, MediaListUserPermission,
     NamedConfigurationPayload, PROVIDER_SECRET_REFERENCE_FIELD, PluginRuntimeInstanceUpsert,
-    ProviderSecretReference, QuickConnectSession, RemoteMediaItemUpsert,
-    RemoteMediaLibrarySnapshot, ResumeItemsPageQuery, SortDirection, SystemConfigurationPayloads,
-    TaskRun, TranscodeSession, TrickplayInfo, TvSeriesCatalogNameFilter,
-    UpsertActivePlaybackSession, UpsertActiveViewingSession, UpsertPlaybackState,
-    UpsertTranscodeSession, probe_remote_media_info_admitted,
-    provider_secret_namespace_for_configuration, record_ffprobe_capacity_unavailable,
-    upcoming_media_item_premiere_date,
+    ProviderSecretReference, QuickConnectSession, REMOTE_MEDIA_CATALOG_STAGE_MAX_APPEND_ITEMS,
+    RemoteMediaCatalogStage, RemoteMediaItemUpsert, RemoteMediaLibraryStageSpec,
+    ResumeItemsPageQuery, SortDirection, SystemConfigurationPayloads, TaskRun, TranscodeSession,
+    TrickplayInfo, TvSeriesCatalogNameFilter, UpsertActivePlaybackSession,
+    UpsertActiveViewingSession, UpsertPlaybackState, UpsertTranscodeSession,
+    probe_remote_media_info_admitted, provider_secret_namespace_for_configuration,
+    record_ffprobe_capacity_unavailable, upcoming_media_item_premiere_date,
 };
 
 #[cfg(not(test))]
@@ -257,7 +257,7 @@ const LIVE_TV_CHANNELS_DEFAULT_LIMIT: usize = 100;
 const LIVE_TV_CHANNELS_MAX_LIMIT: usize = 500;
 /// One catalogue refresh has one wall-clock budget, shared by every provider page.
 const LIVE_TV_PROVIDER_CATALOG_TIMEOUT: StdDuration = StdDuration::from_secs(120);
-const VOD_LIBRARY_PROVIDER_CATALOG_TIMEOUT: StdDuration = StdDuration::from_secs(30 * 60);
+const VOD_LIBRARY_PROVIDER_CATALOG_TIMEOUT: StdDuration = StdDuration::from_secs(2 * 60 * 60);
 /// Bound a faulty provider even when every individual RPC response fits below 1 MiB.
 const LIVE_TV_PROVIDER_CATALOG_MAX_PAGES: usize = 256;
 /// Bound the aggregate JSON retained across a paginated catalogue import. The RPC framing limit
@@ -275,9 +275,10 @@ const LIVE_TV_CONFIG_SOURCE_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 const LIVE_TV_CONFIG_MAX_PROGRAMS: usize = 250_000;
 const LIVE_TV_PROVIDER_CATALOG_MAX_CATEGORIES: usize = 10_000;
 const LIVE_TV_PROVIDER_CONTINUATION_TOKEN_MAX_BYTES: usize = 4 * 1024;
-/// VOD library imports share the live TV page/byte budgets; only the item counter differs.
-const VOD_LIBRARY_PROVIDER_CATALOG_MAX_PAGES: usize = 256;
-const VOD_LIBRARY_PROVIDER_CATALOG_MAX_ITEMS: usize = 100_000;
+/// VOD pages are persisted incrementally, so their aggregate catalogue is bounded by item/page
+/// counts instead of the 64 MiB in-memory budget used by Live TV channel imports.
+const VOD_LIBRARY_PROVIDER_CATALOG_MAX_PAGES: usize = 2_048;
+const VOD_LIBRARY_PROVIDER_CATALOG_MAX_ITEMS: usize = 1_000_000;
 const HDHOMERUN_DISCOVERY_PORT: u16 = 65001;
 const HDHOMERUN_DISCOVERY_DURATION_MS: u64 = 3000;
 const HDHOMERUN_LEGACY_DEFAULT_TUNERS: usize = 2;
@@ -12378,69 +12379,49 @@ async fn invoke_live_tv_provider_catalog_via_runtime_host_path(
     result
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct VodPluginCatalogPages {
-    media_items: Vec<serde_json::Value>,
     continuation_tokens: HashSet<String>,
     page_count: usize,
-    accumulated_bytes: usize,
-    max_accumulated_bytes: usize,
+    media_item_count: usize,
     movie_count: Option<u64>,
     series_count: Option<u64>,
     episode_count: Option<u64>,
 }
 
-impl Default for VodPluginCatalogPages {
-    fn default() -> Self {
-        Self::with_max_accumulated_bytes(LIVE_TV_PROVIDER_CATALOG_MAX_ACCUMULATED_BYTES)
-    }
+#[derive(Debug)]
+struct VodPluginCatalogPage {
+    media_items: Vec<serde_json::Value>,
+    continuation_token: Option<String>,
 }
 
 impl VodPluginCatalogPages {
-    fn with_max_accumulated_bytes(max_accumulated_bytes: usize) -> Self {
-        Self {
-            media_items: Vec::new(),
-            continuation_tokens: HashSet::new(),
-            page_count: 0,
-            accumulated_bytes: 0,
-            max_accumulated_bytes,
-            movie_count: None,
-            series_count: None,
-            episode_count: None,
-        }
-    }
-
-    fn push(&mut self, value: serde_json::Value) -> Result<Option<String>, ApiError> {
+    fn push(&mut self, value: serde_json::Value) -> Result<VodPluginCatalogPage, ApiError> {
         if self.page_count >= VOD_LIBRARY_PROVIDER_CATALOG_MAX_PAGES {
             return Err(ApiError::internal(
                 "VOD library provider catalogue exceeded the page limit",
             ));
         }
-        let remaining_bytes = self
-            .max_accumulated_bytes
-            .saturating_sub(self.accumulated_bytes);
-        let page_bytes = live_tv_plugin_catalog_encoded_size(&value, remaining_bytes)?;
-
-        self.page_count += 1;
-        self.accumulated_bytes = self.accumulated_bytes.saturating_add(page_bytes);
 
         let media_items = live_tv_plugin_catalog_array(&value, &["MediaItems"], "media items")?;
         if media_items.len()
-            > VOD_LIBRARY_PROVIDER_CATALOG_MAX_ITEMS.saturating_sub(self.media_items.len())
+            > VOD_LIBRARY_PROVIDER_CATALOG_MAX_ITEMS.saturating_sub(self.media_item_count)
         {
             return Err(ApiError::internal(
                 "VOD library provider catalogue exceeded the media item limit",
             ));
         }
-        self.media_items.extend(media_items);
-        if let Some(count) = vod_library_plugin_catalog_count(&value, "MovieCount")? {
-            self.movie_count = Some(count);
-        }
-        if let Some(count) = vod_library_plugin_catalog_count(&value, "SeriesCount")? {
-            self.series_count = Some(count);
-        }
-        if let Some(count) = vod_library_plugin_catalog_count(&value, "EpisodeCount")? {
-            self.episode_count = Some(count);
+        let movie_count = vod_library_plugin_catalog_count(&value, "MovieCount")?;
+        let series_count = vod_library_plugin_catalog_count(&value, "SeriesCount")?;
+        let episode_count = vod_library_plugin_catalog_count(&value, "EpisodeCount")?;
+        if [movie_count, series_count, episode_count]
+            .into_iter()
+            .flatten()
+            .any(|count| count > VOD_LIBRARY_PROVIDER_CATALOG_MAX_ITEMS as u64)
+        {
+            return Err(ApiError::internal(
+                "VOD library provider catalogue reported an item count above the limit",
+            ));
         }
 
         let continuation_token = live_tv_plugin_catalog_continuation_token(&value)?;
@@ -12460,36 +12441,31 @@ impl VodPluginCatalogPages {
                 "VOD library provider catalogue returned inconsistent continuation state",
             ));
         }
-        let Some(continuation_token) = continuation_token else {
-            return Ok(None);
-        };
-        if self.page_count >= VOD_LIBRARY_PROVIDER_CATALOG_MAX_PAGES {
-            return Err(ApiError::internal(
-                "VOD library provider catalogue exceeded the page limit",
-            ));
-        }
-        if !self.continuation_tokens.insert(continuation_token.clone()) {
-            return Err(ApiError::internal(
-                "VOD library provider catalogue repeated a continuation token",
-            ));
-        }
-        Ok(Some(continuation_token))
-    }
-
-    fn into_capability_result(self) -> CapabilityResult {
-        let mut value = serde_json::json!({ "MediaItems": self.media_items });
-        if let Some(object) = value.as_object_mut() {
-            for (field, count) in [
-                ("MovieCount", self.movie_count),
-                ("SeriesCount", self.series_count),
-                ("EpisodeCount", self.episode_count),
-            ] {
-                if let Some(count) = count {
-                    object.insert(field.to_string(), serde_json::json!(count));
-                }
+        if let Some(token) = continuation_token.as_ref() {
+            if self.page_count.saturating_add(1) >= VOD_LIBRARY_PROVIDER_CATALOG_MAX_PAGES {
+                return Err(ApiError::internal(
+                    "VOD library provider catalogue exceeded the page limit",
+                ));
+            }
+            if self.continuation_tokens.contains(token) {
+                return Err(ApiError::internal(
+                    "VOD library provider catalogue repeated a continuation token",
+                ));
             }
         }
-        CapabilityResult { value }
+
+        self.page_count += 1;
+        self.media_item_count = self.media_item_count.saturating_add(media_items.len());
+        self.movie_count = movie_count.or(self.movie_count);
+        self.series_count = series_count.or(self.series_count);
+        self.episode_count = episode_count.or(self.episode_count);
+        if let Some(token) = continuation_token.as_ref() {
+            self.continuation_tokens.insert(token.clone());
+        }
+        Ok(VodPluginCatalogPage {
+            media_items,
+            continuation_token,
+        })
     }
 }
 
@@ -12526,7 +12502,8 @@ async fn collect_vod_library_provider_pages(
     capability: &str,
     base_request: serde_json::Value,
     deadline: tokio::time::Instant,
-) -> Result<Option<CapabilityResult>, ApiError> {
+    writer: &mut VodPluginCatalogStageWriter<'_>,
+) -> Result<Option<VodLibraryPluginImportCounts>, ApiError> {
     let mut pages = VodPluginCatalogPages::default();
     let mut continuation_token = None;
     let mut base_request = ZeroizingJsonValue(base_request);
@@ -12570,9 +12547,11 @@ async fn collect_vod_library_provider_pages(
                 "VOD library plugin provider returned forbidden credential material",
             ));
         }
-        continuation_token = pages.push(result.value)?;
+        let page = pages.push(result.value)?;
+        continuation_token = page.continuation_token;
+        writer.append_page(page.media_items).await?;
         if continuation_token.is_none() {
-            return Ok(Some(pages.into_capability_result()));
+            return Ok(Some(writer.counts()));
         }
     }
 }
@@ -12587,7 +12566,8 @@ async fn invoke_vod_library_provider_via_runtime_host_path(
     error_prefix: &str,
     host_path: PathBuf,
     timeout: StdDuration,
-) -> Result<Option<CapabilityResult>, ApiError> {
+    writer: &mut VodPluginCatalogStageWriter<'_>,
+) -> Result<Option<VodLibraryPluginImportCounts>, ApiError> {
     let Some(plugin_id) = json_string_field(plugin, "Id") else {
         return Ok(None);
     };
@@ -12609,6 +12589,7 @@ async fn invoke_vod_library_provider_via_runtime_host_path(
                     capability,
                     base_request,
                     deadline,
+                    writer,
                 )
                 .await
             }
@@ -12635,6 +12616,7 @@ async fn invoke_vod_library_provider_via_runtime_host_path(
         capability,
         base_request,
         deadline,
+        writer,
     )
     .await;
     let _ = client.shutdown().await;
@@ -21107,7 +21089,7 @@ fn vod_library_media_item_from_plugin(
     Some(media_item)
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 struct VodLibraryPluginImportCounts {
     movie_count: usize,
     series_count: usize,
@@ -21238,79 +21220,207 @@ fn vod_library_media_item_upsert(
     }
 }
 
-/// Publishes one complete VOD snapshot through the provider-neutral remote media catalogue
-/// contract. Movies land in a `movies` library; episodes land in a `tvshows` library carrying
-/// their series grouping inline (the flattened catalogue model has no series rows of its own, so
-/// `Series` entries only enrich their episodes). Both libraries publish in one transaction,
-/// including intentionally empty ones, so a shrunk provider catalogue never leaves stale rows.
-async fn persist_vod_library_provider_import(
-    db: &Database,
+fn vod_library_plugin_stage_specs(
     plugin_name: &str,
     plugin_id: &str,
-    tuner_id: &str,
-    items: Vec<VodMediaItem>,
-) -> Result<VodLibraryPluginImportCounts, ApiError> {
+) -> Vec<RemoteMediaLibraryStageSpec> {
     let scope = vod_library_plugin_library_scope(plugin_name);
-    let mut series_index: HashMap<String, (String, Option<String>)> = HashMap::new();
-    for item in &items {
-        if item.item_type == VOD_ITEM_TYPE_SERIES {
-            series_index.insert(
-                item.provider_reference.clone(),
-                (item.name.clone(), item.image_url.clone()),
-            );
-        }
-    }
-    let mut seen_references = HashSet::new();
-    let mut movies = Vec::new();
-    let mut episodes = Vec::new();
-    for item in &items {
-        if !seen_references.insert((item.item_type.as_str(), item.provider_reference.as_str())) {
-            continue;
-        }
-        match item.item_type.as_str() {
-            VOD_ITEM_TYPE_MOVIE => {
-                movies.push(vod_library_media_item_upsert(
-                    plugin_id, tuner_id, item, None, None,
-                ));
-            }
-            VOD_ITEM_TYPE_EPISODE => {
-                let series_entry = item
-                    .series_reference
-                    .as_deref()
-                    .and_then(|reference| series_index.get(reference));
-                episodes.push(vod_library_media_item_upsert(
-                    plugin_id,
-                    tuner_id,
-                    item,
-                    series_entry.map(|(name, _)| name.as_str()),
-                    series_entry.and_then(|(_, image_url)| image_url.as_deref()),
-                ));
-            }
-            _ => {}
-        }
-    }
-    let counts = VodLibraryPluginImportCounts {
-        movie_count: movies.len(),
-        series_count: series_index.len(),
-        episode_count: episodes.len(),
-    };
-    db.replace_remote_media_library_snapshots(vec![
-        RemoteMediaLibrarySnapshot {
+    vec![
+        RemoteMediaLibraryStageSpec {
+            key: "movies".to_string(),
             library_name: format!("{scope} Movies"),
             collection_type: "movies".to_string(),
             source_location: format!("plugin-vod://{plugin_id}/movies"),
-            items: movies,
         },
-        RemoteMediaLibrarySnapshot {
+        RemoteMediaLibraryStageSpec {
+            key: "series".to_string(),
             library_name: format!("{scope} Series"),
             collection_type: "tvshows".to_string(),
             source_location: format!("plugin-vod://{plugin_id}/series"),
-            items: episodes,
         },
-    ])
-    .await
-    .map_err(ApiError::from)?;
-    Ok(counts)
+    ]
+}
+
+/// Streams one validated provider page into a durable, not-yet-visible catalogue generation.
+/// Only the series lookup survives between pages; movies and episodes are projected and appended
+/// in database-sized batches before the next provider RPC is issued. MAGSTV emits movies, then
+/// series, then episodes, so retaining that compact index preserves enrichment across page-kind
+/// boundaries without retaining the movie or episode catalogue.
+struct VodPluginCatalogStageWriter<'a> {
+    db: &'a Database,
+    stage: &'a RemoteMediaCatalogStage,
+    plugin_id: &'a str,
+    tuner_id: &'a str,
+    series_index: HashMap<String, (String, Option<String>)>,
+    counts: VodLibraryPluginImportCounts,
+    seen_remote_items: usize,
+}
+
+impl<'a> VodPluginCatalogStageWriter<'a> {
+    fn new(
+        db: &'a Database,
+        stage: &'a RemoteMediaCatalogStage,
+        plugin_id: &'a str,
+        tuner_id: &'a str,
+    ) -> Self {
+        Self {
+            db,
+            stage,
+            plugin_id,
+            tuner_id,
+            series_index: HashMap::new(),
+            counts: VodLibraryPluginImportCounts::default(),
+            seen_remote_items: 0,
+        }
+    }
+
+    fn counts(&self) -> VodLibraryPluginImportCounts {
+        self.counts
+    }
+
+    async fn append_page(&mut self, media_items: Vec<serde_json::Value>) -> Result<(), ApiError> {
+        // Project one RPC page at a time. Invalid provider items retain the existing contract of
+        // being dropped, but never remain resident after this call returns.
+        let mut items = Vec::with_capacity(media_items.len());
+        for item in media_items {
+            let index = self.seen_remote_items;
+            self.seen_remote_items = self.seen_remote_items.saturating_add(1);
+            if let Some(item) =
+                vod_library_media_item_from_plugin(self.plugin_id, self.tuner_id, index, &item)
+            {
+                items.push(item);
+            }
+        }
+
+        // Index every series in this page before projecting its episodes. This preserves series
+        // enrichment even when a provider emits a series row after its first episode in a page.
+        for item in &items {
+            if item.item_type == VOD_ITEM_TYPE_SERIES {
+                self.series_index.insert(
+                    item.provider_reference.clone(),
+                    (item.name.clone(), item.image_url.clone()),
+                );
+            }
+        }
+
+        let mut movies = Vec::new();
+        let mut episodes = Vec::new();
+        for item in items {
+            match item.item_type.as_str() {
+                VOD_ITEM_TYPE_MOVIE => {
+                    movies.push(vod_library_media_item_upsert(
+                        self.plugin_id,
+                        self.tuner_id,
+                        &item,
+                        None,
+                        None,
+                    ));
+                }
+                VOD_ITEM_TYPE_EPISODE => {
+                    let series_entry = item
+                        .series_reference
+                        .as_deref()
+                        .and_then(|reference| self.series_index.get(reference));
+                    episodes.push(vod_library_media_item_upsert(
+                        self.plugin_id,
+                        self.tuner_id,
+                        &item,
+                        series_entry.map(|(name, _)| name.as_str()),
+                        series_entry.and_then(|(_, image_url)| image_url.as_deref()),
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        let movie_count = movies.len();
+        let episode_count = episodes.len();
+        append_vod_library_stage_items(self.db, self.stage, "movies", movies).await?;
+        append_vod_library_stage_items(self.db, self.stage, "series", episodes).await?;
+        self.counts.movie_count = self.counts.movie_count.saturating_add(movie_count);
+        self.counts.series_count = self.series_index.len();
+        self.counts.episode_count = self.counts.episode_count.saturating_add(episode_count);
+        Ok(())
+    }
+}
+
+async fn append_vod_library_stage_items(
+    db: &Database,
+    stage: &RemoteMediaCatalogStage,
+    library_key: &str,
+    items: Vec<RemoteMediaItemUpsert>,
+) -> Result<(), ApiError> {
+    let mut items = items.into_iter();
+    loop {
+        let chunk = items
+            .by_ref()
+            .take(REMOTE_MEDIA_CATALOG_STAGE_MAX_APPEND_ITEMS)
+            .collect::<Vec<_>>();
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        db.append_remote_media_catalog_stage(stage, library_key, chunk)
+            .await
+            .map_err(ApiError::from)?;
+    }
+}
+
+/// Cancelling an HTTP request drops its import future. Keep the durable stage from becoming an
+/// abandoned partial generation by scheduling an abort from `Drop`; ordinary error paths await
+/// the same abort explicitly before returning.
+struct VodPluginCatalogStageAbortGuard {
+    db: Database,
+    stage: Option<RemoteMediaCatalogStage>,
+}
+
+impl VodPluginCatalogStageAbortGuard {
+    fn new(db: Database, stage: RemoteMediaCatalogStage) -> Self {
+        Self {
+            db,
+            stage: Some(stage),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.stage = None;
+    }
+
+    async fn abort(&mut self) {
+        let Some(stage) = self.stage.clone() else {
+            return;
+        };
+        match self.db.abort_remote_media_catalog_stage(&stage).await {
+            Ok(()) => self.stage = None,
+            Err(error) => {
+                tracing::warn!(stage_id = stage.id(), %error, "failed to abort VOD catalogue stage");
+            }
+        }
+    }
+}
+
+impl Drop for VodPluginCatalogStageAbortGuard {
+    fn drop(&mut self) {
+        let Some(stage) = self.stage.take() else {
+            return;
+        };
+        let db = self.db.clone();
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!(
+                stage_id = stage.id(),
+                "could not schedule cancellation cleanup for VOD catalogue stage"
+            );
+            return;
+        };
+        runtime.spawn(async move {
+            if let Err(error) = db.abort_remote_media_catalog_stage(&stage).await {
+                tracing::warn!(
+                    stage_id = stage.id(),
+                    %error,
+                    "failed to abort cancelled VOD catalogue stage"
+                );
+            }
+        });
+    }
 }
 
 async fn vod_library_plugin_tuner_configuration(
@@ -21346,6 +21456,16 @@ async fn vod_library_plugin_media_import(
         .acquire_owned()
         .await
         .map_err(|_| ApiError::service_unavailable("VOD library provider is unavailable"))?;
+    vod_library_plugin_media_import_admitted(db, plugin_id).await
+}
+
+/// Runs an import after its caller has acquired the shared `catalog-import` admission slot.
+/// Automatic tuner-triggered refreshes use this seam with `try_acquire_owned` so they never queue
+/// a duplicate generation behind an import that is already running.
+async fn vod_library_plugin_media_import_admitted(
+    db: &Database,
+    plugin_id: &str,
+) -> Result<Option<VodLibraryPluginImportCounts>, ApiError> {
     let security_slot = external_plugin_security_slot(plugin_id).await;
     let _security_guard = security_slot.read_owned().await;
     let Some(plugin) = db.installed_plugin_json(plugin_id).await? else {
@@ -21382,73 +21502,96 @@ async fn vod_library_plugin_media_import(
             "VOD library plugin runtime is unavailable",
         ));
     };
-    // A VOD catalogue import paginates exactly like a channel import: one deadline, one isolated
-    // `catalog-import` lane process, and credential canaries checked on every page.
-    let result = invoke_vod_library_provider_via_runtime_host_path(
-        &plugin,
-        CAPABILITY_VOD_LIBRARY_PROVIDER,
-        arguments,
-        runtime,
-        runtime_name,
-        error_prefix,
-        host_path,
-        VOD_LIBRARY_PROVIDER_CATALOG_TIMEOUT,
-    )
-    .await?
-    .ok_or_else(|| ApiError::internal("VOD library plugin runtime is unavailable"))?;
-    let mut seen_remote_items = 0usize;
-    let items = result
-        .value
-        .get("MediaItems")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|item| {
-            let index = seen_remote_items;
-            seen_remote_items += 1;
-            vod_library_media_item_from_plugin(plugin_id, &tuner_id, index, item)
-        })
-        .collect::<Vec<_>>();
     let plugin_name = json_string_field(&plugin, "Name").unwrap_or_else(|| plugin_id.to_string());
-    let counts =
-        persist_vod_library_provider_import(db, &plugin_name, plugin_id, &tuner_id, items).await?;
-    Ok(Some(counts))
+    let stage = db
+        .begin_remote_media_catalog_stage(vod_library_plugin_stage_specs(&plugin_name, plugin_id))
+        .await
+        .map_err(ApiError::from)?;
+    let mut abort_guard = VodPluginCatalogStageAbortGuard::new(db.clone(), stage.clone());
+
+    // One isolated runtime process owns the provider snapshot while each validated page is
+    // projected into the durable stage. The old visible libraries remain untouched until both
+    // stage libraries are complete and published by one database transaction.
+    let import_result = async {
+        let mut writer = VodPluginCatalogStageWriter::new(db, &stage, plugin_id, &tuner_id);
+        let counts = invoke_vod_library_provider_via_runtime_host_path(
+            &plugin,
+            CAPABILITY_VOD_LIBRARY_PROVIDER,
+            arguments,
+            runtime,
+            runtime_name,
+            error_prefix,
+            host_path,
+            VOD_LIBRARY_PROVIDER_CATALOG_TIMEOUT,
+            &mut writer,
+        )
+        .await?
+        .ok_or_else(|| ApiError::internal("VOD library plugin runtime is unavailable"))?;
+        db.complete_remote_media_catalog_stage(&stage)
+            .await
+            .map_err(ApiError::from)?;
+        db.publish_remote_media_catalog_stage(&stage)
+            .await
+            .map_err(ApiError::from)?;
+        Ok::<_, ApiError>(counts)
+    }
+    .await;
+
+    match import_result {
+        Ok(counts) => {
+            abort_guard.disarm();
+            Ok(Some(counts))
+        }
+        Err(error) => {
+            abort_guard.abort().await;
+            Err(error)
+        }
+    }
 }
 
-/// Chains a VOD library refresh after a successful `plugin:<id>` tuner write. A failed VOD import
-/// never fails tuner provisioning: the channel snapshot is already committed and the VOD snapshot
-/// can be retried through the explicit refresh endpoint.
-async fn maybe_refresh_vod_library_for_tuner(state: &AppState, tuner: &serde_json::Value) {
+/// Schedules a VOD library refresh after a successful `plugin:<id>` tuner write. The tuner POST
+/// never waits for a potentially two-hour provider import, and a second automatic refresh is
+/// skipped while the shared catalogue lane is occupied. The explicit admin refresh remains
+/// synchronous and can report its final counts.
+fn maybe_refresh_vod_library_for_tuner(state: &AppState, tuner: &serde_json::Value) {
     let Some(tuner_type) = json_string_field(tuner, "Type") else {
         return;
     };
     let Some(plugin_id) = live_tv_plugin_id_from_payload(tuner, &tuner_type) else {
         return;
     };
-    let declares_vod_library = match state.db.installed_plugin_json(&plugin_id).await {
-        Ok(Some(plugin)) => plugin_string_array(plugin.get("Capabilities"))
-            .iter()
-            .any(|capability| capability.eq_ignore_ascii_case(CAPABILITY_VOD_LIBRARY_PROVIDER)),
-        _ => false,
-    };
-    if !declares_vod_library {
-        return;
-    }
-    match vod_library_plugin_media_import(&state.db, &plugin_id).await {
-        Ok(Some(counts)) => tracing::info!(
-            plugin_id,
-            movie_count = counts.movie_count,
-            series_count = counts.series_count,
-            episode_count = counts.episode_count,
-            "VOD library import completed after Live TV tuner refresh"
-        ),
-        Ok(None) => {}
-        Err(error) => tracing::warn!(
-            plugin_id,
-            ?error,
-            "VOD library import failed after Live TV tuner refresh"
-        ),
-    }
+    let db = state.db.clone();
+    tokio::spawn(async move {
+        let declares_vod_library = match db.installed_plugin_json(&plugin_id).await {
+            Ok(Some(plugin)) => plugin_string_array(plugin.get("Capabilities"))
+                .iter()
+                .any(|capability| capability.eq_ignore_ascii_case(CAPABILITY_VOD_LIBRARY_PROVIDER)),
+            _ => false,
+        };
+        if !declares_vod_library {
+            return;
+        }
+        let admission = external_plugin_host_admission_slot(&plugin_id, "catalog-import").await;
+        let Ok(_admission_guard) = admission.try_acquire_owned() else {
+            tracing::debug!(plugin_id, "skipped duplicate automatic VOD library refresh");
+            return;
+        };
+        match vod_library_plugin_media_import_admitted(&db, &plugin_id).await {
+            Ok(Some(counts)) => tracing::info!(
+                plugin_id,
+                movie_count = counts.movie_count,
+                series_count = counts.series_count,
+                episode_count = counts.episode_count,
+                "VOD library import completed after Live TV tuner refresh"
+            ),
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                plugin_id,
+                ?error,
+                "VOD library import failed after Live TV tuner refresh"
+            ),
+        }
+    });
 }
 
 fn live_tv_source_configuration(value: &serde_json::Value) -> serde_json::Value {
@@ -22812,7 +22955,7 @@ async fn add_live_tv_tuner_host(
     // channel snapshot and public configuration have both committed. The import re-acquires its
     // own lane permit and lifecycle read lock, so it must run after the lease guards above are
     // dropped.
-    maybe_refresh_vod_library_for_tuner(&state, &payload).await;
+    maybe_refresh_vod_library_for_tuner(&state, &payload);
     Ok(Json(payload))
 }
 
@@ -60506,33 +60649,32 @@ mod tests {
     }
 
     #[test]
-    fn vod_library_catalog_pages_accumulate_media_items() {
+    fn vod_library_catalog_pages_validate_without_accumulating_media_items() {
         let mut pages = super::VodPluginCatalogPages::default();
-        assert_eq!(
-            pages
-                .push(json!({
-                    "MediaItems": [{ "ItemType": "Movie" }],
-                    "MovieCount": 2,
-                    "ContinuationToken": "vod-page-2",
-                    "HasMore": true
-                }))
-                .unwrap(),
-            Some("vod-page-2".to_string())
-        );
-        assert_eq!(
-            pages
-                .push(json!({
-                    "MediaItems": [{ "ItemType": "Episode" }],
-                    "EpisodeCount": 1
-                }))
-                .unwrap(),
-            None
-        );
-        let result = pages.into_capability_result();
-        assert_eq!(result.value["MediaItems"].as_array().unwrap().len(), 2);
-        assert_eq!(result.value["MovieCount"], 2);
-        assert_eq!(result.value["EpisodeCount"], 1);
-        assert!(result.value.get("SeriesCount").is_none());
+        let first = pages
+            .push(json!({
+                "MediaItems": [{ "ItemType": "Movie" }],
+                "MovieCount": 2,
+                "ContinuationToken": "vod-page-2",
+                "HasMore": true
+            }))
+            .unwrap();
+        assert_eq!(first.media_items.len(), 1);
+        assert_eq!(first.continuation_token.as_deref(), Some("vod-page-2"));
+        drop(first);
+
+        let second = pages
+            .push(json!({
+                "MediaItems": [{ "ItemType": "Episode" }],
+                "EpisodeCount": 1
+            }))
+            .unwrap();
+        assert_eq!(second.media_items.len(), 1);
+        assert!(second.continuation_token.is_none());
+        assert_eq!(pages.media_item_count, 2);
+        assert_eq!(pages.movie_count, Some(2));
+        assert_eq!(pages.episode_count, Some(1));
+        assert_eq!(pages.series_count, None);
     }
 
     #[test]
@@ -60557,6 +60699,21 @@ mod tests {
         );
         let mut invalid_count = super::VodPluginCatalogPages::default();
         assert!(invalid_count.push(json!({ "MovieCount": -1 })).is_err());
+        assert!(
+            invalid_count
+                .push(json!({
+                    "MovieCount": super::VOD_LIBRARY_PROVIDER_CATALOG_MAX_ITEMS as u64 + 1
+                }))
+                .is_err()
+        );
+
+        let mut item_limited = super::VodPluginCatalogPages::default();
+        item_limited.media_item_count = super::VOD_LIBRARY_PROVIDER_CATALOG_MAX_ITEMS;
+        assert!(
+            item_limited
+                .push(json!({ "MediaItems": [{ "ItemType": "Movie" }] }))
+                .is_err()
+        );
 
         let mut limited = super::VodPluginCatalogPages::default();
         for page in 0..super::VOD_LIBRARY_PROVIDER_CATALOG_MAX_PAGES - 1 {
@@ -60569,6 +60726,150 @@ mod tests {
         }
         limited.push(json!({ "MediaItems": [] })).unwrap();
         assert!(limited.push(json!({ "MediaItems": [] })).is_err());
+    }
+
+    #[test]
+    fn vod_catalogue_has_independent_scalable_limits() {
+        assert_eq!(super::VOD_LIBRARY_PROVIDER_CATALOG_MAX_PAGES, 2_048);
+        assert_eq!(super::VOD_LIBRARY_PROVIDER_CATALOG_MAX_ITEMS, 1_000_000);
+        assert_eq!(
+            super::VOD_LIBRARY_PROVIDER_CATALOG_TIMEOUT,
+            std::time::Duration::from_secs(2 * 60 * 60)
+        );
+        // Live TV retains its independent in-memory safety boundary.
+        assert_eq!(
+            super::LIVE_TV_PROVIDER_CATALOG_MAX_ACCUMULATED_BYTES,
+            64 * 1024 * 1024
+        );
+    }
+
+    #[tokio::test]
+    async fn vod_catalogue_pages_stage_in_bounded_batches_and_publish_atomically() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let plugin_id = "77777777-8888-4999-8aaa-bbbbbbbbbbbb";
+        let specs = super::vod_library_plugin_stage_specs("Staged VOD", plugin_id);
+        let stage = db.begin_remote_media_catalog_stage(specs).await.unwrap();
+        let mut writer =
+            super::VodPluginCatalogStageWriter::new(&db, &stage, plugin_id, "vod-tuner");
+        let mut page = (0..=super::REMOTE_MEDIA_CATALOG_STAGE_MAX_APPEND_ITEMS)
+            .map(|index| {
+                json!({
+                    "ItemType": "Movie",
+                    "ProviderReference": format!("provider:v1:movie-{index}"),
+                    "Name": format!("Movie {index}")
+                })
+            })
+            .collect::<Vec<_>>();
+        page.push(json!({
+            "ItemType": "Series",
+            "ProviderReference": "provider:v1:series-1",
+            "Name": "Show One",
+            "ImageUrl": "https://images.example.invalid/show.jpg"
+        }));
+        writer.append_page(page).await.unwrap();
+        // MAGSTV's episodes follow its series pages. The compact series index must therefore
+        // enrich an episode received by a later RPC page.
+        writer
+            .append_page(vec![json!({
+                "ItemType": "Episode",
+                "ProviderReference": "provider:v1:episode-1",
+                "Name": "Pilot",
+                "SeriesReference": "provider:v1:series-1",
+                "SeasonNumber": 1,
+                "EpisodeNumber": 1
+            })])
+            .await
+            .unwrap();
+        assert_eq!(
+            writer.counts(),
+            super::VodLibraryPluginImportCounts {
+                movie_count: super::REMOTE_MEDIA_CATALOG_STAGE_MAX_APPEND_ITEMS + 1,
+                series_count: 1,
+                episode_count: 1,
+            }
+        );
+        assert!(db.virtual_folders().await.unwrap().is_empty());
+
+        db.complete_remote_media_catalog_stage(&stage)
+            .await
+            .unwrap();
+        db.publish_remote_media_catalog_stage(&stage).await.unwrap();
+        let folders = db.virtual_folders().await.unwrap();
+        let movies = folders
+            .iter()
+            .find(|folder| folder.name == "Staged VOD Movies")
+            .unwrap();
+        let series = folders
+            .iter()
+            .find(|folder| folder.name == "Staged VOD Series")
+            .unwrap();
+        assert_eq!(
+            db.media_items_for_virtual_folders(&[movies.id])
+                .await
+                .unwrap()
+                .len(),
+            super::REMOTE_MEDIA_CATALOG_STAGE_MAX_APPEND_ITEMS + 1
+        );
+        assert_eq!(
+            db.media_items_for_virtual_folders(&[series.id])
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_vod_catalogue_guard_aborts_an_unpublished_stage() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let plugin_id = "88888888-9999-4aaa-8bbb-cccccccccccc";
+        let stage = db
+            .begin_remote_media_catalog_stage(super::vod_library_plugin_stage_specs(
+                "Cancelled VOD",
+                plugin_id,
+            ))
+            .await
+            .unwrap();
+        {
+            let mut writer =
+                super::VodPluginCatalogStageWriter::new(&db, &stage, plugin_id, "vod-tuner");
+            writer
+                .append_page(vec![json!({
+                    "ItemType": "Movie",
+                    "ProviderReference": "provider:v1:partial-movie",
+                    "Name": "Partial Movie"
+                })])
+                .await
+                .unwrap();
+            let _guard = super::VodPluginCatalogStageAbortGuard::new(db.clone(), stage.clone());
+        }
+
+        let mut removed = false;
+        for attempt in 0..50 {
+            let item = super::vod_library_media_item_upsert(
+                plugin_id,
+                "vod-tuner",
+                &super::VodMediaItem::movie(
+                    format!("provider:v1:probe-{attempt}"),
+                    format!("Probe {attempt}"),
+                ),
+                None,
+                None,
+            );
+            match db
+                .append_remote_media_catalog_stage(&stage, "movies", vec![item])
+                .await
+            {
+                Ok(()) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+                Err(error) => {
+                    assert!(error.to_string().contains("stage not found"));
+                    removed = true;
+                    break;
+                }
+            }
+        }
+        assert!(removed, "cancelled VOD stage was not aborted");
+        assert!(db.virtual_folders().await.unwrap().is_empty());
     }
 
     #[cfg(unix)]
@@ -60793,8 +61094,24 @@ mod tests {
         let tuner: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(tuner["PersistedChannelCount"], 1);
 
-        // The chained VOD import published both provider-neutral libraries in one transaction.
-        let folders = db.virtual_folders().await.unwrap();
+        // Tuner provisioning returns before the chained VOD import. Poll only for the test's
+        // deterministic fake runtime; production clients use the explicit refresh endpoint when
+        // they need synchronous counts.
+        let mut folders = Vec::new();
+        for _ in 0..100 {
+            folders = db.virtual_folders().await.unwrap();
+            if folders
+                .iter()
+                .any(|folder| folder.name == "VOD Provider Movies")
+                && folders
+                    .iter()
+                    .any(|folder| folder.name == "VOD Provider Series")
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // The background import publishes both provider-neutral libraries in one transaction.
         let movies = folders
             .iter()
             .find(|folder| folder.name == "VOD Provider Movies")
