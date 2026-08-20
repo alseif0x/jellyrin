@@ -69,6 +69,38 @@ seconds; `--dry-run` authenticates the admin token but performs no mutation.
 The MAGSTV plugin must already be installed, active, and granted exactly `Network` and
 `ProviderSecrets`.
 
+### Full deployed MAGSTV settings and playback QA
+
+`qa/e2e/deployed-magstv-plugin.spec.js` drives the real plugin configuration page rather than
+posting its payload directly. It enters only the account username and password, presses
+`Guardar e indexar`, verifies that Jellyrin persisted only an encrypted provider-secret
+reference, waits for `Mags Movies`, `Mags Series`, and `Mags Live TV` to reach full-catalogue
+minimums, opens all three views in Jellyfin Web, and reads media bytes from one live channel, one
+movie, and one episode. Playwright tracing is disabled for this suite so credentials cannot be
+captured in an artifact.
+
+This is an opt-in, mutating real-provider test. Supply secrets only through the environment (or
+an administrator token in a private mode-0600 file):
+
+```bash
+JELLYRIN_E2E_DEPLOYED=1 \
+JELLYRIN_E2E_MAGSTV_QA=1 \
+JELLYRIN_E2E_NO_WEBSERVER=1 \
+JELLYRIN_E2E_BASE_URL=https://jellyrin.test.kode.live \
+JELLYRIN_E2E_API_TOKEN_FILE=/secure/path/jellyrin-admin-token \
+JELLYRIN_MAGSTV_USERNAME='<account username>' \
+JELLYRIN_MAGSTV_PASSWORD='<account password>' \
+npm run test:e2e:magstv-plugin
+```
+
+By default the gate requires at least 1,000 channels, 30,000 movies, 20,000 series, and 100,001
+episodes, preventing the former 10k/100k VOD truncation limits from passing. Override the four
+`JELLYRIN_E2E_MAGSTV_MIN_*` variables only when the provider's canonical `All` catalogue has
+legitimately changed. `JELLYRIN_E2E_MAGSTV_SYNC_TIMEOUT_MS` defaults to two hours. Set
+`JELLYRIN_E2E_MAGSTV_CLICK_REFRESH=1` only when intentionally testing the explicit
+`Actualizar catálogo` action; the normal first-run path relies on `Guardar e indexar` so it does
+not start two concurrent full imports.
+
 ## PostgreSQL Release Smokes
 
 Production packaging no longer starts Jellyrin with SQLite. The systemd runtime and release
