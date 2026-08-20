@@ -6,7 +6,8 @@ use time::OffsetDateTime;
 use super::{
     LiveTvCategoryRecord, LiveTvCategoryUpsert, LiveTvChannelQuery, LiveTvChannelRecord,
     LiveTvChannelUpsert, LiveTvPage, LiveTvStreamProbeOutcome, LiveTvStreamProbeRecord,
-    LiveTvStreamProbeUpsert, LiveTvTunerUpsert, postgres::PostgresDatabase,
+    LiveTvStreamProbeUpsert, LiveTvTunerUpsert,
+    postgres::{POSTGRES_REPEATABLE_READ_ONLY_BEGIN, PostgresDatabase},
     validate_live_tv_stream_probe,
 };
 
@@ -186,9 +187,9 @@ impl PostgresDatabase {
         &self,
         query: LiveTvChannelQuery,
     ) -> anyhow::Result<LiveTvPage<LiveTvChannelRecord>> {
-        let mut transaction = self.pool.begin().await?;
-        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-            .execute(&mut *transaction)
+        let mut transaction = self
+            .pool
+            .begin_with(POSTGRES_REPEATABLE_READ_ONLY_BEGIN)
             .await?;
 
         let mut count_builder = live_tv_channel_count_builder();
@@ -746,6 +747,19 @@ mod tests {
             PostgresDatabase::connect_with_settings(&PostgresSettings::new(database_url).unwrap())
                 .await
                 .unwrap();
+        database.migrate().await.unwrap();
+        Some(database)
+    }
+
+    async fn configured_single_api_connection_database() -> Option<PostgresDatabase> {
+        let database_url = std::env::var("JELLYRIN_TEST_POSTGRES_URL").ok()?;
+        let settings = PostgresSettings::new(database_url)
+            .unwrap()
+            .with_max_connections(1)
+            .unwrap();
+        let database = PostgresDatabase::connect_with_settings(&settings)
+            .await
+            .unwrap();
         database.migrate().await.unwrap();
         Some(database)
     }
@@ -1455,5 +1469,43 @@ mod tests {
         assert!(category_index.contains("WHERE enabled"));
         assert!(!obsolete_category_index_exists);
         assert!(deleted.is_none());
+    }
+
+    #[tokio::test]
+    async fn postgres_live_tv_page_recovers_a_server_side_transaction_unknown_to_sqlx() {
+        let Some(database) = configured_single_api_connection_database().await else {
+            return;
+        };
+
+        // Reproduce the state left when SQLx's BEGIN reaches PostgreSQL but the begin future is
+        // cancelled before SQLx increments its local transaction depth. Returning this raw-BEGIN
+        // connection to a one-connection pool keeps the server transaction open while SQLx sees
+        // depth zero. A separate BEGIN followed by SET TRANSACTION fails on this exact state.
+        let mut connection = database.pool.acquire().await.unwrap();
+        sqlx::query("BEGIN")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        connection.return_to_pool().await;
+
+        let page = database
+            .live_tv_channel_page(LiveTvChannelQuery {
+                start_index: 0,
+                limit: Some(1),
+                ..LiveTvChannelQuery::default()
+            })
+            .await
+            .unwrap();
+
+        // The successful transaction commit must also heal the pooled connection for a normal
+        // autocommit query after the page read.
+        let one = sqlx::query_scalar::<_, i32>("SELECT 1")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+        database.close().await;
+
+        assert!(page.items.len() <= 1);
+        assert_eq!(one, 1);
     }
 }

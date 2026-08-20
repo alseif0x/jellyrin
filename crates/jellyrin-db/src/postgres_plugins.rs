@@ -6,6 +6,7 @@ use sqlx::{PgConnection, Postgres, Row, Transaction, postgres::PgRow};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use super::postgres::POSTGRES_REPEATABLE_READ_ONLY_BEGIN;
 use super::{
     DiscoveredPluginPackage, InstallPluginPackage, PluginRuntimeInstanceUpsert, PostgresDatabase,
     format_time, parse_time,
@@ -53,9 +54,9 @@ impl PostgresDatabase {
         self.sync_plugin_platform_from_system_configuration()
             .await?;
 
-        let mut transaction = self.worker_pool.begin().await?;
-        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-            .execute(&mut *transaction)
+        let mut transaction = self
+            .worker_pool
+            .begin_with(POSTGRES_REPEATABLE_READ_ONLY_BEGIN)
             .await?;
         lock_platform_shared(&mut transaction).await?;
         let connection = &mut *transaction;

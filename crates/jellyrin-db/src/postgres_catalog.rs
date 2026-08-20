@@ -11,10 +11,11 @@ use jellyrin_core::{
     tv_episode_path_info, tv_episode_series_key,
 };
 use serde_json::Value;
-use sqlx::{Acquire, PgConnection, Postgres, QueryBuilder, Transaction};
+use sqlx::{Connection, PgConnection, Postgres, QueryBuilder, Transaction};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use super::postgres::POSTGRES_REPEATABLE_READ_ONLY_BEGIN;
 use super::{
     CatalogSyncCountsRow, CatalogSyncDiagnostics, CatalogSyncRunDiagnostics, DatabasePoolRole,
     EffectiveTypeCandidateScope, MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE,
@@ -944,9 +945,9 @@ impl PostgresDatabase {
         query: &MediaItemCatalogQuery,
     ) -> anyhow::Result<MediaItemCatalogPage> {
         super::validate_media_item_catalog_query(query)?;
-        let mut transaction = self.pool.begin().await?;
-        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
-            .execute(&mut *transaction)
+        let mut transaction = self
+            .pool
+            .begin_with(POSTGRES_REPEATABLE_READ_ONLY_BEGIN)
             .await?;
 
         let mut count = QueryBuilder::<Postgres>::new("SELECT COUNT(*)::bigint ");
@@ -1028,12 +1029,12 @@ impl PostgresDatabase {
     ) -> anyhow::Result<MediaItemCatalogCounts> {
         super::validate_media_item_catalog_query(query)?;
         let acquire = self.telemetry.start_acquire(DatabasePoolRole::Api);
-        let transaction_result = self.pool.begin().await;
+        let transaction_result = self
+            .pool
+            .begin_with(POSTGRES_REPEATABLE_READ_ONLY_BEGIN)
+            .await;
         acquire.finish_result(&transaction_result);
         let mut transaction = transaction_result?;
-        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
-            .execute(&mut *transaction)
-            .await?;
 
         let mut aggregate =
             QueryBuilder::<Postgres>::new("SELECT COUNT(*)::bigint AS item_count, ");
@@ -1145,9 +1146,8 @@ impl PostgresDatabase {
         let connection_result = self.pool.acquire().await;
         acquire.finish_result(&connection_result);
         let mut connection = connection_result?;
-        let mut transaction = connection.begin().await?;
-        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
-            .execute(&mut *transaction)
+        let mut transaction = connection
+            .begin_with(POSTGRES_REPEATABLE_READ_ONLY_BEGIN)
             .await?;
 
         if let Some((folder_ids, effective_item_types)) = postgres_query_filter_summary_scope(query)
@@ -1862,9 +1862,9 @@ impl PostgresDatabase {
             lower_bound: lower_bound.as_deref(),
             upper_bound: upper_bound.as_deref(),
         };
-        let mut transaction = self.pool.begin().await?;
-        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
-            .execute(&mut *transaction)
+        let mut transaction = self
+            .pool
+            .begin_with(POSTGRES_REPEATABLE_READ_ONLY_BEGIN)
             .await?;
         let projection_covered: bool = sqlx::query_scalar(
             r#"

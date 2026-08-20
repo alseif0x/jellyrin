@@ -10,7 +10,8 @@ use super::{
     ResumeItemsPage, ResumeItemsPageQuery, StaleTranscodeSession, TaskRun,
     TerminalTranscodeSession, TranscodeSession, UpsertActivePlaybackSession,
     UpsertActiveViewingSession, UpsertPlaybackState, UpsertTranscodeSession,
-    postgres::PostgresDatabase, telemetry::DatabaseOperation,
+    postgres::{POSTGRES_REPEATABLE_READ_ONLY_BEGIN, PostgresDatabase},
+    telemetry::DatabaseOperation,
 };
 
 impl PostgresDatabase {
@@ -1064,9 +1065,9 @@ impl PostgresDatabase {
         user_id: Uuid,
         query: ResumeItemsPageQuery,
     ) -> anyhow::Result<ResumeItemsPage> {
-        let mut transaction = self.pool.begin().await?;
-        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-            .execute(&mut *transaction)
+        let mut transaction = self
+            .pool
+            .begin_with(POSTGRES_REPEATABLE_READ_ONLY_BEGIN)
             .await?;
         let min_pct = query.min_pct.clamp(0, 100);
         let max_pct = query.max_pct.clamp(min_pct, 100);

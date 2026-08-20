@@ -27,6 +27,16 @@ const DEFAULT_MAX_LIFETIME: Duration = Duration::from_secs(30 * 60);
 const DEFAULT_API_STATEMENT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_WORKER_STATEMENT_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(3);
+/// Start snapshot reads with their transaction characteristics in the same PostgreSQL command.
+///
+/// Keeping the mode in `BEGIN` is cancellation-resilient: SQLx 0.9 can leave a server-side
+/// `BEGIN` accepted when its begin future is cancelled before local transaction depth increments.
+/// A later plain `BEGIN` followed by `SET TRANSACTION` would then fail because PostgreSQL treats
+/// the duplicate `BEGIN` as a command inside the already-open transaction.
+pub(crate) const POSTGRES_REPEATABLE_READ_ONLY_BEGIN: &str =
+    "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY";
+pub(crate) const POSTGRES_SERIALIZABLE_BEGIN: &str =
+    "BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE";
 // Keep this declaration in the dependency graph whenever a new embedded migration is added.
 pub(crate) static POSTGRES_MIGRATOR: sqlx::migrate::Migrator =
     sqlx::migrate!("./migrations-postgres");

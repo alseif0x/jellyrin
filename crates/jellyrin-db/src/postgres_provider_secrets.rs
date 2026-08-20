@@ -4,6 +4,7 @@ use anyhow::{Context, ensure};
 use serde_json::Value;
 use sqlx::{PgConnection, Row};
 
+use super::postgres::POSTGRES_SERIALIZABLE_BEGIN;
 use super::{
     PostgresDatabase, ProviderCredentials, ProviderSecretEnvelope, ProviderSecretReference,
     collect_provider_secret_reference_identities, configuration_has_provider_secret_input_field,
@@ -443,10 +444,7 @@ impl PostgresDatabase {
     /// envelopes selected as candidates are row-locked, and any invalid nested reference aborts
     /// the whole transaction rather than being interpreted as an orphan.
     pub async fn reconcile_orphaned_provider_secrets(&self) -> anyhow::Result<usize> {
-        let mut transaction = self.pool.begin().await?;
-        sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
-            .execute(&mut *transaction)
-            .await?;
+        let mut transaction = self.pool.begin_with(POSTGRES_SERIALIZABLE_BEGIN).await?;
         let envelopes = sqlx::query(
             "SELECT secret_id, provider_type FROM provider_secrets ORDER BY secret_id FOR UPDATE",
         )
