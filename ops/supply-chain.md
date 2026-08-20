@@ -211,9 +211,8 @@ development host is not assumed to provide Docker, cargo-audit, Trivy or Syft gl
 
 ### Exceptions
 
-`ops/vulnerability-exceptions.json` is the only reviewed exception source and currently contains
-no exceptions. Do not add raw cargo-audit arguments or a hand-written `.trivyignore`. Each future
-entry must contain exactly:
+`ops/vulnerability-exceptions.json` is the only reviewed exception source. Do not add raw
+cargo-audit arguments or a hand-written `.trivyignore`. Each entry must contain exactly:
 
 ```json
 {
@@ -234,6 +233,17 @@ runner turns into package-scoped ignore rules. Every exception requires a named 
 tracking issue, substantive reason and expiry 1–30 days after approval. QA rejects duplicate,
 future, expired, malformed or longer-lived entries before the scanners are downloaded. Removing or
 upgrading the affected component is preferred; renewal requires a new reviewed risk decision.
+
+The temporary exception for `CVE-2026-14456` is limited to the exact Debian `libssl3t64` PURL
+reported by the amd64 image scan and expires on 2026-09-03. [OpenSSL's
+advisory](https://openssl-library.org/news/secadv/20260813.txt) limits the flaw to its QUIC server
+Listener path, while [Debian defers the fix as a minor
+issue](https://security-tracker.debian.org/tracker/CVE-2026-14456). Jellyrin's Rust binaries do not
+dynamically link OpenSSL, while the reviewed FFmpeg build uses OpenSSL only behind its finite
+non-QUIC protocol allowlist. SBOM generation fails if FFmpeg gains a QUIC protocol or imports
+`SSL_new_listener`, `SSL_accept_connection` or an `OSSL_QUIC` API. The finding remains visible in
+Trivy's suppressed evidence, and issue https://github.com/alseif0x/jellyrin/issues/3 tracks
+replacement with a fixed Debian/distroless package and removal of the exception.
 
 The generated Trivy file is retained with `--show-suppressed`, so accepted findings remain visible
 in the JSON evidence. A RustSec ignore is advisory-wide (a RustSec advisory identifies a specific

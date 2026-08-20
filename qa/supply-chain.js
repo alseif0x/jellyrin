@@ -73,6 +73,7 @@ async function main() {
       decoder:
         'h264,hevc,mpeg2video,mpeg4,vc1,wmv3,vp8,vp9,av1,mjpeg,aac,ac3,eac3,mp3,mp3float,flac,opus,vorbis,ass,dvbsub,dvdsub,mov_text,pgssub,srt,ssa,subrip,webvtt',
       filter: 'anull,aresample,format,fps,overlay,scale',
+      protocol: 'file,pipe,http,https,tcp,tls,udp,crypto',
     },
     runtime: {
       encoder: 'aac,libx264,mjpeg,subrip,webvtt',
@@ -80,6 +81,7 @@ async function main() {
         'aac,ac3,ass,av1,dvbsub,dvdsub,eac3,flac,h263,h264,hevc,mjpeg,mp3,mp3float,mpeg2video,mpeg4,opus,pgssub,srt,ssa,subrip,vc1,vorbis,vp8,vp9,webvtt,wmv3',
       filter:
         'abuffer,abuffersink,aformat,anull,aresample,atrim,buffer,buffersink,crop,format,fps,hflip,null,overlay,rotate,scale,transpose,trim,vflip',
+      protocol: 'crypto,file,http,https,pipe,tcp,tls,udp',
     },
   };
   const ffmpegCapabilityPolicyIsValid = validateFfmpegCapabilityPolicy(
@@ -378,6 +380,10 @@ async function main() {
     ),
     check('vulnerability-exception-validator-self-test', exceptionValidatorSelfTest),
     check(
+      'temporary-openssl-quic-exception-is-exact-and-bounded',
+      validateTemporaryOpenSslQuicException(vulnerabilityExceptions),
+    ),
+    check(
       'vulnerability-rendering-is-scoped',
       vulnerabilityRenderer.includes("mode === 'rustsec-ids'") &&
         vulnerabilityRenderer.includes("mode === 'trivy-yaml'") &&
@@ -466,7 +472,7 @@ async function main() {
     check(
       'sbom-tool-download-is-verified',
       generator.includes('node "${repo_root}/qa/supply-chain.js"') &&
-        generator.includes('required_command in curl docker jq node sha256sum tar') &&
+        generator.includes('required_command in curl docker jq node readelf sha256sum tar') &&
         generator.includes('SYFT_LINUX_AMD64_SHA256') &&
         generator.includes('SYFT_LINUX_ARM64_SHA256') &&
         generator.includes('sha256sum --check --strict'),
@@ -596,15 +602,24 @@ function validateFfmpegCapabilityPolicy(dockerfile, generator, reviewed) {
     generator.includes('"${actual_encoders}" != "${expected_runtime_encoders}"') &&
     generator.includes('"${actual_decoders}" != "${expected_runtime_decoders}"') &&
     generator.includes('"${actual_filters}" != "${expected_runtime_filters}"') &&
+    generator.includes('"${actual_protocols}" != "${expected_runtime_protocols}"') &&
     generator.includes('enabled image encoder allowlist drift') &&
     generator.includes('enabled image decoder allowlist drift') &&
-    generator.includes('enabled image filter allowlist drift')
+    generator.includes('enabled image filter allowlist drift') &&
+    generator.includes('enabled image protocol allowlist drift') &&
+    generator.includes('for media_binary in ffmpeg ffprobe') &&
+    generator.includes('SSL_accept_connection|SSL_new_listener|OSSL_QUIC.*') &&
+    generator.includes('${media_binary} QUIC server symbol surface drift') &&
+    generator.includes('ffmpeg-dynamic-imports.txt') &&
+    generator.includes('ffprobe-dynamic-imports.txt')
   );
 }
 
 function validateFfmpegCapabilityPolicySelfTest(dockerfile, generator, reviewed) {
   const configuredEncoder = `--enable-encoder=${reviewed.configured.encoder}`;
+  const configuredProtocol = `--enable-protocol=${reviewed.configured.protocol}`;
   const runtimeEncoder = `reviewed_runtime_ffmpeg_encoders='${reviewed.runtime.encoder}'`;
+  const runtimeProtocol = `reviewed_runtime_ffmpeg_protocols='${reviewed.runtime.protocol}'`;
   const broadenedDockerfile = dockerfile.replace(
     configuredEncoder,
     `${configuredEncoder},rawvideo`,
@@ -613,6 +628,14 @@ function validateFfmpegCapabilityPolicySelfTest(dockerfile, generator, reviewed)
     runtimeEncoder,
     `${runtimeEncoder.slice(0, -1)},rawvideo'`,
   );
+  const broadenedProtocolDockerfile = dockerfile.replace(
+    configuredProtocol,
+    `${configuredProtocol},quic`,
+  );
+  const broadenedProtocolGenerator = generator.replace(
+    runtimeProtocol,
+    `${runtimeProtocol.slice(0, -1)},quic'`,
+  );
   const changedModeDockerfile = dockerfile.replace(
     'JELLYRIN_FFMPEG_MODE=enabled',
     'JELLYRIN_FFMPEG_MODE=remux-only',
@@ -620,10 +643,33 @@ function validateFfmpegCapabilityPolicySelfTest(dockerfile, generator, reviewed)
   return (
     broadenedDockerfile !== dockerfile &&
     broadenedGenerator !== generator &&
+    broadenedProtocolDockerfile !== dockerfile &&
+    broadenedProtocolGenerator !== generator &&
     changedModeDockerfile !== dockerfile &&
     !validateFfmpegCapabilityPolicy(broadenedDockerfile, generator, reviewed) &&
     !validateFfmpegCapabilityPolicy(dockerfile, broadenedGenerator, reviewed) &&
+    !validateFfmpegCapabilityPolicy(broadenedProtocolDockerfile, generator, reviewed) &&
+    !validateFfmpegCapabilityPolicy(dockerfile, broadenedProtocolGenerator, reviewed) &&
     !validateFfmpegCapabilityPolicy(changedModeDockerfile, generator, reviewed)
+  );
+}
+
+function validateTemporaryOpenSslQuicException(policy) {
+  const expectedPurl =
+    'pkg:deb/debian/libssl3t64@3.5.6-1~deb13u2?arch=amd64&distro=debian-13.6';
+  const entries = policy.exceptions.filter(
+    (entry) => entry.scanner === 'trivy' && entry.id === 'CVE-2026-14456',
+  );
+  return (
+    entries.length === 1 &&
+    entries[0].components.length === 1 &&
+    entries[0].components[0] === expectedPurl &&
+    entries[0].approved_on === '2026-08-20' &&
+    entries[0].expires_on === '2026-09-03' &&
+    entries[0].owner === '@alseif0x' &&
+    entries[0].tracking_issue === 'https://github.com/alseif0x/jellyrin/issues/3' &&
+    entries[0].reason.includes('OpenSSL QUIC server Listener path is unreachable') &&
+    entries[0].reason.includes('neither QUIC protocols nor QUIC server API imports')
   );
 }
 

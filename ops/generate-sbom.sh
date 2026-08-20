@@ -21,7 +21,7 @@ set -a
 source "${lock_file}"
 set +a
 
-for required_command in curl docker jq node sha256sum tar; do
+for required_command in curl docker jq node readelf sha256sum tar; do
     if ! command -v "${required_command}" >/dev/null 2>&1; then
         echo "required SBOM command is unavailable: ${required_command}" >&2
         exit 1
@@ -115,9 +115,11 @@ printf '%s\n' "${image_ffmpeg_mode}" > "${output_dir}/ffmpeg-mode.txt"
 reviewed_configured_ffmpeg_encoders='libx264,aac,mjpeg,subrip,webvtt'
 reviewed_configured_ffmpeg_decoders='h264,hevc,mpeg2video,mpeg4,vc1,wmv3,vp8,vp9,av1,mjpeg,aac,ac3,eac3,mp3,mp3float,flac,opus,vorbis,ass,dvbsub,dvdsub,mov_text,pgssub,srt,ssa,subrip,webvtt'
 reviewed_configured_ffmpeg_filters='anull,aresample,format,fps,overlay,scale'
+reviewed_configured_ffmpeg_protocols='file,pipe,http,https,tcp,tls,udp,crypto'
 reviewed_runtime_ffmpeg_encoders='aac,libx264,mjpeg,subrip,webvtt'
 reviewed_runtime_ffmpeg_decoders='aac,ac3,ass,av1,dvbsub,dvdsub,eac3,flac,h263,h264,hevc,mjpeg,mp3,mp3float,mpeg2video,mpeg4,opus,pgssub,srt,ssa,subrip,vc1,vorbis,vp8,vp9,webvtt,wmv3'
 reviewed_runtime_ffmpeg_filters='abuffer,abuffersink,aformat,anull,aresample,atrim,buffer,buffersink,crop,format,fps,hflip,null,overlay,rotate,scale,transpose,trim,vflip'
+reviewed_runtime_ffmpeg_protocols='crypto,file,http,https,pipe,tcp,tls,udp'
 
 require_configure_allowlist() {
     local source_label="$1"
@@ -152,6 +154,8 @@ for source_spec in \
         "${source_label}" "${source_file}" decoder "${reviewed_configured_ffmpeg_decoders}"
     require_configure_allowlist \
         "${source_label}" "${source_file}" filter "${reviewed_configured_ffmpeg_filters}"
+    require_configure_allowlist \
+        "${source_label}" "${source_file}" protocol "${reviewed_configured_ffmpeg_protocols}"
 done
 
 grep -o -- '--enable-parser=[^[:space:]]*' "${output_dir}/ffmpeg-build-configuration.txt" \
@@ -167,6 +171,18 @@ expected_parsers="$(
 )"
 if [[ "$(<"${output_dir}/ffmpeg-parsers.txt")" != "${expected_parsers}" ]]; then
     echo "FFmpeg parser allowlist drift" >&2
+    exit 1
+fi
+
+expected_runtime_protocols="$(
+    printf '%s\n' "${reviewed_runtime_ffmpeg_protocols}" | tr ',' '\n' | LC_ALL=C sort
+)"
+actual_protocols="$(
+    awk '/^  [[:alnum:]_+-]+$/ { print $1 }' "${output_dir}/ffmpeg-protocols.txt" \
+        | LC_ALL=C sort -u
+)"
+if [[ "${actual_protocols}" != "${expected_runtime_protocols}" ]]; then
+    echo "enabled image protocol allowlist drift: ${actual_protocols//$'\n'/,}" >&2
     exit 1
 fi
 
@@ -364,8 +380,21 @@ jq -e '.bomFormat == "CycloneDX" and (.components | length > 0)' \
 container_id="$(docker create "${image_ref}")"
 docker cp "${container_id}:/usr/local/bin/jellyrin-server" "${output_dir}/jellyrin-server"
 docker cp "${container_id}:/usr/local/bin/jellyrin-migrate" "${output_dir}/jellyrin-migrate"
+docker cp "${container_id}:/usr/local/bin/ffmpeg" "${temp_root}/ffmpeg"
+docker cp "${container_id}:/usr/local/bin/ffprobe" "${temp_root}/ffprobe"
 docker rm "${container_id}" >/dev/null
 container_id=""
+
+for media_binary in ffmpeg ffprobe; do
+    readelf --wide --dyn-syms "${temp_root}/${media_binary}" \
+        | awk '$7 == "UND" { sub(/@.*/, "", $8); print $8 }' \
+        | LC_ALL=C sort -u > "${output_dir}/${media_binary}-dynamic-imports.txt"
+    if grep -Eq '^(SSL_accept_connection|SSL_new_listener|OSSL_QUIC.*)$' \
+        "${output_dir}/${media_binary}-dynamic-imports.txt"; then
+        echo "${media_binary} QUIC server symbol surface drift" >&2
+        exit 1
+    fi
+done
 
 docker image inspect "${image_ref}" > "${output_dir}/image-inspect.json"
 docker image inspect --format '{{.Id}}' "${image_ref}" > "${output_dir}/image-id.txt"
@@ -380,6 +409,7 @@ cp "${lock_file}" "${output_dir}/supply-chain.lock.env"
         ffmpeg-build-configuration.txt \
         ffmpeg-decoders.txt \
         ffmpeg-demuxers.txt \
+        ffmpeg-dynamic-imports.txt \
         ffmpeg-encoders.txt \
         ffmpeg-filters.txt \
         ffmpeg-mode.txt \
@@ -393,6 +423,7 @@ cp "${lock_file}" "${output_dir}/supply-chain.lock.env"
         ffmpeg-source.cyclonedx.json \
         ffmpeg-source.spdx.json \
         ffmpeg-version.txt \
+        ffprobe-dynamic-imports.txt \
         ffprobe-version.txt \
         image-id.txt \
         image-inspect.json \
