@@ -13705,6 +13705,34 @@ fn bounded_plugin_runtime_error_code(error: &ApiError) -> &'static str {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PluginRuntimeFailureTelemetry {
+    action: &'static str,
+    phase: &'static str,
+    provider_error_code: &'static str,
+}
+
+fn plugin_vod_metadata_runtime_failure_telemetry(
+    error: &ApiError,
+) -> PluginRuntimeFailureTelemetry {
+    PluginRuntimeFailureTelemetry {
+        action: "ResolveMetadata",
+        phase: "runtime_invoke",
+        provider_error_code: bounded_plugin_runtime_error_code(error),
+    }
+}
+
+fn map_plugin_vod_metadata_runtime_failure(error: ApiError) -> ApiError {
+    let telemetry = plugin_vod_metadata_runtime_failure_telemetry(&error);
+    tracing::warn!(
+        action = telemetry.action,
+        phase = telemetry.phase,
+        provider_error_code = telemetry.provider_error_code,
+        "VOD metadata plugin invocation failed"
+    );
+    ApiError::service_unavailable("VOD metadata resolution failed")
+}
+
 fn rust_wasi_host_binary_path() -> Option<PathBuf> {
     #[cfg(test)]
     if let Some(path) = test_rust_wasi_host_binary_path()
@@ -26182,7 +26210,7 @@ async fn resolve_plugin_vod_metadata(
         StdDuration::from_secs(15),
     )
     .await
-    .map_err(|_| ApiError::service_unavailable("VOD metadata resolution failed"))?
+    .map_err(map_plugin_vod_metadata_runtime_failure)?
     .ok_or_else(|| ApiError::service_unavailable("VOD metadata runtime is unavailable"))?;
     let result = ZeroizingJsonValue(result.value);
     if result
@@ -62602,31 +62630,59 @@ mod tests {
 
     #[test]
     fn provider_secret_rpc_failure_retains_only_the_allowlisted_code() {
-        let message_canary = "signed-url-or-password-canary";
+        let message_canary =
+            "signed-url-or-password-canary https://provider.invalid/private/item-id-canary";
         let detail_canary = "provider-response-detail-canary";
-        let mut rpc_error = jellyrin_plugin_rpc::PluginRpcError::new(
-            jellyrin_plugin_rpc::PluginRpcErrorCode::HostFailed,
-            message_canary,
-        );
-        rpc_error.details.push(detail_canary.to_string());
-        let response = jellyrin_plugin_rpc::PluginRpcResponse::<serde_json::Value>::failure(
-            "provider-secret-code-test",
-            rpc_error,
-        );
+        for (rpc_code, expected_code) in [
+            (
+                jellyrin_plugin_rpc::PluginRpcErrorCode::HostFailed,
+                "HostFailed",
+            ),
+            (
+                jellyrin_plugin_rpc::PluginRpcErrorCode::HostUnavailable,
+                "HostUnavailable",
+            ),
+        ] {
+            let mut rpc_error = jellyrin_plugin_rpc::PluginRpcError::new(rpc_code, message_canary);
+            rpc_error.details.push(detail_canary.to_string());
+            let response = jellyrin_plugin_rpc::PluginRpcResponse::<serde_json::Value>::failure(
+                "provider-secret-code-test",
+                rpc_error,
+            );
 
-        let error = super::provider_secret_rpc_result(response)
-            .expect_err("a failed provider response must remain an error");
-        let rendered = error.error.to_string();
-        assert_eq!(
-            rendered,
-            "ExternalProcess provider-secret invocation failed (HostFailed)"
-        );
-        assert!(!rendered.contains(message_canary));
-        assert!(!rendered.contains(detail_canary));
-        assert_eq!(
-            super::bounded_plugin_runtime_error_code(&error),
-            "HostFailed"
-        );
+            let error = super::provider_secret_rpc_result(response)
+                .expect_err("a failed provider response must remain an error");
+            let rendered = error.error.to_string();
+            assert_eq!(
+                rendered,
+                format!("ExternalProcess provider-secret invocation failed ({expected_code})")
+            );
+            assert!(!rendered.contains(message_canary));
+            assert!(!rendered.contains(detail_canary));
+            assert_eq!(
+                super::bounded_plugin_runtime_error_code(&error),
+                expected_code
+            );
+
+            let telemetry = super::plugin_vod_metadata_runtime_failure_telemetry(&error);
+            assert_eq!(telemetry.action, "ResolveMetadata");
+            assert_eq!(telemetry.phase, "runtime_invoke");
+            assert_eq!(telemetry.provider_error_code, expected_code);
+            let rendered_telemetry = format!("{telemetry:?}");
+            assert!(!rendered_telemetry.contains(message_canary));
+            assert!(!rendered_telemetry.contains(detail_canary));
+            assert!(!rendered_telemetry.contains("provider.invalid"));
+            assert!(!rendered_telemetry.contains("item-id-canary"));
+
+            let mapped = super::map_plugin_vod_metadata_runtime_failure(error);
+            assert_eq!(mapped.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let mapped = mapped.error.to_string();
+            assert_eq!(mapped, "VOD metadata resolution failed");
+            assert!(!mapped.contains(message_canary));
+            assert!(!mapped.contains(detail_canary));
+            assert!(!mapped.contains("provider.invalid"));
+            assert!(!mapped.contains("item-id-canary"));
+        }
         assert_eq!(
             super::bounded_plugin_runtime_error_code(&ApiError::internal(
                 "untrusted runtime text HostFailed"
