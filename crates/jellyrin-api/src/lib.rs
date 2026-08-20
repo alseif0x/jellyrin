@@ -25553,9 +25553,22 @@ async fn resolve_plugin_vod_subtitle(
 struct PluginVodResolvedMetadata {
     overview: Option<String>,
     image_url: Option<Zeroizing<String>>,
+    runtime_ticks: Option<i64>,
 }
 
 const PLUGIN_VOD_METADATA_CACHE_TTL_SECONDS: i64 = 24 * 60 * 60;
+const PLUGIN_VOD_MAX_RUNTIME_TICKS: i64 = 7 * 24 * 60 * 60 * 10_000_000;
+const PLUGIN_VOD_RUNTIME_RESOLVED_AT_FIELD: &str = "PluginVodRuntimeResolvedAt";
+
+fn bounded_plugin_vod_runtime_ticks(runtime_ticks: Option<i64>) -> Option<i64> {
+    runtime_ticks.filter(|ticks| (1..=PLUGIN_VOD_MAX_RUNTIME_TICKS).contains(ticks))
+}
+
+#[derive(Default)]
+struct PluginVodSafeMetadata {
+    overview: Option<String>,
+    runtime_ticks: Option<i64>,
+}
 
 #[derive(Clone)]
 struct PluginVodMetadataTarget {
@@ -25571,7 +25584,11 @@ fn plugin_vod_metadata_resolution_is_fresh(
     metadata: &serde_json::Value,
     target: &PluginVodMetadataTarget,
 ) -> bool {
-    json_field_case_insensitive(metadata, target.resolved_at_field)
+    plugin_vod_resolution_marker_is_fresh(metadata, target.resolved_at_field)
+}
+
+fn plugin_vod_resolution_marker_is_fresh(metadata: &serde_json::Value, field: &str) -> bool {
+    json_field_case_insensitive(metadata, field)
         .and_then(serde_json::Value::as_i64)
         .is_some_and(|resolved_at| {
             let age = OffsetDateTime::now_utc()
@@ -25781,12 +25798,13 @@ fn image_dimensions_from_bytes(bytes: &[u8]) -> Option<(u32, u32)> {
     None
 }
 
-/// Resolves safe copy and artwork together. The only durable values are the synopsis, a bounded
-/// resolution timestamp and cached image bytes; the provider URL remains in zeroizing memory.
+/// Resolves safe copy, runtime and artwork together. The only durable values are the synopsis, a
+/// bounded runtime, a resolution timestamp and cached image bytes; the provider URL remains in
+/// zeroizing memory.
 async fn ensure_plugin_vod_metadata(
     state: &AppState,
     target: &PluginVodMetadataTarget,
-) -> Result<Option<String>, ApiError> {
+) -> Result<PluginVodSafeMetadata, ApiError> {
     let lock_path = stored_image_owner_dir(state, ImageOwner::Item(&target.owner_id))
         .join(".plugin-vod-metadata");
     let lock = trickplay_tile_lock(&lock_path).await;
@@ -25794,15 +25812,31 @@ async fn ensure_plugin_vod_metadata(
 
     let mut metadata = metadata_payload_for_item(&state.db, target.source_item_id).await?;
     if plugin_vod_remote_reference(&metadata).is_none() {
-        return Ok(None);
+        return Ok(PluginVodSafeMetadata::default());
     }
+    let persisted_runtime_ticks = if target.scope == "Item" {
+        bounded_plugin_vod_runtime_ticks(
+            state
+                .db
+                .media_item_by_id_visible(target.source_item_id)
+                .await
+                .map_err(ApiError::from)?
+                .and_then(|item| item.runtime_ticks),
+        )
+    } else {
+        None
+    };
     let removed_external_image_fields = remove_plugin_vod_external_image_fields(&mut metadata);
     let overview = plugin_vod_metadata_overview(&metadata, target);
     let cached_image =
         find_stored_image(state, ImageOwner::Item(&target.owner_id), "Primary", 0).await?;
     let image_resolution_complete =
         plugin_vod_image_resolution_complete(&metadata, target, cached_image.is_some());
-    if plugin_vod_metadata_resolution_is_fresh(&metadata, target) && image_resolution_complete {
+    let metadata_resolution_fresh = plugin_vod_metadata_resolution_is_fresh(&metadata, target);
+    let runtime_resolution_complete = target.scope != "Item"
+        || persisted_runtime_ticks.is_some()
+        || plugin_vod_resolution_marker_is_fresh(&metadata, PLUGIN_VOD_RUNTIME_RESOLVED_AT_FIELD);
+    if metadata_resolution_fresh && image_resolution_complete && runtime_resolution_complete {
         if removed_external_image_fields {
             state
                 .db
@@ -25810,27 +25844,46 @@ async fn ensure_plugin_vod_metadata(
                 .await
                 .map_err(ApiError::from)?;
         }
-        return Ok(overview);
+        return Ok(PluginVodSafeMetadata {
+            overview,
+            runtime_ticks: persisted_runtime_ticks,
+        });
     }
 
+    // Existing installations can have a fresh synopsis/image marker written by an older core
+    // while the media-info runtime is still NULL. Resolve that missing Item field once, but keep
+    // the already-complete image decision so an upgrade neither re-fetches artwork nor turns a
+    // cached positive/negative result into the provider's latest response by accident.
+    let preserve_cached_presentation = metadata_resolution_fresh && image_resolution_complete;
+    let preserved_image_available = preserve_cached_presentation
+        .then(|| {
+            json_field_case_insensitive(&metadata, target.image_available_field)
+                .and_then(serde_json::Value::as_bool)
+        })
+        .flatten();
+
     let resolved = resolve_plugin_vod_metadata(&state.db, &metadata, target.scope).await?;
-    let resolved_overview = resolved.overview.or(overview);
+    let resolved_overview = if preserve_cached_presentation {
+        overview
+    } else {
+        resolved.overview.or(overview)
+    };
+    let runtime_ticks =
+        bounded_plugin_vod_runtime_ticks(resolved.runtime_ticks.or(persisted_runtime_ticks));
     if let Some(overview) = resolved_overview.as_deref() {
         metadata[target.overview_field] = serde_json::Value::String(overview.to_string());
     }
 
-    let image_available = if let Some(image_url) = resolved.image_url.as_deref() {
+    let image_available = if let Some(image_available) = preserved_image_available {
+        image_available
+    } else if let Some(image_url) = resolved.image_url.as_deref() {
         let bytes = match fetch_plugin_vod_remote_image(image_url).await {
             Ok(bytes) => bytes,
             Err(error) => {
                 // Synopsis resolution remains useful even when artwork egress/cache is
                 // unavailable. Persist only that safe field; omitting the success marker allows a
                 // later image request to retry without another login once the cache is writable.
-                state
-                    .db
-                    .update_media_item_metadata(target.source_item_id, metadata)
-                    .await
-                    .map_err(ApiError::from)?;
+                persist_plugin_vod_metadata(state, target, metadata, runtime_ticks).await?;
                 return Err(error);
             }
         };
@@ -25845,30 +25898,67 @@ async fn ensure_plugin_vod_metadata(
         )
         .await
         {
-            state
-                .db
-                .update_media_item_metadata(target.source_item_id, metadata)
-                .await
-                .map_err(ApiError::from)?;
+            persist_plugin_vod_metadata(state, target, metadata, runtime_ticks).await?;
             return Err(error);
         }
         true
     } else {
         false
     };
+    let resolved_at = OffsetDateTime::now_utc().unix_timestamp();
     apply_safe_plugin_vod_resolution(
         &mut metadata,
         target,
         resolved_overview.as_deref(),
         image_available,
-        OffsetDateTime::now_utc().unix_timestamp(),
+        resolved_at,
     );
+    if target.scope == "Item" {
+        metadata[PLUGIN_VOD_RUNTIME_RESOLVED_AT_FIELD] = serde_json::json!(resolved_at);
+    }
+    persist_plugin_vod_metadata(state, target, metadata, runtime_ticks).await?;
+    Ok(PluginVodSafeMetadata {
+        overview: resolved_overview,
+        runtime_ticks,
+    })
+}
+
+/// Persists only bounded, provider-neutral values. The remote image URL is
+/// consumed before this boundary and is deliberately not an argument, so a
+/// signed provider address cannot become durable metadata or media info.
+async fn persist_plugin_vod_metadata(
+    state: &AppState,
+    target: &PluginVodMetadataTarget,
+    metadata: serde_json::Value,
+    runtime_ticks: Option<i64>,
+) -> Result<(), ApiError> {
+    if target.scope != "Item" {
+        return state
+            .db
+            .update_media_item_metadata(target.source_item_id, metadata)
+            .await
+            .map_err(ApiError::from);
+    }
+    let runtime_ticks = bounded_plugin_vod_runtime_ticks(runtime_ticks);
+    let item = state
+        .db
+        .media_item_by_id_visible(target.source_item_id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::not_found("VOD metadata item is unavailable"))?;
     state
         .db
-        .update_media_item_metadata(target.source_item_id, metadata)
+        .update_media_item_media_info_and_metadata(
+            target.source_item_id,
+            runtime_ticks,
+            item.bitrate,
+            item.width,
+            item.height,
+            item.media_streams,
+            metadata,
+        )
         .await
-        .map_err(ApiError::from)?;
-    Ok(resolved_overview)
+        .map_err(ApiError::from)
 }
 
 fn plugin_vod_item_metadata_target(
@@ -25956,18 +26046,21 @@ async fn plugin_vod_virtual_metadata_target(
 
 async fn enrich_plugin_vod_item_metadata(
     state: &AppState,
-    item: &MediaItem,
+    item: &mut MediaItem,
     metadata: &mut serde_json::Value,
 ) {
     let Some(target) = plugin_vod_item_metadata_target(item, metadata) else {
         return;
     };
+    item.runtime_ticks = bounded_plugin_vod_runtime_ticks(item.runtime_ticks);
     remove_plugin_vod_external_image_fields(metadata);
     match ensure_plugin_vod_metadata(state, &target).await {
-        Ok(Some(overview)) => {
-            metadata["Overview"] = serde_json::Value::String(overview);
+        Ok(resolved) => {
+            if let Some(overview) = resolved.overview {
+                metadata["Overview"] = serde_json::Value::String(overview);
+            }
+            item.runtime_ticks = resolved.runtime_ticks;
         }
-        Ok(None) => {}
         Err(error) => {
             tracing::warn!(
                 status = %error.status(),
@@ -25993,8 +26086,11 @@ async fn enrich_plugin_vod_virtual_metadata(
         }
     };
     match ensure_plugin_vod_metadata(state, &target).await {
-        Ok(Some(overview)) => metadata["Overview"] = serde_json::Value::String(overview),
-        Ok(None) => {}
+        Ok(resolved) => {
+            if let Some(overview) = resolved.overview {
+                metadata["Overview"] = serde_json::Value::String(overview);
+            }
+        }
         Err(error) => {
             tracing::warn!(
                 status = %error.status(),
@@ -26115,10 +26211,25 @@ async fn resolve_plugin_vod_metadata(
             Ok::<_, ApiError>(Zeroizing::new(value.to_string()))
         })
         .transpose()?;
+    let runtime_ticks = plugin_vod_resolved_runtime_ticks(payload)
+        .map_err(|_| ApiError::service_unavailable("VOD metadata response is invalid"))?;
     Ok(PluginVodResolvedMetadata {
         overview,
         image_url,
+        runtime_ticks,
     })
+}
+
+fn plugin_vod_resolved_runtime_ticks(value: &serde_json::Value) -> Result<Option<i64>, ()> {
+    let Some(value) = json_field_case_insensitive(value, "RuntimeTicks") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    bounded_plugin_vod_runtime_ticks(value.as_i64())
+        .map(Some)
+        .ok_or(())
 }
 
 fn contains_plaintext_provider_secret(value: &serde_json::Value) -> bool {
@@ -34397,7 +34508,7 @@ async fn item_detail(
                 .await?
                 .item;
         }
-        enrich_plugin_vod_item_metadata(&state, &item, &mut metadata).await;
+        enrich_plugin_vod_item_metadata(&state, &mut item, &mut metadata).await;
         return Ok(Json(media_item_to_json_with_playback_and_metadata(
             &item,
             &server_id,
@@ -34507,7 +34618,7 @@ async fn current_user_item_detail(
                 .await?
                 .item;
         }
-        enrich_plugin_vod_item_metadata(&state, &item, &mut metadata).await;
+        enrich_plugin_vod_item_metadata(&state, &mut item, &mut metadata).await;
         return Ok(Json(media_item_to_json_with_playback_and_metadata(
             &item,
             &server_id,
@@ -34605,7 +34716,7 @@ async fn user_item_detail(
                 .await?
                 .item;
         }
-        enrich_plugin_vod_item_metadata(&state, &item, &mut metadata).await;
+        enrich_plugin_vod_item_metadata(&state, &mut item, &mut metadata).await;
         return Ok(Json(media_item_to_json_with_playback_and_metadata(
             &item,
             &server_id,
@@ -61996,6 +62107,18 @@ mod tests {
         assert!(super::plugin_vod_image_resolution_complete(
             &metadata, &target, false
         ));
+        assert!(
+            !super::plugin_vod_resolution_marker_is_fresh(
+                &metadata,
+                super::PLUGIN_VOD_RUNTIME_RESOLVED_AT_FIELD
+            ),
+            "the legacy metadata marker must not masquerade as a runtime resolution"
+        );
+        metadata[super::PLUGIN_VOD_RUNTIME_RESOLVED_AT_FIELD] = json!(now);
+        assert!(super::plugin_vod_resolution_marker_is_fresh(
+            &metadata,
+            super::PLUGIN_VOD_RUNTIME_RESOLVED_AT_FIELD
+        ));
         // The mutator deliberately has no URL input and scrubs legacy provider artwork fields:
         // only safe copy/cache markers can reach DB or later item JSON.
         assert!(
@@ -62003,6 +62126,35 @@ mod tests {
                 .unwrap()
                 .contains("images.provider.invalid")
         );
+
+        assert_eq!(
+            super::plugin_vod_resolved_runtime_ticks(&json!({
+                "RuntimeTicks": 5_400_i64 * 10_000_000
+            })),
+            Ok(Some(5_400_i64 * 10_000_000))
+        );
+        assert_eq!(
+            super::plugin_vod_resolved_runtime_ticks(&json!({
+                "RunTimeTicks": super::PLUGIN_VOD_MAX_RUNTIME_TICKS
+            })),
+            Ok(Some(super::PLUGIN_VOD_MAX_RUNTIME_TICKS))
+        );
+        assert_eq!(
+            super::plugin_vod_resolved_runtime_ticks(&json!({})),
+            Ok(None)
+        );
+        for invalid in [
+            json!({ "RuntimeTicks": -1 }),
+            json!({ "RuntimeTicks": 0 }),
+            json!({ "RuntimeTicks": super::PLUGIN_VOD_MAX_RUNTIME_TICKS + 1 }),
+            json!({ "RuntimeTicks": u64::MAX }),
+            json!({ "RuntimeTicks": "54000000000" }),
+        ] {
+            assert!(
+                super::plugin_vod_resolved_runtime_ticks(&invalid).is_err(),
+                "unbounded runtime must fail closed: {invalid}"
+            );
+        }
     }
 
     #[test]
@@ -64459,6 +64611,33 @@ mod tests {
             .await
             .unwrap();
 
+        // Reproduce an in-place upgrade: the previous metadata implementation already wrote a
+        // fresh positive/negative cache marker, but the media-info column has no duration. That
+        // marker must not suppress the one JIT resolution needed to backfill RuntimeTicks.
+        for item_id in [movie_id, episode_id] {
+            let item = db
+                .media_item_by_id_visible(item_id)
+                .await
+                .unwrap()
+                .expect("fixture VOD item remains visible");
+            assert_eq!(item.runtime_ticks, None);
+            let mut metadata = super::metadata_payload_for_item(&db, item_id)
+                .await
+                .unwrap();
+            let target = super::plugin_vod_item_metadata_target(&item, &metadata)
+                .expect("fixture has an opaque provider reference");
+            super::apply_safe_plugin_vod_resolution(
+                &mut metadata,
+                &target,
+                Some("Fresh pre-upgrade synopsis"),
+                false,
+                time::OffsetDateTime::now_utc().unix_timestamp(),
+            );
+            db.update_media_item_metadata(item_id, metadata)
+                .await
+                .unwrap();
+        }
+
         let app = router(AppState {
             db: db.clone(),
             web_dir: ".".into(),
@@ -64475,7 +64654,71 @@ mod tests {
                 "SubtitleProfiles": [{ "Format": "vtt", "Method": "External" }]
             }
         });
-        for item_id in [movie_id, episode_id] {
+        for (item_id, expected_runtime_ticks) in [
+            (movie_id, 5_400_i64 * 10_000_000),
+            (episode_id, 2_700_i64 * 10_000_000),
+        ] {
+            // Opening either kind resolves its authoritative getItemData duration once. The
+            // current response and the durable media-info column receive the bounded value, while
+            // the provider response itself (and any remote URL it may carry) is never persisted.
+            let detail_response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/Items/{}", item_id.simple()))
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(detail_response.status(), StatusCode::OK);
+            let detail: Value = serde_json::from_slice(
+                &detail_response
+                    .into_body()
+                    .collect()
+                    .await
+                    .unwrap()
+                    .to_bytes(),
+            )
+            .unwrap();
+            assert_eq!(detail["RunTimeTicks"], expected_runtime_ticks);
+            assert_eq!(
+                detail["MediaSources"][0]["RunTimeTicks"],
+                expected_runtime_ticks
+            );
+            let persisted = db
+                .media_item_by_id_visible(item_id)
+                .await
+                .unwrap()
+                .expect("resolved VOD item remains visible");
+            assert_eq!(persisted.runtime_ticks, Some(expected_runtime_ticks));
+            let persisted_metadata = super::metadata_payload_for_item(&db, item_id)
+                .await
+                .unwrap();
+            let persisted_metadata_text = serde_json::to_string(&persisted_metadata).unwrap();
+            assert!(!persisted_metadata_text.contains("http"));
+            assert_eq!(
+                super::json_field_case_insensitive(&persisted_metadata, "Overview")
+                    .and_then(Value::as_str),
+                Some("Fresh pre-upgrade synopsis"),
+                "runtime-only upgrade repair must preserve the fresh synopsis"
+            );
+            assert_eq!(
+                super::json_field_case_insensitive(&persisted_metadata, "PluginVodImageAvailable")
+                    .and_then(Value::as_bool),
+                Some(false),
+                "runtime-only upgrade repair must preserve the negative image cache marker"
+            );
+            assert!(super::plugin_vod_resolution_marker_is_fresh(
+                &persisted_metadata,
+                super::PLUGIN_VOD_RUNTIME_RESOLVED_AT_FIELD
+            ));
+            assert!(
+                super::json_field_case_insensitive(&persisted_metadata, "RuntimeTicks").is_none(),
+                "runtime belongs in the media-info column, not provider metadata"
+            );
+
             let response = app
                 .clone()
                 .oneshot(
@@ -64510,6 +64753,7 @@ mod tests {
             assert_eq!(source["SupportsDirectPlay"], false);
             assert_eq!(source["SupportsDirectStream"], true);
             assert_eq!(source["SupportsTranscoding"], false);
+            assert_eq!(source["RunTimeTicks"], expected_runtime_ticks);
             assert_eq!(source["DefaultAudioStreamIndex"], 2);
             assert_eq!(source["DefaultSubtitleStreamIndex"], 3);
             let direct_url = source["DirectStreamUrl"].as_str().unwrap();
@@ -64530,6 +64774,30 @@ mod tests {
                     .as_str()
                     .is_some_and(|url| url.contains("/Subtitles/3/Stream.vtt?"))
             );
+        }
+
+        // Once movie and episode runtimes have been backfilled, another detail request must use
+        // the cache and avoid a second ResolveMetadata call.
+        for (item_id, expected_runtime_ticks) in [
+            (movie_id, 5_400_i64 * 10_000_000),
+            (episode_id, 2_700_i64 * 10_000_000),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/Items/{}", item_id.simple()))
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let item: Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(item["RunTimeTicks"], expected_runtime_ticks);
         }
         assert_eq!(
             upstream_connections.load(Ordering::SeqCst),
@@ -64593,6 +64861,14 @@ mod tests {
         let invokes = tokio::fs::read_to_string(tmp.path().join("external-invokes"))
             .await
             .unwrap();
+        assert_eq!(
+            invokes
+                .lines()
+                .filter(|line| line.contains("\"Action\":\"ResolveMetadata\""))
+                .count(),
+            2,
+            "fresh pre-upgrade markers must trigger exactly one runtime backfill per item"
+        );
         let subtitle_invokes = invokes
             .lines()
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
@@ -68035,6 +68311,19 @@ while IFS= read -r line; do
     InvokeCapability)
       printf '%s\n' "$line" >> '__INVOKE_FILE__'
       case "$line" in
+        *'"Action":"ResolveMetadata"'*)
+          case "$line" in
+            *'"ProviderReference":"provider:v1:movie-1"'*)
+              printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"Status":"Executed","Metadata":{"Overview":"Movie metadata","RuntimeTicks":54000000000}}}}\n' "$corr"
+              ;;
+            *'"ProviderReference":"provider:v1:episode-1"'*)
+              printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"Status":"Executed","Metadata":{"Overview":"Episode metadata","RuntimeTicks":27000000000}}}}\n' "$corr"
+              ;;
+            *)
+              printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"Status":"Failed","Error":"unknown provider reference"}}}\n' "$corr"
+              ;;
+          esac
+          ;;
         *'"Action":"ResolveSubtitle"'*)
           case "$line" in
             *'"ProviderReference":"provider:v1:movie-1"'*'"SubtitleStreamIndex":3'*|*'"ProviderReference":"provider:v1:episode-1"'*'"SubtitleStreamIndex":3'*)
@@ -104157,7 +104446,9 @@ done
                 }),
             ],
         };
+        let runtime_ticks = item.runtime_ticks;
         super::apply_plugin_vod_playback_descriptor(&mut item, &playback).unwrap();
+        assert_eq!(item.runtime_ticks, runtime_ticks);
         assert_eq!(item.path, "plugin-vod://movies/provider-item/stream.ts");
         assert!(item.media_streams[0].get("Codec").is_none());
         assert!(item.media_streams[1].get("Codec").is_none());
