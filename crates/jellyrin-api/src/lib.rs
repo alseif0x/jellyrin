@@ -25601,28 +25601,26 @@ async fn plugin_vod_virtual_metadata_target(
     // New catalogues persist a provider-backed Series anchor even when the series has no
     // episodes. Prefer that authoritative reference; the episode snapshot below remains the
     // compatibility path for catalogues created before anchors were introduced.
-    if !season {
-        if let Ok(owner_uuid) = Uuid::parse_str(owner_id) {
-            if let Some(anchor) = db
-                .media_item_by_id_visible(owner_uuid)
-                .await
-                .map_err(ApiError::from)?
-            {
-                let metadata = metadata_payload_for_item(db, anchor.id).await?;
-                let is_series = json_field_case_insensitive(&metadata, "PluginVodKind")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|kind| kind.eq_ignore_ascii_case("series"));
-                if is_series && plugin_vod_remote_reference(&metadata).is_some() {
-                    return Ok(Some(PluginVodMetadataTarget {
-                        owner_id: owner_id.to_string(),
-                        source_item_id: anchor.id,
-                        scope: "Series",
-                        overview_field: "SeriesOverview",
-                        resolved_at_field: "SeriesPluginVodMetadataResolvedAt",
-                        image_available_field: "SeriesPluginVodImageAvailable",
-                    }));
-                }
-            }
+    if !season
+        && let Ok(owner_uuid) = Uuid::parse_str(owner_id)
+        && let Some(anchor) = db
+            .media_item_by_id_visible(owner_uuid)
+            .await
+            .map_err(ApiError::from)?
+    {
+        let metadata = metadata_payload_for_item(db, anchor.id).await?;
+        let is_series = json_field_case_insensitive(&metadata, "PluginVodKind")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("series"));
+        if is_series && plugin_vod_remote_reference(&metadata).is_some() {
+            return Ok(Some(PluginVodMetadataTarget {
+                owner_id: owner_id.to_string(),
+                source_item_id: anchor.id,
+                scope: "Series",
+                overview_field: "SeriesOverview",
+                resolved_at_field: "SeriesPluginVodMetadataResolvedAt",
+                image_available_field: "SeriesPluginVodImageAvailable",
+            }));
         }
     }
     let snapshot = if season {
@@ -62367,6 +62365,21 @@ mod tests {
         assert_eq!(
             empty_summary.metadata["SeriesPrimaryImageUrl"],
             "https://images.example.invalid/empty.jpg"
+        );
+        let metadata_target =
+            super::plugin_vod_virtual_metadata_target(&db, &empty_series_id, false)
+                .await
+                .unwrap()
+                .expect("the empty series anchor must resolve provider metadata directly");
+        assert_eq!(metadata_target.owner_id, empty_series_id);
+        let anchor_metadata = super::metadata_payload_for_item(&db, metadata_target.source_item_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            super::plugin_vod_remote_reference(&anchor_metadata)
+                .as_ref()
+                .map(|reference| reference.provider_reference.as_str()),
+            Some("provider:v1:series-empty")
         );
         assert_eq!(
             episode_metadata["SeriesOverview"],
