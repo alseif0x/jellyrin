@@ -6027,20 +6027,38 @@ fn push_postgres_include_item_types_filter(
 
 fn push_postgres_search_hint_filter(builder: &mut QueryBuilder<Postgres>, pattern: &str) {
     builder
+        .push(" AND (lower(item.name) LIKE ")
+        .push_bind(pattern.to_owned())
         .push(
-            " AND lower(\
-               COALESCE(item.name, '') || ' ' ||\
-               COALESCE(item.metadata ->> 'Album', '') || ' ' ||\
-               COALESCE(item.metadata ->> 'AlbumName', '') || ' ' ||\
-               COALESCE(item.metadata ->> 'AlbumArtist', '') || ' ' ||\
-               COALESCE(item.metadata ->> 'AlbumArtists', '') || ' ' ||\
-               COALESCE(item.metadata ->> 'SeriesName', '') || ' ' ||\
-               COALESCE(item.metadata ->> 'Series', '') || ' ' ||\
-               COALESCE(item.metadata ->> 'Artists', '')\
-             ) LIKE ",
+            " ESCAPE '\\' OR EXISTS (\
+           WITH RECURSIVE hint_values(value) AS (\
+             SELECT hint_field.value \
+             FROM jsonb_each(item.metadata) AS hint_field(key, value) \
+             WHERE hint_field.key = ANY(ARRAY[\
+               'Album', 'AlbumName', 'AlbumArtist', 'AlbumArtists', \
+               'SeriesName', 'Series', 'Artists'\
+             ]::text[]) \
+             UNION ALL \
+             SELECT array_value.value \
+             FROM hint_values \
+             CROSS JOIN LATERAL jsonb_array_elements(\
+               CASE WHEN jsonb_typeof(hint_values.value) = 'array' \
+                    THEN hint_values.value ELSE '[]'::jsonb END\
+             ) AS array_value(value)\
+           ) \
+           SELECT 1 FROM hint_values \
+           WHERE (jsonb_typeof(hint_values.value) IN ('string', 'number') \
+                  AND lower(hint_values.value #>> '{}') LIKE ",
         )
         .push_bind(pattern.to_owned())
-        .push(" ESCAPE '\\'");
+        .push(
+            " ESCAPE '\\') \
+              OR (jsonb_typeof(hint_values.value) = 'object' \
+                  AND jsonb_typeof(hint_values.value -> 'Name') = 'string' \
+                  AND lower(hint_values.value ->> 'Name') LIKE ",
+        )
+        .push_bind(pattern.to_owned())
+        .push(" ESCAPE '\\')))");
 }
 
 fn push_postgres_catalog_order(
