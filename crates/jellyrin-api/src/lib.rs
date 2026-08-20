@@ -24808,7 +24808,18 @@ async fn resolve_opaque_live_tv_playback(
         StdDuration::from_secs(15),
     )
     .await
-    .map_err(|_| ApiError::service_unavailable("Live TV provider resolution failed"))?
+    .map_err(|error| {
+        let message = error.error.to_string();
+        let provider_error_code = message
+            .strip_prefix("Plugin runtime request failed (")
+            .and_then(|value| value.strip_suffix(')'))
+            .unwrap_or("RuntimeFailure");
+        tracing::warn!(
+            provider_error_code,
+            "Live TV plugin playback resolution failed"
+        );
+        ApiError::service_unavailable("Live TV provider resolution failed")
+    })?
     .ok_or_else(|| ApiError::service_unavailable("Live TV provider runtime is unavailable"))?;
     let result = ZeroizingJsonValue(result.value);
 
