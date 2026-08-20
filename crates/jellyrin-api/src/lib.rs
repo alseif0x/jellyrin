@@ -18975,14 +18975,54 @@ fn syncplay_command_from_uri(uri: &Uri) -> String {
         .unwrap_or_else(|| "Command".to_string())
 }
 
-async fn live_tv_info() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
+async fn live_tv_info(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let tuners = configured_live_tv_tuner_views(&state.db).await?;
+    let persisted_channel_count = state
+        .db
+        .live_tv_channel_count(&LiveTvChannelQuery::default())
+        .await?;
+    let channel_count =
+        persisted_channel_count.max(tuners.iter().map(|tuner| tuner.child_count).sum::<usize>());
+    let config = state
+        .db
+        .named_configuration("livetv")
+        .await?
+        .unwrap_or_else(default_live_tv_configuration);
+    let listing_providers = config
+        .get("ListingProviders")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|provider| {
+            serde_json::json!({
+                "Id": json_string_field(provider, "Id"),
+                "Name": json_string_field(provider, "FriendlyName")
+                    .or_else(|| json_string_field(provider, "Name")),
+                "Type": json_string_field(provider, "Type")
+            })
+        })
+        .collect::<Vec<_>>();
+    let tuner_hosts = tuners
+        .iter()
+        .map(|tuner| {
+            serde_json::json!({
+                "Id": tuner.tuner_id,
+                "Name": tuner.name,
+                "FriendlyName": tuner.name,
+                "Type": tuner.provider_type,
+                "ChannelCount": tuner.child_count,
+                "IsEnabled": true
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(serde_json::json!({
         "Services": [],
-        "IsEnabled": false,
+        "IsEnabled": channel_count > 0,
         "EnabledUsers": [],
-        "TunerHosts": [],
-        "ListingsProviders": []
-    }))
+        "TunerHosts": tuner_hosts,
+        "ListingsProviders": listing_providers,
+        "ChannelCount": channel_count
+    })))
 }
 
 async fn live_tv_guide_info() -> Json<serde_json::Value> {
@@ -21614,6 +21654,7 @@ async fn live_tv_channel_record_by_any_id(
             start_index: 0,
             limit: Some(total.min(LIVE_TV_XTREAM_MAX_IMPORT_LIMIT)),
             search_term: None,
+            tuner_ids: Vec::new(),
             category_ids: Vec::new(),
         })
         .await?;
@@ -21655,6 +21696,7 @@ async fn live_tv_channel_records_by_any_ids(
             start_index: 0,
             limit: Some(total.min(LIVE_TV_XTREAM_MAX_IMPORT_LIMIT)),
             search_term: None,
+            tuner_ids: Vec::new(),
             category_ids: Vec::new(),
         })
         .await?;
@@ -23025,6 +23067,8 @@ struct LiveTvChannelsQuery {
     limit: Option<usize>,
     #[serde(alias = "SearchTerm", alias = "searchTerm")]
     search_term: Option<String>,
+    #[serde(alias = "ParentId", alias = "parentId")]
+    parent_id: Option<String>,
     #[serde(alias = "CategoryId", alias = "categoryId")]
     category_id: Option<String>,
     #[serde(
@@ -23088,6 +23132,12 @@ async fn live_tv_channels(
         .limit
         .map(|limit| limit.min(LIVE_TV_CHANNELS_MAX_LIMIT))
         .unwrap_or(LIVE_TV_CHANNELS_DEFAULT_LIMIT);
+    let tuner_id = match query.parent_id.as_deref() {
+        Some(parent_id) => live_tv_tuner_view_by_id(&state.db, parent_id)
+            .await?
+            .map(|view| view.tuner_id),
+        None => None,
+    };
     let category_ids = live_tv_channel_category_filter(&state.db, &query).await?;
     let requested_start_index = query.start_index.unwrap_or(0);
     let db_query = LiveTvChannelQuery {
@@ -23098,6 +23148,7 @@ async fn live_tv_channels(
             Some(limit)
         },
         search_term: query.search_term.clone(),
+        tuner_ids: tuner_id.clone().into_iter().collect(),
         category_ids,
     };
     let page = service.channel_page(db_query).await?;
@@ -23135,6 +23186,12 @@ async fn live_tv_channels(
         .unwrap_or_else(default_live_tv_configuration);
     let server_id = state.db.server_state().await?.server_id.to_string();
     let mut channels = live_tv_channel_items(&config, &server_id);
+    if let Some(tuner_id) = tuner_id.as_deref() {
+        channels.retain(|channel| {
+            json_string_field(channel, "TunerHostId")
+                .is_some_and(|id| id.eq_ignore_ascii_case(tuner_id))
+        });
+    }
     filter_channel_items_by_search(&mut channels, query.search_term.as_deref());
     filter_channel_items_by_category(&mut channels, &query);
     for channel in &mut channels {
@@ -23619,6 +23676,7 @@ async fn live_tv_program_by_id(
                         start_index: 0,
                         limit: Some(persisted_count.min(LIVE_TV_XTREAM_MAX_IMPORT_LIMIT)),
                         search_term: None,
+                        tuner_ids: Vec::new(),
                         category_ids: Vec::new(),
                     })
                     .await?;
@@ -23766,6 +23824,7 @@ async fn live_tv_program_result(
                     start_index: 0,
                     limit: None,
                     search_term: None,
+                    tuner_ids: Vec::new(),
                     category_ids: category_ids_filter.clone(),
                 })
                 .await?;
@@ -23775,6 +23834,7 @@ async fn live_tv_program_result(
                         start_index: 0,
                         limit: Some(persisted_count.min(LIVE_TV_XTREAM_MAX_IMPORT_LIMIT)),
                         search_term: None,
+                        tuner_ids: Vec::new(),
                         category_ids: category_ids_filter,
                     })
                     .await?;
@@ -23810,6 +23870,7 @@ async fn live_tv_program_result(
                     start_index,
                     limit: Some(limit),
                     search_term: None,
+                    tuner_ids: Vec::new(),
                     category_ids: category_ids.to_vec(),
                 })
                 .await?;
@@ -29324,7 +29385,8 @@ async fn user_views_result(
     let folders = state.db.virtual_folders().await?;
     let server_id = state.db.server_state().await?.server_id.to_string();
     let item_counts = state.db.media_item_counts_by_virtual_folder().await?;
-    let items = user_views_for_query(&folders, &item_counts, &server_id, &query);
+    let live_tv_tuners = configured_live_tv_tuner_views(&state.db).await?;
+    let items = user_views_for_query(&folders, &item_counts, &live_tv_tuners, &server_id, &query);
     Ok(Json(query_result(items)))
 }
 
@@ -29341,7 +29403,8 @@ async fn user_views_result_legacy(
     let folders = state.db.virtual_folders().await?;
     let server_id = state.db.server_state().await?.server_id.to_string();
     let item_counts = state.db.media_item_counts_by_virtual_folder().await?;
-    let items = user_views_for_query(&folders, &item_counts, &server_id, &query);
+    let live_tv_tuners = configured_live_tv_tuner_views(&state.db).await?;
+    let items = user_views_for_query(&folders, &item_counts, &live_tv_tuners, &server_id, &query);
     Ok(Json(query_result(items)))
 }
 
@@ -29399,6 +29462,7 @@ struct UserViewsQuery {
 fn user_views_for_query(
     folders: &[VirtualFolder],
     item_counts: &HashMap<Uuid, usize>,
+    live_tv_tuners: &[LiveTvTunerView],
     server_id: &str,
     query: &UserViewsQuery,
 ) -> Vec<serde_json::Value> {
@@ -29433,6 +29497,18 @@ fn user_views_for_query(
                 })
         })
     }));
+    items.extend(
+        live_tv_tuners
+            .iter()
+            .filter(|_| {
+                preset_views.as_ref().is_none_or(|presets| {
+                    presets
+                        .iter()
+                        .any(|preset| preset.eq_ignore_ascii_case("livetv"))
+                })
+            })
+            .map(|tuner| live_tv_tuner_view_to_json(tuner, server_id)),
+    );
     items
 }
 
@@ -29494,6 +29570,97 @@ const SPECIAL_USER_VIEWS: &[(&str, &str)] = &[
     ("Live TV", "livetv"),
     ("Playlists", "playlists"),
 ];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveTvTunerView {
+    tuner_id: String,
+    name: String,
+    provider_type: Option<String>,
+    view_id: String,
+    child_count: usize,
+}
+
+fn live_tv_tuner_view_id(tuner_id: &str) -> String {
+    stable_entity_id("LiveTvTunerView", &tuner_id.trim().to_ascii_lowercase())
+}
+
+async fn configured_live_tv_tuner_views(db: &Database) -> Result<Vec<LiveTvTunerView>, ApiError> {
+    let config = db
+        .named_configuration("livetv")
+        .await?
+        .unwrap_or_else(default_live_tv_configuration);
+    let mut seen = HashSet::new();
+    let mut views = Vec::new();
+    for tuner in config
+        .get("TunerHosts")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if tuner.get("Enabled").and_then(serde_json::Value::as_bool) == Some(false) {
+            continue;
+        }
+        let Some(tuner_id) = json_string_field(tuner, "Id")
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+        else {
+            continue;
+        };
+        if !seen.insert(tuner_id.to_ascii_lowercase()) {
+            continue;
+        }
+        let name = json_string_field(tuner, "FriendlyName")
+            .or_else(|| json_string_field(tuner, "Name"))
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| tuner_id.clone());
+        let provider_type = json_string_field(tuner, "Type");
+        let persisted_count = db
+            .live_tv_channel_count(&LiveTvChannelQuery {
+                tuner_ids: vec![tuner_id.clone()],
+                ..LiveTvChannelQuery::default()
+            })
+            .await?;
+        let configured_count = tuner
+            .get("Channels")
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len);
+        views.push(LiveTvTunerView {
+            view_id: live_tv_tuner_view_id(&tuner_id),
+            tuner_id,
+            name,
+            provider_type,
+            child_count: persisted_count.max(configured_count),
+        });
+    }
+    views.sort_by(|left, right| {
+        left.name
+            .to_ascii_lowercase()
+            .cmp(&right.name.to_ascii_lowercase())
+            .then_with(|| left.tuner_id.cmp(&right.tuner_id))
+    });
+    Ok(views)
+}
+
+async fn live_tv_tuner_view_by_id(
+    db: &Database,
+    view_id: &str,
+) -> Result<Option<LiveTvTunerView>, ApiError> {
+    Ok(configured_live_tv_tuner_views(db)
+        .await?
+        .into_iter()
+        .find(|view| view.view_id.eq_ignore_ascii_case(view_id.trim())))
+}
+
+fn live_tv_tuner_view_to_json(tuner: &LiveTvTunerView, server_id: &str) -> serde_json::Value {
+    let mut view = special_user_view_to_json(&tuner.name, "livetv", server_id);
+    view["Id"] = serde_json::json!(tuner.view_id);
+    view["ChildCount"] = serde_json::json!(tuner.child_count);
+    view["RecursiveItemCount"] = serde_json::json!(tuner.child_count);
+    view["TunerHostId"] = serde_json::json!(tuner.tuner_id);
+    view["UserData"]["Key"] = serde_json::json!(tuner.view_id);
+    view["UserData"]["ItemId"] = serde_json::json!(tuner.view_id);
+    view
+}
 
 fn special_user_views(server_id: &str) -> Vec<serde_json::Value> {
     SPECIAL_USER_VIEWS
@@ -30525,6 +30692,12 @@ async fn items_result(
         ensure_user_access(&auth_user, requested_user_id)?;
     }
     let server_id = state.db.server_state().await?.server_id.to_string();
+    if let Some(parent_id) = query.parent_id.as_deref()
+        && let Some(tuner) = live_tv_tuner_view_by_id(&state.db, parent_id).await?
+    {
+        return live_tv_channel_items_result(&state.db, &query, &server_id, Some(&tuner.tuner_id))
+            .await;
+    }
     if let Some(collection_type) =
         special_user_view_collection_type_for_parent(query.parent_id.as_deref())
     {
@@ -30541,7 +30714,7 @@ async fn items_result(
     if query_requests_only_item_type(&query, "LiveTvChannel")
         || query_requests_only_item_type(&query, "TvChannel")
     {
-        return live_tv_channel_items_result(&state.db, &query, &server_id).await;
+        return live_tv_channel_items_result(&state.db, &query, &server_id, None).await;
     }
     if let Some(result) =
         random_movie_series_items_result(&state.db, &query, &server_id, requested_user_id).await?
@@ -30632,6 +30805,12 @@ async fn user_items_result(
     let requested_user_id = resolve_user_id(&user_id)?;
     ensure_user_access(&auth_user, requested_user_id)?;
     let server_id = state.db.server_state().await?.server_id.to_string();
+    if let Some(parent_id) = query.parent_id.as_deref()
+        && let Some(tuner) = live_tv_tuner_view_by_id(&state.db, parent_id).await?
+    {
+        return live_tv_channel_items_result(&state.db, &query, &server_id, Some(&tuner.tuner_id))
+            .await;
+    }
     if let Some(collection_type) =
         special_user_view_collection_type_for_parent(query.parent_id.as_deref())
     {
@@ -30648,7 +30827,7 @@ async fn user_items_result(
     if query_requests_only_item_type(&query, "LiveTvChannel")
         || query_requests_only_item_type(&query, "TvChannel")
     {
-        return live_tv_channel_items_result(&state.db, &query, &server_id).await;
+        return live_tv_channel_items_result(&state.db, &query, &server_id, None).await;
     }
     if let Some(result) =
         media_catalog_items_result(&state.db, &query, &server_id, Some(requested_user_id)).await?
@@ -30820,6 +30999,7 @@ async fn live_tv_channel_items_result(
     db: &Database,
     query: &ItemsQuery,
     server_id: &str,
+    tuner_id: Option<&str>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let requested_limit = query.limit.unwrap_or(25);
     let limit = requested_limit.min(500);
@@ -30827,6 +31007,7 @@ async fn live_tv_channel_items_result(
         start_index: query.start_index.unwrap_or(0),
         limit: Some(limit),
         search_term: query.search_term.clone(),
+        tuner_ids: tuner_id.map(ToOwned::to_owned).into_iter().collect(),
         category_ids: Vec::new(),
     };
     let page = LiveTvService::new(db).channel_page(db_query).await?;
@@ -30844,6 +31025,12 @@ async fn live_tv_channel_items_result(
     }
 
     let mut items = configured_live_tv_channel_items(db).await?;
+    if let Some(tuner_id) = tuner_id {
+        items.retain(|item| {
+            json_string_field(item, "TunerHostId")
+                .is_some_and(|id| id.eq_ignore_ascii_case(tuner_id))
+        });
+    }
     filter_channel_items_by_search(&mut items, query.search_term.as_deref());
     let total_record_count = items.len();
     let start_index = query.start_index.unwrap_or(0).min(total_record_count);
@@ -32569,6 +32756,9 @@ async fn item_detail(
     if let Some(view) = special_user_view_by_id(&item_id, &server_id) {
         return Ok(Json(view));
     }
+    if let Some(tuner) = live_tv_tuner_view_by_id(&state.db, &item_id).await? {
+        return Ok(Json(live_tv_tuner_view_to_json(&tuner, &server_id)));
+    }
     if let Some(folder) = state
         .db
         .virtual_folders()
@@ -32669,6 +32859,9 @@ async fn current_user_item_detail(
     if let Some(view) = special_user_view_by_id(&item_id, &server_id) {
         return Ok(Json(view));
     }
+    if let Some(tuner) = live_tv_tuner_view_by_id(&state.db, &item_id).await? {
+        return Ok(Json(live_tv_tuner_view_to_json(&tuner, &server_id)));
+    }
     if let Some(folder) = state
         .db
         .virtual_folders()
@@ -32766,6 +32959,9 @@ async fn user_item_detail(
     let server_id = state.db.server_state().await?.server_id.to_string();
     if let Some(view) = special_user_view_by_id(&item_id, &server_id) {
         return Ok(Json(view));
+    }
+    if let Some(tuner) = live_tv_tuner_view_by_id(&state.db, &item_id).await? {
+        return Ok(Json(live_tv_tuner_view_to_json(&tuner, &server_id)));
     }
     if let Some(folder) = state
         .db
@@ -34830,6 +35026,12 @@ async fn item_ancestors(
     let root = root_folder_json(&state.db).await?;
     let server_id = state.db.server_state().await?.server_id.to_string();
     let root_id = root["Id"].as_str().unwrap_or_default().to_string();
+    if live_tv_tuner_view_by_id(&state.db, &item_id)
+        .await?
+        .is_some()
+    {
+        return Ok(Json(vec![root]));
+    }
     if live_tv_program_by_id(&state.db, &item_id).await?.is_some() {
         let mut live_tv = special_user_view_to_json("Live TV", "livetv", &server_id);
         if let Some(object) = live_tv.as_object_mut() {
@@ -46242,7 +46444,9 @@ async fn metadata_facet_folder_scope(
     let Some(parent_id) = query.parent_id.as_deref() else {
         return Ok(Some(Vec::new()));
     };
-    if special_user_view_collection_type_for_parent(Some(parent_id)).is_some() {
+    if special_user_view_collection_type_for_parent(Some(parent_id)).is_some()
+        || live_tv_tuner_view_by_id(db, parent_id).await?.is_some()
+    {
         return Ok(None);
     }
     let Ok(parent_id) = parse_jellyfin_uuid(parent_id) else {
@@ -46903,6 +47107,7 @@ async fn channel_items(
             start_index: query.start_index.unwrap_or(0),
             limit: Some(query.limit.unwrap_or(100).min(500)),
             search_term: query.search_term.clone(),
+            tuner_ids: Vec::new(),
             category_ids: Vec::new(),
         };
         let page = LiveTvService::new(&state.db).channel_page(db_query).await?;
@@ -47074,6 +47279,7 @@ async fn channel_content_items(
                 start_index: 0,
                 limit: Some(100),
                 search_term: None,
+                tuner_ids: Vec::new(),
                 category_ids: Vec::new(),
             })
             .await?;
@@ -48958,7 +49164,7 @@ async fn item_filters(
     if let Some(requested_user_id) = requested_user_id {
         ensure_user_access(&auth_user, requested_user_id)?;
     }
-    if query_targets_live_tv(&query) {
+    if query_targets_live_tv(&state.db, &query).await? {
         return Ok(Json(live_tv_filter_response(&state.db).await?));
     }
     let mut filter_query = query.clone();
@@ -49032,7 +49238,7 @@ async fn query_filters(
     if let Some(requested_user_id) = requested_user_id {
         ensure_user_access(&auth_user, requested_user_id)?;
     }
-    if query_targets_live_tv(&query) {
+    if query_targets_live_tv(&state.db, &query).await? {
         let values = live_tv_filter_metadata_items(&state.db).await?;
         return Ok(Json(serde_json::json!({
             "Genres": values,
@@ -49217,7 +49423,9 @@ async fn resolved_media_catalog_query_for_filter_values(
     let Some(parent_id) = query.parent_id.as_deref() else {
         return Ok(Some(db_query));
     };
-    if special_user_view_collection_type_for_parent(Some(parent_id)).is_some() {
+    if special_user_view_collection_type_for_parent(Some(parent_id)).is_some()
+        || live_tv_tuner_view_by_id(db, parent_id).await?.is_some()
+    {
         return Ok(None);
     }
     let Ok(parent_id) = parse_jellyfin_uuid(parent_id) else {
@@ -49236,15 +49444,22 @@ async fn resolved_media_catalog_query_for_filter_values(
     Ok(Some(db_query))
 }
 
-fn query_targets_live_tv(query: &ItemsQuery) -> bool {
-    query
+async fn query_targets_live_tv(db: &Database, query: &ItemsQuery) -> Result<bool, ApiError> {
+    let targets_static_live_tv = query
         .parent_id
         .as_deref()
         .is_some_and(|parent_id| parent_id.eq_ignore_ascii_case("livetv"))
         || special_user_view_collection_type_for_parent(query.parent_id.as_deref())
             .is_some_and(|collection_type| collection_type.eq_ignore_ascii_case("livetv"))
         || query_requests_item_type(query, "Program")
-        || query_requests_item_type(query, "TvChannel")
+        || query_requests_item_type(query, "TvChannel");
+    if targets_static_live_tv {
+        return Ok(true);
+    }
+    let Some(parent_id) = query.parent_id.as_deref() else {
+        return Ok(false);
+    };
+    Ok(live_tv_tuner_view_by_id(db, parent_id).await?.is_some())
 }
 
 async fn live_tv_filter_response(db: &Database) -> Result<serde_json::Value, ApiError> {
@@ -49472,6 +49687,9 @@ async fn media_items_source_for_query(
     query: &ItemsQuery,
 ) -> Result<Vec<MediaItem>, ApiError> {
     if let Some(parent_id) = query.parent_id.as_deref() {
+        if live_tv_tuner_view_by_id(db, parent_id).await?.is_some() {
+            return Ok(Vec::new());
+        }
         if let Some(collection_type) = special_user_view_collection_type_for_parent(Some(parent_id))
         {
             return Ok(db.media_items_by_collection_type(collection_type).await?);
@@ -56316,6 +56534,7 @@ async fn precache_live_tv_logos(state: &AppState) -> Result<(), ApiError> {
             start_index: 0,
             limit: Some(LIVE_TV_LOGO_PRECACHE_MAX),
             search_term: None,
+            tuner_ids: Vec::new(),
             category_ids: Vec::new(),
         })
         .await?;
@@ -73337,6 +73556,213 @@ done
             );
             assert_eq!(filters["Tags"], json!([]), "{endpoint}");
         }
+    }
+
+    #[tokio::test]
+    async fn live_tv_tuner_views_are_named_and_scope_channels_by_parent_id() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        let plugin_id = "7a7a8541-29f8-4c35-99b1-66df55f8399e";
+        db.update_named_configuration(
+            "livetv",
+            live_tv_configuration_json(json!({
+                "TunerHosts": [
+                    {
+                        "Id": "xtream-dev",
+                        "Type": "xtream",
+                        "FriendlyName": "Xtream Live TV"
+                    },
+                    {
+                        "Id": "magstv",
+                        "Type": format!("plugin:{plugin_id}"),
+                        "PluginId": plugin_id,
+                        "FriendlyName": "Mags Live TV"
+                    }
+                ],
+                "ListingProviders": []
+            })),
+        )
+        .await
+        .unwrap();
+        db.replace_live_tv_tuner_snapshot(
+            LiveTvTunerUpsert {
+                tuner_id: "xtream-dev".to_string(),
+                provider_type: "xtream".to_string(),
+                name: "Xtream Live TV".to_string(),
+                source_url: None,
+                configuration: json!({
+                    "Id": "xtream-dev",
+                    "Type": "xtream",
+                    "FriendlyName": "Xtream Live TV"
+                }),
+            },
+            Vec::new(),
+            vec![LiveTvChannelUpsert {
+                channel_id: "xtream-channel".to_string(),
+                tuner_id: "xtream-dev".to_string(),
+                remote_id: "xtream-1".to_string(),
+                category_id: None,
+                name: "Xtream Channel".to_string(),
+                sort_name: "Xtream Channel".to_string(),
+                number: Some("1".to_string()),
+                stream_url: "http://example.invalid/xtream.ts".to_string(),
+                logo_url: None,
+                channel_type: "TV".to_string(),
+                metadata: json!({ "Name": "Xtream Channel" }),
+            }],
+        )
+        .await
+        .unwrap();
+        db.replace_live_tv_tuner_snapshot(
+            LiveTvTunerUpsert {
+                tuner_id: "magstv".to_string(),
+                provider_type: format!("plugin:{plugin_id}"),
+                name: "Mags Live TV".to_string(),
+                source_url: None,
+                configuration: json!({
+                    "Id": "magstv",
+                    "Type": format!("plugin:{plugin_id}"),
+                    "PluginId": plugin_id,
+                    "FriendlyName": "Mags Live TV"
+                }),
+            },
+            Vec::new(),
+            vec![LiveTvChannelUpsert {
+                channel_id: "mags-channel".to_string(),
+                tuner_id: "magstv".to_string(),
+                remote_id: "mags-1".to_string(),
+                category_id: None,
+                name: "Mags Channel".to_string(),
+                sort_name: "Mags Channel".to_string(),
+                number: Some("2".to_string()),
+                stream_url: String::new(),
+                logo_url: None,
+                channel_type: "TV".to_string(),
+                metadata: json!({
+                    "Name": "Mags Channel",
+                    "ProviderReference": "opaque-mags-channel",
+                    "PluginProviderId": plugin_id,
+                    "ProviderType": format!("plugin:{plugin_id}")
+                }),
+            }],
+        )
+        .await
+        .unwrap();
+
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/UserViews")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let views: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(views["TotalRecordCount"], 5);
+        assert!(views["Items"].as_array().unwrap().iter().any(|view| {
+            view["Name"] == "Live TV"
+                && view["CollectionType"] == "livetv"
+                && view.get("TunerHostId").is_none()
+        }));
+        let mags_view = views["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|view| view["TunerHostId"] == "magstv")
+            .unwrap();
+        assert_eq!(mags_view["Name"], "Mags Live TV");
+        assert_eq!(mags_view["CollectionType"], "livetv");
+        assert_eq!(mags_view["ChildCount"], 1);
+        let mags_view_id = mags_view["Id"].as_str().unwrap().to_string();
+        assert_eq!(mags_view_id, super::live_tv_tuner_view_id("magstv"));
+
+        for endpoint in [
+            format!("/Items?ParentId={mags_view_id}&IncludeItemTypes=TvChannel&Limit=10"),
+            format!(
+                "/Users/{}/Items?ParentId={mags_view_id}&IncludeItemTypes=TvChannel&Limit=10",
+                user.id
+            ),
+            format!("/LiveTv/Channels?ParentId={mags_view_id}&Limit=10"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint.clone())
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let channels: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(channels["TotalRecordCount"], 1, "{endpoint}");
+            assert_eq!(channels["Items"][0]["Name"], "Mags Channel", "{endpoint}");
+            assert_eq!(channels["Items"][0]["TunerHostId"], "magstv", "{endpoint}");
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items/{mags_view_id}"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let view: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(view["Name"], "Mags Live TV");
+        assert_eq!(view["TunerHostId"], "magstv");
+        assert_eq!(view["ChildCount"], 1);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/LiveTv/Info")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let info: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(info["IsEnabled"], true);
+        assert_eq!(info["ChannelCount"], 2);
+        assert_eq!(info["TunerHosts"].as_array().unwrap().len(), 2);
+        let mags_info = info["TunerHosts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tuner| tuner["Id"] == "magstv")
+            .unwrap();
+        assert_eq!(mags_info["Name"], "Mags Live TV");
+        assert_eq!(mags_info["ChannelCount"], 1);
     }
 
     #[tokio::test]

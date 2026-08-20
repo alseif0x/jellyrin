@@ -604,6 +604,20 @@ fn append_live_tv_channel_filters(
     builder: &mut QueryBuilder<Postgres>,
     query: &LiveTvChannelQuery,
 ) {
+    let tuner_ids = query
+        .tuner_ids
+        .iter()
+        .map(|id| id.trim())
+        .filter(|id| !id.is_empty())
+        .collect::<Vec<_>>();
+    if !tuner_ids.is_empty() {
+        builder.push(" AND c.tuner_id IN (");
+        let mut separated = builder.separated(", ");
+        for tuner_id in tuner_ids {
+            separated.push_bind(tuner_id.to_string());
+        }
+        separated.push_unseparated(")");
+    }
     let category_ids = query
         .category_ids
         .iter()
@@ -1350,6 +1364,7 @@ mod tests {
                 start_index: 1,
                 limit: Some(1),
                 search_term: Some("  SPORTS  ".to_string()),
+                tuner_ids: Vec::new(),
                 category_ids: vec!["".to_string(), format!("  {sports_id}  ")],
             })
             .await

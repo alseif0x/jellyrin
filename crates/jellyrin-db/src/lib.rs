@@ -1689,6 +1689,8 @@ pub struct LiveTvChannelQuery {
     pub start_index: usize,
     pub limit: Option<usize>,
     pub search_term: Option<String>,
+    /// Resolved tuner ids to match (OR). Empty = channels from every tuner.
+    pub tuner_ids: Vec<String>,
     /// Resolved category ids to match (OR). Empty = no category filter.
     pub category_ids: Vec<String>,
 }
@@ -16977,6 +16979,20 @@ fn live_tv_channel_select_builder() -> QueryBuilder<Sqlite> {
 
 #[cfg(any(test, feature = "sqlite"))]
 fn append_live_tv_channel_filters(builder: &mut QueryBuilder<Sqlite>, query: &LiveTvChannelQuery) {
+    let tuner_ids = query
+        .tuner_ids
+        .iter()
+        .map(|id| id.trim())
+        .filter(|id| !id.is_empty())
+        .collect::<Vec<_>>();
+    if !tuner_ids.is_empty() {
+        builder.push(" AND c.tuner_id IN (");
+        let mut separated = builder.separated(", ");
+        for id in &tuner_ids {
+            separated.push_bind(id.to_string());
+        }
+        separated.push_unseparated(")");
+    }
     let category_ids = query
         .category_ids
         .iter()
