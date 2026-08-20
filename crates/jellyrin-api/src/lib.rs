@@ -25167,6 +25167,82 @@ fn sanitize_plugin_vod_media_streams(
     Ok(sanitized)
 }
 
+/// Returns codec evidence that can participate in client-profile matching. Some providers expose
+/// the MPEG-TS container in a field named `videoFormat` and use `unknown` when no audio codec was
+/// supplied. Those values are safe strings, but treating them as elementary-stream codecs makes
+/// both native TS discovery and browser HLS negotiation fail with `NoCompatibleStream`.
+fn usable_plugin_vod_codec_hint(value: Option<&str>, stream_type: &str) -> Option<String> {
+    let value = value?.trim();
+    if value.is_empty()
+        || value.len() > 32
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return None;
+    }
+    let normalized = match value.to_ascii_lowercase().as_str() {
+        // Jellyfin device profiles use FFmpeg's canonical decoder name.
+        "h265" => "hevc".to_string(),
+        value => value.to_string(),
+    };
+    if normalized == "unknown"
+        || normalized == "unspecified"
+        || normalized == "none"
+        || ((stream_type.eq_ignore_ascii_case("Video")
+            || stream_type.eq_ignore_ascii_case("Audio"))
+            && matches!(
+                normalized.as_str(),
+                "ts" | "mpegts" | "mpeg-ts" | "mpeg2ts" | "mp2t" | "hls" | "m3u8"
+            ))
+    {
+        return None;
+    }
+    Some(normalized)
+}
+
+fn repair_plugin_vod_placeholder_codecs(
+    streams: &mut [serde_json::Value],
+    playback: &VodPlaybackResult,
+) {
+    let video_hint =
+        usable_plugin_vod_codec_hint(playback.delivery.video_codec.as_deref(), "Video");
+    let audio_hint =
+        usable_plugin_vod_codec_hint(playback.delivery.audio_codec.as_deref(), "Audio");
+
+    for stream in streams {
+        let Some(object) = stream.as_object_mut() else {
+            continue;
+        };
+        let Some(stream_type) = object
+            .get("Type")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let delivery_hint = if stream_type.eq_ignore_ascii_case("Video") {
+            video_hint.as_ref()
+        } else if stream_type.eq_ignore_ascii_case("Audio") {
+            audio_hint.as_ref()
+        } else {
+            continue;
+        };
+        let current_codec = object.get("Codec").and_then(serde_json::Value::as_str);
+        if let Some(codec) = usable_plugin_vod_codec_hint(current_codec, &stream_type) {
+            object.insert("Codec".to_string(), serde_json::json!(codec));
+            continue;
+        }
+        if let Some(delivery_hint) = delivery_hint {
+            object.insert("Codec".to_string(), serde_json::json!(delivery_hint));
+        } else {
+            // Absence is honest codec evidence. Keeping `unknown` or the container alias would
+            // instead turn it into a definite mismatch against every ordinary device profile.
+            object.remove("Codec");
+        }
+    }
+}
+
 fn apply_plugin_vod_playback_descriptor(
     item: &mut MediaItem,
     playback: &VodPlaybackResult,
@@ -25181,7 +25257,14 @@ fn apply_plugin_vod_playback_descriptor(
     // synthesize their own stream URL to request `/stream.ts`; no provider URL becomes durable.
     let path = item.path.trim_end_matches('/');
     item.path = format!("{path}/stream.ts");
-    item.media_streams = playback.media_streams.clone();
+    let mut media_streams = playback.media_streams.clone();
+    // Prefer fresh provider track descriptors so language/subtitle selection remains exact, but
+    // do not let container aliases or explicit placeholders masquerade as elementary-stream
+    // codecs. Valid fresh codecs always win, as do valid delivery hints when a provider supplies
+    // them separately. We deliberately do not restore the catalogue's provisional h264/aac
+    // descriptors: playback resolution may reveal a different codec and must remain authoritative.
+    repair_plugin_vod_placeholder_codecs(&mut media_streams, playback);
+    item.media_streams = media_streams;
     Ok(())
 }
 
@@ -40403,6 +40486,60 @@ fn playback_profile_compatible(item: &MediaItem, options: &PlaybackInfoOptions) 
         .any(|profile| direct_play_profile_matches(item, profile))
 }
 
+/// Plugin VOD has already passed the fail-closed `DirectProxy` + MPEG-TS delivery gate, but its
+/// portal may not expose elementary codec names until a client opens the stream. A native client
+/// that explicitly advertises the TS container may therefore discover/proxy it when the known
+/// codecs match and unknown codecs remain absent. Browsers still fail the container check and use
+/// HLS, while a known incompatible codec continues to reject direct delivery.
+fn plugin_vod_direct_stream_profile_compatible(
+    item: &MediaItem,
+    options: &PlaybackInfoOptions,
+) -> bool {
+    if item.media_type.eq_ignore_ascii_case("Video") && !media_item_has_stream_type(item, "Video") {
+        return false;
+    }
+    let Some(profiles) = options.direct_play_profiles.as_ref() else {
+        return true;
+    };
+    profiles.iter().any(|profile| {
+        if let Some(profile_type) = profile.profile_type.as_deref()
+            && !profile_type.eq_ignore_ascii_case(&item.media_type)
+        {
+            return false;
+        }
+        let Some(container) = media_item_container(item) else {
+            return false;
+        };
+        if !profile.containers.is_empty()
+            && !profile
+                .containers
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(&container))
+        {
+            return false;
+        }
+        if let Some(video_codec) = media_item_stream_codec(item, "Video")
+            && !profile.video_codecs.is_empty()
+            && !profile
+                .video_codecs
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(&video_codec))
+        {
+            return false;
+        }
+        if let Some(audio_codec) = media_item_stream_codec(item, "Audio")
+            && !profile.audio_codecs.is_empty()
+            && !profile
+                .audio_codecs
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(&audio_codec))
+        {
+            return false;
+        }
+        true
+    })
+}
+
 fn playback_profile_codecs_compatible(item: &MediaItem, options: &PlaybackInfoOptions) -> bool {
     let Some(profiles) = options.direct_play_profiles.as_ref() else {
         return true;
@@ -41356,16 +41493,22 @@ fn playback_output_constraints(
             }
         }
     }
-    if video_mode == HlsStreamMode::Encode
-        && let Some(source_bitrate) = item.bitrate.and_then(positive_u32)
-    {
+    if video_mode == HlsStreamMode::Encode {
         // MaxStreamingBitrate is a transport ceiling, not a desired encoder bitrate. Browsers
         // commonly advertise values around 140 Mbps; using that directly turned a 2.1 Mbps source
         // into 30-50 MiB HLS segments. Bound software H.264 relative to the source while retaining
-        // enough headroom for HEVC-to-AVC efficiency differences.
-        let source_relative_ceiling = source_bitrate
-            .saturating_mul(2)
-            .clamp(MIN_VIDEO_TRANSCODE_BITRATE, MAX_VIDEO_TRANSCODE_BITRATE);
+        // enough headroom for HEVC-to-AVC efficiency differences. Remote plugin catalogues do not
+        // necessarily know the source bitrate before JIT playback; the server ceiling remains the
+        // safe bound in that case instead of inheriting the client's transport maximum.
+        let source_relative_ceiling = item
+            .bitrate
+            .and_then(positive_u32)
+            .map(|source_bitrate| {
+                source_bitrate
+                    .saturating_mul(2)
+                    .clamp(MIN_VIDEO_TRANSCODE_BITRATE, MAX_VIDEO_TRANSCODE_BITRATE)
+            })
+            .unwrap_or(MAX_VIDEO_TRANSCODE_BITRATE);
         output.video_bitrate = Some(
             output
                 .video_bitrate
@@ -41450,9 +41593,11 @@ fn hls_audio_stream_copy_supported(item: &MediaItem, options: &PlaybackInfoOptio
     let selected_index = options
         .audio_stream_index
         .or_else(|| default_audio_stream_index(&media_item_streams(item)));
-    selected_index
-        .and_then(|index| media_item_stream_codec_by_index(item, "Audio", index))
-        .is_none_or(|codec| matches!(codec.to_ascii_lowercase().as_str(), "aac" | "mp3"))
+    let Some(selected_index) = selected_index else {
+        return true;
+    };
+    media_item_stream_codec_by_index(item, "Audio", selected_index)
+        .is_some_and(|codec| matches!(codec.to_ascii_lowercase().as_str(), "aac" | "mp3"))
 }
 
 fn playback_delivery_decision(
@@ -41481,7 +41626,11 @@ fn playback_delivery_decision_with_ffmpeg_mode(
         .subtitle_stream_index
         .is_some_and(|index| index >= 0)
         && !selected_text_subtitle_can_use_external(item, options);
-    let profile_compatible = playback_profile_compatible(item, options);
+    let profile_compatible = if plugin_vod_remote {
+        plugin_vod_direct_stream_profile_compatible(item, options)
+    } else {
+        playback_profile_compatible(item, options)
+    };
     let profile_codecs_compatible = playback_profile_codecs_compatible(item, options);
     let profile_video_codec_compatible = playback_profile_video_codec_compatible(item, options);
     let video_codec_conditions_compatible =
@@ -103928,13 +104077,75 @@ done
     }
 
     #[test]
-    fn plugin_vod_uses_web_hls_but_keeps_native_mpegts_direct_proxy() {
+    fn plugin_vod_repairs_container_codec_labels_for_qa_native_and_web_profiles() {
         let mut item = playback_profile_test_item();
-        item.path = "plugin-vod://movies/provider-item/stream.ts".to_string();
+        item.path = "plugin-vod://movies/provider-item".to_string();
+        item.bitrate = None;
+        item.width = None;
+        item.height = None;
         item.media_streams = vec![
             json!({ "Type": "Video", "Index": 0, "Codec": "h264" }),
             json!({ "Type": "Audio", "Index": 1, "Codec": "aac", "Language": "spa", "IsDefault": true }),
         ];
+        let playback = jellyrin_plugin_sdk::VodPlaybackResult {
+            source_url: jellyrin_plugin_sdk::SensitiveUrl::new(
+                "https://provider.invalid/runtime-only.ts?signature=secret",
+            ),
+            expires_at: Some("2099-01-01T00:00:00Z".to_string()),
+            delivery: jellyrin_plugin_sdk::VodPlaybackDelivery {
+                container: "MpegTs".to_string(),
+                preferred: "DirectProxy".to_string(),
+                requires_provider_egress: true,
+                fallback: None,
+                // This is the exact faulty shape observed from MAGSTV: `videoFormat` carries the
+                // TS container, while its absent audio type is serialized as `unknown`.
+                video_codec: Some("ts".to_string()),
+                audio_codec: Some("unknown".to_string()),
+            },
+            media_streams: vec![
+                json!({
+                    "Type": "Video", "Index": 0, "Codec": "ts", "IsDefault": true,
+                    "MagstvVariantContentId": "variant-1"
+                }),
+                json!({
+                    "Type": "Audio", "Index": 1, "Codec": "unknown", "Language": "spa",
+                    "DisplayTitle": "Español", "IsDefault": true,
+                    "MagstvVariantContentId": "variant-1"
+                }),
+                json!({
+                    "Type": "Audio", "Index": 2, "Codec": "unknown", "Language": "eng",
+                    "DisplayTitle": "English", "IsDefault": false,
+                    "MagstvVariantContentId": "variant-1"
+                }),
+                json!({
+                    "Type": "Subtitle", "Index": 3, "Codec": "vtt", "Language": "spa",
+                    "DisplayTitle": "Español", "IsDefault": false, "IsForced": false,
+                    "IsExternal": true, "IsTextSubtitleStream": true,
+                    "SupportsExternalStream": true, "MagstvSubtitleLanguage": "spa"
+                }),
+            ],
+        };
+        super::apply_plugin_vod_playback_descriptor(&mut item, &playback).unwrap();
+        assert_eq!(item.path, "plugin-vod://movies/provider-item/stream.ts");
+        assert!(item.media_streams[0].get("Codec").is_none());
+        assert!(item.media_streams[1].get("Codec").is_none());
+        assert!(item.media_streams[2].get("Codec").is_none());
+        assert_eq!(item.media_streams[2]["Language"], "eng");
+        assert_eq!(item.media_streams[3]["Language"], "spa");
+        assert_eq!(
+            super::usable_plugin_vod_codec_hint(Some("h265"), "Video").as_deref(),
+            Some("hevc")
+        );
+        let mut resolved_hevc_streams =
+            vec![json!({ "Type": "Video", "Index": 0, "Codec": "hevc" })];
+        let mut conflicting_hint = playback.clone();
+        conflicting_hint.delivery.video_codec = Some("h264".to_string());
+        super::repair_plugin_vod_placeholder_codecs(&mut resolved_hevc_streams, &conflicting_hint);
+        assert_eq!(resolved_hevc_streams[0]["Codec"], "hevc");
+        let public_streams = serde_json::to_string(&item.media_streams).unwrap();
+        assert!(!public_streams.contains("provider.invalid"));
+        assert!(!public_streams.contains("signature"));
+
         let metadata = json!({
             "Provider": "plugin:66666666-7777-4888-9999-000000000099",
             "TunerId": "vod-tuner",
@@ -103944,21 +104155,36 @@ done
             "EnableDirectPlay": true,
             "EnableDirectStream": true,
             "EnableTranscoding": true,
+            "AudioStreamIndex": 2,
+            "SubtitleStreamIndex": 3,
             "DeviceProfile": {
-                "DirectPlayProfiles": [{
-                    "Type": "Video",
-                    "Container": "mp4",
-                    "VideoCodec": "h264",
-                    "AudioCodec": "aac"
-                }],
+                "Name": "Jellyfin Web",
+                "MaxStreamingBitrate": 120_000_000,
+                "DirectPlayProfiles": [
+                    {
+                        "Container": "webm", "Type": "Video", "VideoCodec": "vp8,vp9,av1",
+                        "AudioCodec": "vorbis,opus"
+                    },
+                    {
+                        "Container": "mp4,m4v", "Type": "Video", "VideoCodec": "h264,av1",
+                        "AudioCodec": "aac,mp3,opus,flac,vorbis"
+                    }
+                ],
                 "TranscodingProfiles": [{
-                    "Type": "Video",
-                    "Context": "Streaming",
-                    "Protocol": "hls",
                     "Container": "ts",
+                    "Type": "Video",
                     "VideoCodec": "h264",
-                    "AudioCodec": "aac"
-                }]
+                    "AudioCodec": "aac",
+                    "Protocol": "hls",
+                    "Context": "Streaming",
+                    "EnableMpegtsM2TsMode": true,
+                    "CopyTimestamps": true,
+                    "MinSegments": 1,
+                    "BreakOnNonKeyFrames": false
+                }],
+                "ContainerProfiles": [],
+                "CodecProfiles": [],
+                "SubtitleProfiles": [{ "Format": "vtt", "Method": "External" }]
             }
         }));
         let web_decision = playback_delivery_decision_with_ffmpeg_mode(
@@ -103967,21 +104193,31 @@ done
             &web,
             FfmpegMode::Enabled,
         );
-        assert_eq!(web_decision.delivery, DeliveryMode::HlsRemux);
-        assert_eq!(web_decision.video, HlsStreamMode::Copy);
-        assert_eq!(web_decision.audio, HlsStreamMode::Copy);
+        assert_eq!(web_decision.delivery, DeliveryMode::HlsTranscode);
+        assert_eq!(web_decision.video, HlsStreamMode::Encode);
+        assert_eq!(web_decision.audio, HlsStreamMode::Encode);
+        assert_eq!(
+            web_decision.output.video_bitrate,
+            Some(super::MAX_VIDEO_TRANSCODE_BITRATE)
+        );
 
         let native = playback_info_options_from_body(&json!({
-            "EnableDirectPlay": true,
+            "EnableDirectPlay": false,
             "EnableDirectStream": true,
-            "EnableTranscoding": true,
+            "EnableTranscoding": false,
+            "SubtitleStreamIndex": -1,
             "DeviceProfile": {
+                "Name": "MAGSTV QA native MPEG-TS discovery",
                 "DirectPlayProfiles": [{
+                    "Container": "ts,mpegts",
                     "Type": "Video",
-                    "Container": "ts",
-                    "VideoCodec": "h264",
-                    "AudioCodec": "aac"
-                }]
+                    "VideoCodec": "h264,hevc,mpeg2video",
+                    "AudioCodec": "aac,mp2,mp3,ac3,eac3"
+                }],
+                "TranscodingProfiles": [],
+                "ContainerProfiles": [],
+                "CodecProfiles": [],
+                "SubtitleProfiles": [{ "Format": "vtt", "Method": "External" }]
             }
         }));
         let native_decision = playback_delivery_decision_with_ffmpeg_mode(
@@ -103991,6 +104227,16 @@ done
             FfmpegMode::Enabled,
         );
         assert_eq!(native_decision.delivery, DeliveryMode::DirectProxy);
+
+        let mut known_incompatible = item.clone();
+        known_incompatible.media_streams[0]["Codec"] = json!("vp9");
+        let incompatible_decision = playback_delivery_decision_with_ffmpeg_mode(
+            &known_incompatible,
+            Some(&metadata),
+            &native,
+            FfmpegMode::Enabled,
+        );
+        assert_eq!(incompatible_decision.delivery, DeliveryMode::Unsupported);
     }
 
     #[test]
