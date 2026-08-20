@@ -148,10 +148,24 @@ pub async fn apply_schema(target_url: &str) -> anyhow::Result<SchemaReport> {
     ensure_local_migration_table(&target).await?;
     let schema_version_before = postgres_schema_version(&target).await?;
     let applied_before = postgres_applied_migration_count(&target).await?;
+    // Some immutable catalogue-index expressions intentionally catch invalid
+    // provider metadata with PL/pgSQL exception handlers. PostgreSQL exception
+    // handlers open subtransactions, which parallel CREATE INDEX workers cannot
+    // do. Keep migration DDL on one backend without changing an already-published
+    // migration (and therefore its SQLx checksum).
+    let mut migration_connection = target
+        .acquire()
+        .await
+        .context("failed to acquire PostgreSQL schema migration connection")?;
+    sqlx::query("SET max_parallel_maintenance_workers = 0")
+        .execute(&mut *migration_connection)
+        .await
+        .context("failed to disable parallel PostgreSQL migration workers")?;
     POSTGRES_MIGRATOR
-        .run(&target)
+        .run(&mut *migration_connection)
         .await
         .context("failed to apply embedded PostgreSQL schema migrations")?;
+    drop(migration_connection);
     let facet_projection = ensure_media_item_facet_projection(
         &mut migration_lock,
         MediaItemFacetProjectionMode::EnsureCurrent,

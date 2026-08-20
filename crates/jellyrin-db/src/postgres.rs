@@ -276,10 +276,23 @@ impl PostgresDatabase {
         .execute(&mut *migration_lock)
         .await
         .context("failed to acquire PostgreSQL migration lock")?;
+        // Catalogue index expressions may catch malformed provider metadata
+        // with PL/pgSQL exception handlers. Such handlers open subtransactions,
+        // which PostgreSQL forbids inside parallel CREATE INDEX workers.
+        let mut migration_connection = self
+            .worker_pool
+            .acquire()
+            .await
+            .context("failed to acquire PostgreSQL migration connection")?;
+        sqlx::query("SET max_parallel_maintenance_workers = 0")
+            .execute(&mut *migration_connection)
+            .await
+            .context("failed to disable parallel PostgreSQL migration workers")?;
         POSTGRES_MIGRATOR
-            .run(&self.worker_pool)
+            .run(&mut *migration_connection)
             .await
             .context("failed to migrate PostgreSQL schema")?;
+        drop(migration_connection);
         ensure_media_item_facet_projection(
             &mut migration_lock,
             MediaItemFacetProjectionMode::EnsureCurrent,
