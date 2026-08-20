@@ -323,6 +323,9 @@ static EXTERNAL_PLUGIN_SECURITY_LOCKS: OnceLock<ExternalPluginSecurityRegistry> 
 type ExternalPluginHostAdmissionRegistry = Mutex<HashMap<(String, String), Weak<Semaphore>>>;
 static EXTERNAL_PLUGIN_HOST_ADMISSION: OnceLock<ExternalPluginHostAdmissionRegistry> =
     OnceLock::new();
+type ExternalProviderSessionSlot = Arc<RwLock<()>>;
+type ExternalProviderSessionRegistry = Mutex<HashMap<(String, String), Weak<RwLock<()>>>>;
+static EXTERNAL_PROVIDER_SESSIONS: OnceLock<ExternalProviderSessionRegistry> = OnceLock::new();
 static TRANSCODE_LAST_ACCESS: OnceLock<Mutex<HashMap<String, tokio::time::Instant>>> =
     OnceLock::new();
 static SYNCPLAY_GROUPS: OnceLock<Mutex<HashMap<String, SyncPlayGroup>>> = OnceLock::new();
@@ -339,6 +342,9 @@ const AUTH_FAILURE_RETENTION_SECONDS: u64 = 15 * 60;
 const AUTH_FAILURE_MAX_ENTRIES: usize = 16_384;
 const AUTH_FAILURE_PRUNE_INTERVAL: usize = 64;
 const EXTERNAL_PROCESS_TARGET_ABI: &str = "jellyrin-plugin-rpc-v1";
+const EXTERNAL_PLUGIN_CATALOG_LANE: &str = "catalog-import";
+const EXTERNAL_PLUGIN_PROVIDER_JIT_LANE_PREFIX: &str = "provider-jit";
+const EXTERNAL_PLUGIN_PROVIDER_SECRET_LANE: &str = "provider-secret";
 const MAX_PLUGIN_PACKAGE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_PLUGIN_PACKAGE_ENTRIES: usize = 4_096;
 const MAX_PLUGIN_PACKAGE_UNCOMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
@@ -11437,6 +11443,7 @@ async fn sync_xtream_tuner_from_plugin_config(
             import,
             plugin_security_guard,
             plugin_admission_guard,
+            plugin_provider_session_guard,
         } = import_lease;
         let payload = persist_live_tv_provider_import(&state.db, &payload, &import).await?;
         // Warm the channel-logo disk cache in the background.
@@ -11471,6 +11478,7 @@ async fn sync_xtream_tuner_from_plugin_config(
             .await?;
         drop(plugin_security_guard);
         drop(plugin_admission_guard);
+        drop(plugin_provider_session_guard);
 
         // Trigger media sync
         let _ = start_xtream_media_sync_task(state.db.clone(), None).await;
@@ -11919,24 +11927,28 @@ async fn invoke_plugin_capability_via_runtime_host_path_with_timeout(
     };
     if runtime == PluginRuntime::ExternalProcess {
         let isolated_catalog_call = is_external_catalog_import_call(capability, &arguments);
-        let reusable_provider_metadata_call =
-            is_external_provider_metadata_call(capability, &arguments);
         let contains_secret_grant =
             json_field_case_insensitive(&arguments, "SecretGrant").is_some();
-        let one_shot =
-            isolated_catalog_call || (contains_secret_grant && !reusable_provider_metadata_call);
+        let reusable_provider_jit_lane = contains_secret_grant
+            .then(|| external_provider_jit_lane_for_call(capability, &arguments))
+            .flatten();
+        let one_shot = isolated_catalog_call
+            || (contains_secret_grant && reusable_provider_jit_lane.is_none());
         let lane = if isolated_catalog_call {
-            "catalog-import"
-        } else if reusable_provider_metadata_call {
-            "provider-metadata"
+            EXTERNAL_PLUGIN_CATALOG_LANE
+        } else if let Some(lane) = reusable_provider_jit_lane.as_deref() {
+            lane
         } else if contains_secret_grant {
-            "provider-secret"
+            EXTERNAL_PLUGIN_PROVIDER_SECRET_LANE
         } else {
             "default"
         };
         let guard = locked_external_plugin_host_in_lane(plugin, host_path, lane).await?;
-        let mut host_lease = ExternalPluginHostLease::new(guard, one_shot);
-        let invoke = ZeroizingInvokeEnvelope(PluginRpcEnvelope::new(
+        // Credentialed calls arm kill-on-drop until their complete response has been validated
+        // and the request envelope has been scrubbed. This keeps cancellation one-shot even for
+        // the normally persistent JIT lane.
+        let mut host_lease = ExternalPluginHostLease::new(guard, one_shot || contains_secret_grant);
+        let mut invoke = ZeroizingInvokeEnvelope(PluginRpcEnvelope::new(
             format!("{plugin_id}:capability:{capability}"),
             PluginRpcMethod::InvokeCapability,
             InvokeCapabilityRequest {
@@ -11972,21 +11984,25 @@ async fn invoke_plugin_capability_via_runtime_host_path_with_timeout(
                 ))
             }
         };
+        let mut reflected_secret = false;
         if contains_secret_grant && let Ok(Some(capability_result)) = &mut result {
             let canaries = live_tv_provider_secret_canaries(&invoke.0.payload.arguments);
             if json_contains_sensitive_canary(&capability_result.value, &canaries) {
                 zeroize_json_value_strings(&mut capability_result.value);
+                reflected_secret = true;
                 result = Err(ApiError::internal(
                     "ExternalProcess provider-secret response reflected credential material",
                 ));
             }
         }
-        // Catalogue and playback grants remain one-shot. ResolveMetadata has a dedicated,
-        // serial reusable lane so a page of artwork can reuse its provider session; request JSON
-        // and credentials are still zeroized after every call, and grant scope/revision remains
-        // pinned by the runtime for the process lifetime.
-        if one_shot {
+        // Scrub the core-owned grant before releasing a persistent lane to its next JIT action.
+        // The process may retain its own provider session, but it never receives a durable core
+        // grant: scope/revision is revalidated independently on every request.
+        invoke.scrub();
+        if one_shot || reflected_secret {
             host_lease.shutdown().await;
+        } else {
+            host_lease.retain_on_drop();
         }
         return result;
     }
@@ -12228,6 +12244,12 @@ struct ZeroizingJsonValue(serde_json::Value);
 
 struct ZeroizingInvokeEnvelope(PluginRpcEnvelope<InvokeCapabilityRequest>);
 
+impl ZeroizingInvokeEnvelope {
+    fn scrub(&mut self) {
+        zeroize_json_value_strings(&mut self.0.payload.arguments);
+    }
+}
+
 fn zeroize_json_value_strings(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::String(value) => value.zeroize(),
@@ -12254,7 +12276,7 @@ impl Drop for ZeroizingJsonValue {
 
 impl Drop for ZeroizingInvokeEnvelope {
     fn drop(&mut self) {
-        zeroize_json_value_strings(&mut self.0.payload.arguments);
+        self.scrub();
     }
 }
 
@@ -12671,10 +12693,41 @@ fn is_external_catalog_import_call(capability: &str, arguments: &serde_json::Val
         })
 }
 
-fn is_external_provider_metadata_call(capability: &str, arguments: &serde_json::Value) -> bool {
+fn is_external_provider_jit_call(capability: &str, arguments: &serde_json::Value) -> bool {
+    let Some(action) = json_string_field(arguments, "Action") else {
+        return false;
+    };
+    if capability.eq_ignore_ascii_case(CAPABILITY_LIVE_TV_PROVIDER) {
+        return action.eq_ignore_ascii_case("ResolvePlayback");
+    }
     capability.eq_ignore_ascii_case(CAPABILITY_VOD_LIBRARY_PROVIDER)
-        && json_string_field(arguments, "Action")
-            .is_some_and(|action| action.eq_ignore_ascii_case("ResolveMetadata"))
+        && ["ResolveMetadata", "ResolvePlayback", "ResolveSubtitle"]
+            .iter()
+            .any(|candidate| action.eq_ignore_ascii_case(candidate))
+}
+
+fn external_provider_jit_lane(tuner_id: &str) -> Option<String> {
+    let tuner_id = tuner_id.trim();
+    (!tuner_id.is_empty()).then(|| {
+        format!(
+            "{EXTERNAL_PLUGIN_PROVIDER_JIT_LANE_PREFIX}:{}",
+            tuner_id.to_ascii_lowercase()
+        )
+    })
+}
+
+fn external_provider_jit_lane_for_call(
+    capability: &str,
+    arguments: &serde_json::Value,
+) -> Option<String> {
+    if !is_external_provider_jit_call(capability, arguments) {
+        return None;
+    }
+    ["TunerConfig", "ProviderConfig"]
+        .iter()
+        .find_map(|field| json_field_case_insensitive(arguments, field))
+        .and_then(|config| json_string_field(config, "Id"))
+        .and_then(|tuner_id| external_provider_jit_lane(&tuner_id))
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -12873,6 +12926,39 @@ async fn external_plugin_host_admission_slot(plugin_id: &str, lane: &str) -> Arc
     slot
 }
 
+async fn external_provider_session_slot(
+    plugin_id: &str,
+    tuner_id: &str,
+) -> ExternalProviderSessionSlot {
+    let key = (
+        plugin_id.trim().to_ascii_lowercase(),
+        tuner_id.trim().to_ascii_lowercase(),
+    );
+    let registry = EXTERNAL_PROVIDER_SESSIONS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut registry = registry.lock().await;
+    registry.retain(|_, slot| slot.strong_count() > 0);
+    if let Some(slot) = registry.get(&key).and_then(Weak::upgrade) {
+        return slot;
+    }
+    // These providers permit only one account session. An importer owns the writer for its full
+    // generation; JIT uses non-blocking readers after entering its serial lane.
+    let slot = Arc::new(RwLock::new(()));
+    registry.insert(key, Arc::downgrade(&slot));
+    slot
+}
+
+async fn try_external_provider_jit_session(
+    plugin_id: &str,
+    tuner_id: &str,
+) -> Result<tokio::sync::OwnedRwLockReadGuard<()>, ApiError> {
+    external_provider_session_slot(plugin_id, tuner_id)
+        .await
+        .try_read_owned()
+        .map_err(|_| {
+            ApiError::service_unavailable("Provider catalogue synchronization is in progress")
+        })
+}
+
 async fn locked_external_plugin_host(
     plugin: &serde_json::Value,
     host_path: PathBuf,
@@ -12956,6 +13042,10 @@ impl ExternalPluginHostLease {
         stop_locked_external_plugin_host(&mut self.guard).await;
         self.stop_on_drop = false;
     }
+
+    fn retain_on_drop(&mut self) {
+        self.stop_on_drop = false;
+    }
 }
 
 impl Drop for ExternalPluginHostLease {
@@ -12989,6 +13079,21 @@ async fn stop_external_plugin_host(plugin_id: &str) {
     // Keep empty slots registered. Removing first would detach waiters that already cloned the
     // Arc; such a waiter could start an unreachable child after this stop completed.
     for slot in slots {
+        let mut guard = slot.lock_owned().await;
+        stop_locked_external_plugin_host(&mut guard).await;
+    }
+}
+
+async fn stop_external_plugin_host_in_lane(plugin_id: &str, lane: &str) {
+    let key = (
+        plugin_id.trim().to_ascii_lowercase(),
+        lane.trim().to_ascii_lowercase(),
+    );
+    let slot = {
+        let hosts = external_plugin_hosts().lock().await;
+        hosts.get(&key).cloned()
+    };
+    if let Some(slot) = slot {
         let mut guard = slot.lock_owned().await;
         stop_locked_external_plugin_host(&mut guard).await;
     }
@@ -19900,6 +20005,7 @@ async fn live_tv_provider_import_from_payload(
                 import,
                 plugin_security_guard: None,
                 plugin_admission_guard: None,
+                plugin_provider_session_guard: None,
             }
         }));
     }
@@ -19912,6 +20018,7 @@ struct LiveTvProviderImportLease {
     import: LiveTvProviderImport,
     plugin_security_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
     plugin_admission_guard: Option<tokio::sync::OwnedSemaphorePermit>,
+    plugin_provider_session_guard: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
 }
 
 async fn live_tv_provider_programs_from_payload(
@@ -20510,7 +20617,7 @@ async fn live_tv_plugin_provider_request(
 
 /// Builds a `VodLibraryProviderRequest` for one `plugin:<id>` tuner. VOD provider credentials
 /// anchor to the same tuner as the live TV flow, so the binding, persisted configuration,
-/// namespace, permission and one-shot grant validation are exactly the live TV builder's; only
+/// namespace, permission and scoped grant validation are exactly the live TV builder's; only
 /// the wire type changes.
 async fn vod_library_plugin_provider_request(
     db: &Database,
@@ -20537,13 +20644,23 @@ async fn live_tv_plugin_channel_provider_import(
     let Some(plugin_id) = live_tv_plugin_id_from_payload(payload, provider_type) else {
         return Ok(None);
     };
-    let admission_guard = external_plugin_host_admission_slot(&plugin_id, "catalog-import")
+    let tuner_id = json_string_field(payload, "Id")
+        .ok_or_else(|| ApiError::bad_request("Live TV tuner Id is required"))?;
+    let jit_lane = external_provider_jit_lane(&tuner_id)
+        .ok_or_else(|| ApiError::bad_request("Live TV tuner Id is required"))?;
+    let admission_guard =
+        external_plugin_host_admission_slot(&plugin_id, EXTERNAL_PLUGIN_CATALOG_LANE)
+            .await
+            .acquire_owned()
+            .await
+            .map_err(|_| ApiError::service_unavailable("Live TV provider is unavailable"))?;
+    let provider_session_guard = external_provider_session_slot(&plugin_id, &tuner_id)
         .await
-        .acquire_owned()
-        .await
-        .map_err(|_| ApiError::service_unavailable("Live TV provider is unavailable"))?;
+        .write_owned()
+        .await;
     let security_slot = external_plugin_security_slot(&plugin_id).await;
     let security_guard = security_slot.read_owned().await;
+    stop_external_plugin_host_in_lane(&plugin_id, &jit_lane).await;
     let Some(plugin) = db.installed_plugin_json(&plugin_id).await? else {
         return Err(ApiError::not_found("Live TV plugin provider not found"));
     };
@@ -20562,8 +20679,6 @@ async fn live_tv_plugin_channel_provider_import(
         ));
     }
     let (capability, arguments) = if uses_live_tv_provider {
-        let tuner_id = json_string_field(payload, "Id")
-            .ok_or_else(|| ApiError::bad_request("Live TV tuner Id is required"))?;
         let persisted = persisted_live_tv_tuner_configuration(db, &tuner_id).await?;
         let request_configuration = persisted.as_ref().unwrap_or(payload);
         let request = live_tv_plugin_provider_request(
@@ -20670,6 +20785,7 @@ async fn live_tv_plugin_channel_provider_import(
         },
         plugin_security_guard: Some(security_guard),
         plugin_admission_guard: Some(admission_guard),
+        plugin_provider_session_guard: Some(provider_session_guard),
     }))
 }
 
@@ -21560,11 +21676,12 @@ async fn vod_library_plugin_media_import(
     db: &Database,
     plugin_id: &str,
 ) -> Result<Option<VodLibraryPluginImportCounts>, ApiError> {
-    let _admission_guard = external_plugin_host_admission_slot(plugin_id, "catalog-import")
-        .await
-        .acquire_owned()
-        .await
-        .map_err(|_| ApiError::service_unavailable("VOD library provider is unavailable"))?;
+    let _admission_guard =
+        external_plugin_host_admission_slot(plugin_id, EXTERNAL_PLUGIN_CATALOG_LANE)
+            .await
+            .acquire_owned()
+            .await
+            .map_err(|_| ApiError::service_unavailable("VOD library provider is unavailable"))?;
     vod_library_plugin_media_import_admitted(db, plugin_id).await
 }
 
@@ -21575,6 +21692,17 @@ async fn vod_library_plugin_media_import_admitted(
     db: &Database,
     plugin_id: &str,
 ) -> Result<Option<VodLibraryPluginImportCounts>, ApiError> {
+    let Some(preflight_tuner) = vod_library_plugin_tuner_configuration(db, plugin_id).await? else {
+        return Ok(None);
+    };
+    let preflight_tuner_id = json_string_field(&preflight_tuner, "Id")
+        .ok_or_else(|| ApiError::bad_request("Live TV tuner Id is required"))?;
+    let jit_lane = external_provider_jit_lane(&preflight_tuner_id)
+        .ok_or_else(|| ApiError::bad_request("Live TV tuner Id is required"))?;
+    let _provider_session_guard = external_provider_session_slot(plugin_id, &preflight_tuner_id)
+        .await
+        .write_owned()
+        .await;
     let security_slot = external_plugin_security_slot(plugin_id).await;
     let _security_guard = security_slot.read_owned().await;
     let Some(plugin) = db.installed_plugin_json(plugin_id).await? else {
@@ -21595,6 +21723,12 @@ async fn vod_library_plugin_media_import_admitted(
     };
     let tuner_id = json_string_field(&tuner, "Id")
         .ok_or_else(|| ApiError::bad_request("Live TV tuner Id is required"))?;
+    if !tuner_id.eq_ignore_ascii_case(&preflight_tuner_id) {
+        return Err(ApiError::service_unavailable(
+            "VOD provider tuner changed before catalogue synchronization",
+        ));
+    }
+    stop_external_plugin_host_in_lane(plugin_id, &jit_lane).await;
     let request = vod_library_plugin_provider_request(
         db,
         &plugin,
@@ -22995,6 +23129,7 @@ async fn add_live_tv_tuner_host(
     // tuner deletion from being overwritten by an import that started with older state.
     let mut provider_import_security_guard = None;
     let mut provider_import_admission_guard = None;
+    let mut provider_import_session_guard = None;
     if tuner_type == "hdhomerun" {
         if let Some(channels) = live_tv_hdhomerun_channels_from_payload(&mut payload).await {
             payload["Channels"] = serde_json::json!(channels);
@@ -23006,9 +23141,11 @@ async fn add_live_tv_tuner_host(
             import,
             plugin_security_guard,
             plugin_admission_guard,
+            plugin_provider_session_guard,
         } = import_lease;
         provider_import_security_guard = plugin_security_guard;
         provider_import_admission_guard = plugin_admission_guard;
+        provider_import_session_guard = plugin_provider_session_guard;
         payload = persist_live_tv_provider_import(&state.db, &payload, &import).await?;
         // Warm the channel-logo disk cache in the background.
         spawn_live_tv_logo_precache(state.clone());
@@ -23060,6 +23197,7 @@ async fn add_live_tv_tuner_host(
         .await?;
     drop(provider_import_security_guard);
     drop(provider_import_admission_guard);
+    drop(provider_import_session_guard);
     // A plugin tuner may also expose the VOD library capability; chain its import after the
     // channel snapshot and public configuration have both committed. The import re-acquires its
     // own lane permit and lifecycle read lock, so it must run after the lease guards above are
@@ -24600,11 +24738,14 @@ async fn resolve_opaque_live_tv_playback(
             "Live TV channel provider binding is invalid",
         ));
     }
-    let _admission_guard = external_plugin_host_admission_slot(&plugin_id, "provider-secret")
+    let jit_lane = external_provider_jit_lane(&tuner_id)
+        .ok_or_else(|| ApiError::service_unavailable("Live TV tuner is unavailable"))?;
+    let _admission_guard = external_plugin_host_admission_slot(&plugin_id, &jit_lane)
         .await
         .acquire_owned()
         .await
         .map_err(|_| ApiError::service_unavailable("Live TV provider is unavailable"))?;
+    let _provider_session_guard = try_external_provider_jit_session(&plugin_id, &tuner_id).await?;
     let security_slot = external_plugin_security_slot(&plugin_id).await;
     let _security_guard = security_slot.read_owned().await;
     let persisted_tuner_config = db
@@ -24987,11 +25128,14 @@ async fn invoke_plugin_vod_provider_action(
     action: &str,
     mut request_arguments: serde_json::Value,
 ) -> Result<ZeroizingJsonValue, ApiError> {
-    let _admission_guard = external_plugin_host_admission_slot(plugin_id, "provider-secret")
+    let jit_lane = external_provider_jit_lane(tuner_id)
+        .ok_or_else(|| ApiError::service_unavailable("VOD provider tuner is unavailable"))?;
+    let _admission_guard = external_plugin_host_admission_slot(plugin_id, &jit_lane)
         .await
         .acquire_owned()
         .await
         .map_err(|_| ApiError::service_unavailable("VOD library provider is unavailable"))?;
+    let _provider_session_guard = try_external_provider_jit_session(plugin_id, tuner_id).await?;
     let security_slot = external_plugin_security_slot(plugin_id).await;
     let _security_guard = security_slot.read_owned().await;
     let persisted_tuner_config = db
@@ -25076,8 +25220,9 @@ async fn invoke_plugin_vod_provider_action(
 
 /// Resolves playback for one persisted plugin-VOD media item just-in-time. The `plugin-vod://`
 /// path and its metadata only carry the opaque provider reference, so every stream asks the
-/// provider plugin for a fresh signed URL through a one-shot grant on the `provider-secret`
-/// lane. The signed URL is never logged or persisted: it returns as a `SensitiveUrl` that only
+/// provider plugin for a fresh signed URL through a fresh grant on the persistent, serial JIT
+/// lane shared with metadata and subtitles for this tuner. The grant is scrubbed after the call;
+/// the signed URL is never logged or persisted and returns as a `SensitiveUrl` that only
 /// the internal proxy may expose. The provider contract remains direct-proxy MPEG-TS; Jellyrin may
 /// feed those bytes to FFmpeg through its unguessable loopback relay when a browser requires HLS.
 /// Callers must enforce `opaque_live_tv_delivery_is_safe_for_direct_proxy` before either path.
@@ -25142,7 +25287,7 @@ struct PluginVodSubtitleResolution {
 }
 
 /// Resolves one external subtitle by the public stream index returned by `ResolvePlayback`.
-/// This is intentionally a separate one-shot grant/action: the plugin may retrieve its runtime
+/// This is intentionally a separate scoped grant/action: the plugin may retrieve its runtime
 /// subtitle URL, but neither that URL nor its provider-language selector is persisted in the
 /// catalogue or returned by PlaybackInfo.
 async fn resolve_plugin_vod_subtitle(
@@ -25722,12 +25867,15 @@ async fn resolve_plugin_vod_metadata(
     }
     let reference = plugin_vod_remote_reference(metadata)
         .ok_or_else(|| ApiError::service_unavailable("VOD metadata route is unavailable"))?;
-    let _admission_guard =
-        external_plugin_host_admission_slot(&reference.plugin_id, "provider-metadata")
-            .await
-            .acquire_owned()
-            .await
-            .map_err(|_| ApiError::service_unavailable("VOD metadata provider is unavailable"))?;
+    let jit_lane = external_provider_jit_lane(&reference.tuner_id)
+        .ok_or_else(|| ApiError::service_unavailable("VOD metadata tuner is unavailable"))?;
+    let _admission_guard = external_plugin_host_admission_slot(&reference.plugin_id, &jit_lane)
+        .await
+        .acquire_owned()
+        .await
+        .map_err(|_| ApiError::service_unavailable("VOD metadata provider is unavailable"))?;
+    let _provider_session_guard =
+        try_external_provider_jit_session(&reference.plugin_id, &reference.tuner_id).await?;
     let security_slot = external_plugin_security_slot(&reference.plugin_id).await;
     let _security_guard = security_slot.read_owned().await;
     let tuner = db
@@ -62026,19 +62174,121 @@ mod tests {
     }
 
     #[test]
-    fn provider_metadata_has_a_dedicated_reusable_runtime_lane() {
-        assert!(super::is_external_provider_metadata_call(
-            super::CAPABILITY_VOD_LIBRARY_PROVIDER,
-            &json!({ "Action": "ResolveMetadata" }),
-        ));
-        assert!(!super::is_external_provider_metadata_call(
-            super::CAPABILITY_VOD_LIBRARY_PROVIDER,
+    fn provider_jit_actions_share_one_runtime_lane_per_tuner() {
+        assert!(super::is_external_provider_jit_call(
+            super::CAPABILITY_LIVE_TV_PROVIDER,
             &json!({ "Action": "ResolvePlayback" }),
         ));
-        assert!(!super::is_external_provider_metadata_call(
+        for action in ["ResolveMetadata", "ResolvePlayback", "ResolveSubtitle"] {
+            assert!(super::is_external_provider_jit_call(
+                super::CAPABILITY_VOD_LIBRARY_PROVIDER,
+                &json!({ "Action": action }),
+            ));
+        }
+        assert!(!super::is_external_provider_jit_call(
+            super::CAPABILITY_VOD_LIBRARY_PROVIDER,
+            &json!({ "Action": "ImportMedia" }),
+        ));
+        assert!(!super::is_external_provider_jit_call(
             super::CAPABILITY_LIVE_TV_PROVIDER,
             &json!({ "Action": "ResolveMetadata" }),
         ));
+
+        let live = json!({
+            "Action": "ResolvePlayback",
+            "TunerConfig": { "Id": "Tuner-One" }
+        });
+        let vod = json!({
+            "Action": "ResolveSubtitle",
+            "ProviderConfig": { "Id": "tuner-one" }
+        });
+        assert_eq!(
+            super::external_provider_jit_lane_for_call(super::CAPABILITY_LIVE_TV_PROVIDER, &live),
+            Some("provider-jit:tuner-one".to_string())
+        );
+        assert_eq!(
+            super::external_provider_jit_lane_for_call(
+                super::CAPABILITY_VOD_LIBRARY_PROVIDER,
+                &vod
+            ),
+            Some("provider-jit:tuner-one".to_string())
+        );
+        assert!(
+            super::external_provider_jit_lane_for_call(
+                super::CAPABILITY_VOD_LIBRARY_PROVIDER,
+                &json!({ "Action": "ResolvePlayback", "ProviderConfig": {} }),
+            )
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_jit_admission_is_serial_for_the_same_tuner() {
+        let lane = super::external_provider_jit_lane("TUNER-SERIAL").unwrap();
+        let first_slot =
+            super::external_plugin_host_admission_slot("plugin-jit-serial", &lane).await;
+        let second_slot = super::external_plugin_host_admission_slot(
+            "PLUGIN-JIT-SERIAL",
+            &super::external_provider_jit_lane("tuner-serial").unwrap(),
+        )
+        .await;
+        assert!(std::sync::Arc::ptr_eq(&first_slot, &second_slot));
+
+        let first = first_slot.clone().acquire_owned().await.unwrap();
+        assert!(
+            tokio::time::timeout(
+                StdDuration::from_millis(25),
+                second_slot.clone().acquire_owned(),
+            )
+            .await
+            .is_err(),
+            "metadata/playback/subtitle calls for one tuner must not overlap"
+        );
+        drop(first);
+        let _second = tokio::time::timeout(StdDuration::from_secs(1), second_slot.acquire_owned())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn provider_catalogue_excludes_jit_for_the_same_plugin_and_tuner() {
+        let slot = super::external_provider_session_slot("plugin-import-gate", "TUNER-ONE").await;
+        let import = slot.write_owned().await;
+
+        let error = super::try_external_provider_jit_session("PLUGIN-IMPORT-GATE", "tuner-one")
+            .await
+            .expect_err("JIT must fail closed while a catalogue generation owns the account");
+        assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        drop(import);
+        let _jit = super::try_external_provider_jit_session("plugin-import-gate", "tuner-one")
+            .await
+            .expect("JIT may resume after catalogue publication releases the writer");
+    }
+
+    #[test]
+    fn provider_jit_invoke_envelope_scrubs_credential_material() {
+        let mut invoke = super::ZeroizingInvokeEnvelope(super::PluginRpcEnvelope::new(
+            "jit-zeroize-test",
+            super::PluginRpcMethod::InvokeCapability,
+            super::InvokeCapabilityRequest {
+                plugin_id: "plugin-zeroize".to_string(),
+                capability: super::CAPABILITY_VOD_LIBRARY_PROVIDER.to_string(),
+                arguments: json!({
+                    "Action": "ResolveMetadata",
+                    "ProviderConfig": { "Id": "tuner-zeroize" },
+                    "SecretGrant": {
+                        "Username": "zeroize-user-canary",
+                        "Password": "zeroize-password-canary",
+                        "Fields": { "SessionToken": "zeroize-token-canary" }
+                    }
+                }),
+                timeout_ms: 1_000,
+            },
+        ));
+        invoke.scrub();
+        assert_eq!(invoke.0.payload.arguments, json!({}));
     }
 
     #[tokio::test]
@@ -66971,7 +67221,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     #[serial(plugin_host)]
-    async fn provider_secret_playback_is_one_shot_and_rejects_reflection() {
+    async fn provider_jit_reuses_one_host_across_actions_and_rejects_reflection() {
         let plugin_id = "23333333-4444-5555-6666-777777777777";
         let tmp = tempfile::tempdir().unwrap();
         let plugin_dir = tmp.path().join("plugin");
@@ -66988,26 +67238,26 @@ mod tests {
             .unwrap();
         let plugin = json!({
             "Id": plugin_id,
-            "Name": "One-shot External Provider",
+            "Name": "Persistent JIT External Provider",
             "Version": "0.1.0",
             "Runtime": "ExternalProcess",
             "TargetAbi": super::EXTERNAL_PROCESS_TARGET_ABI,
             "Permissions": ["Network", "ProviderSecrets"],
             "Manifest": {
                 "Guid": plugin_id,
-                "Name": "One-shot External Provider",
+                "Name": "Persistent JIT External Provider",
                 "Version": "0.1.0",
                 "Runtime": "ExternalProcess",
                 "TargetAbi": super::EXTERNAL_PROCESS_TARGET_ABI,
                 "Entrypoint": "bin/external-provider-runtime",
-                "Capabilities": ["LiveTvProvider"],
+                "Capabilities": ["LiveTvProvider", "VodLibraryProvider"],
                 "Installation": { "InstallPath": plugin_dir.to_string_lossy() }
             }
         });
-        let request = |reflect: bool| {
+        let live_request = |password: &str, reflect: bool| {
             json!({
                 "Action": "ResolvePlayback",
-                "TunerConfig": { "Id": "tuner-one" },
+                "TunerConfig": { "Id": "TUNER-ONE" },
                 "Arguments": { "ReflectGrant": reflect },
                 "SecretGrant": {
                     "PluginId": plugin_id,
@@ -67016,7 +67266,23 @@ mod tests {
                     "SecretId": "ps_0123456789abcdef0123456789abcdef",
                     "Revision": 1,
                     "Username": "provider-user",
-                    "Password": "one-use-password"
+                    "Password": password
+                }
+            })
+        };
+        let vod_request = |action: &str, password: &str, reflect: bool| {
+            json!({
+                "Action": action,
+                "ProviderConfig": { "Id": "tuner-one" },
+                "Arguments": { "ReflectGrant": reflect },
+                "SecretGrant": {
+                    "PluginId": plugin_id,
+                    "TunerId": "tuner-one",
+                    "Action": action,
+                    "SecretId": "ps_0123456789abcdef0123456789abcdef",
+                    "Revision": 1,
+                    "Username": "provider-user",
+                    "Password": password
                 }
             })
         };
@@ -67024,7 +67290,7 @@ mod tests {
         let result = super::invoke_plugin_capability_via_runtime_host_path_with_timeout(
             &plugin,
             super::CAPABILITY_LIVE_TV_PROVIDER,
-            request(false),
+            live_request("live-jit-password", false),
             super::PluginRuntime::ExternalProcess,
             "ExternalProcess",
             "ExternalProcess",
@@ -67041,18 +67307,64 @@ mod tests {
                 .unwrap(),
             b"x"
         );
+        assert!(!tmp.path().join("external-stopped").exists());
+
+        for (action, password) in [
+            ("ResolveMetadata", "metadata-jit-password"),
+            ("ResolvePlayback", "vod-playback-jit-password"),
+            ("ResolveSubtitle", "subtitle-jit-password"),
+        ] {
+            let result = super::invoke_plugin_capability_via_runtime_host_path_with_timeout(
+                &plugin,
+                super::CAPABILITY_VOD_LIBRARY_PROVIDER,
+                vod_request(action, password, false),
+                super::PluginRuntime::ExternalProcess,
+                "ExternalProcess",
+                "ExternalProcess",
+                host_path.clone(),
+                StdDuration::from_secs(5),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(result.value["Status"], "Executed");
+        }
         assert_eq!(
-            tokio::fs::read(tmp.path().join("external-stopped"))
+            tokio::fs::read(tmp.path().join("external-started"))
                 .await
                 .unwrap(),
-            b"x"
+            b"x",
+            "all JIT actions for one plugin/tuner must reuse one process"
         );
+        assert!(!tmp.path().join("external-stopped").exists());
+
+        let invokes = tokio::fs::read_to_string(tmp.path().join("external-invokes"))
+            .await
+            .unwrap();
+        let lines = invokes.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 4);
+        let passwords = [
+            "live-jit-password",
+            "metadata-jit-password",
+            "vod-playback-jit-password",
+            "subtitle-jit-password",
+        ];
+        for (index, own_password) in passwords.into_iter().enumerate() {
+            assert!(lines[index].contains(own_password));
+            assert!(
+                passwords
+                    .iter()
+                    .filter(|password| **password != own_password)
+                    .all(|password| !lines[index].contains(password)),
+                "a JIT request must not inherit a previous grant envelope"
+            );
+        }
 
         assert!(
             super::invoke_plugin_capability_via_runtime_host_path_with_timeout(
                 &plugin,
-                super::CAPABILITY_LIVE_TV_PROVIDER,
-                request(true),
+                super::CAPABILITY_VOD_LIBRARY_PROVIDER,
+                vod_request("ResolveSubtitle", "one-use-password", true),
                 super::PluginRuntime::ExternalProcess,
                 "ExternalProcess",
                 "ExternalProcess",
@@ -67066,20 +67378,21 @@ mod tests {
             tokio::fs::read(tmp.path().join("external-started"))
                 .await
                 .unwrap(),
-            b"xx"
+            b"x"
         );
         assert_eq!(
             tokio::fs::read(tmp.path().join("external-stopped"))
                 .await
                 .unwrap(),
-            b"xx"
+            b"x"
         );
+        let lane = super::external_provider_jit_lane("tuner-one").unwrap();
         let slot = {
             let hosts = super::external_plugin_hosts().lock().await;
             hosts
-                .get(&(plugin_id.to_string(), "provider-secret".to_string()))
+                .get(&(plugin_id.to_string(), lane))
                 .cloned()
-                .expect("provider-secret lane slot was not registered")
+                .expect("provider JIT lane slot was not registered")
         };
         assert!(slot.lock().await.is_none());
         super::stop_external_plugin_host(plugin_id).await;
