@@ -29,7 +29,10 @@ CREATE OR REPLACE FUNCTION public.jellyrin_metadata_number(metadata jsonb, keys 
 RETURNS double precision
 LANGUAGE plpgsql
 IMMUTABLE
-PARALLEL SAFE
+-- The exception handler uses a PostgreSQL subtransaction. Marking this function
+-- parallel-safe lets a parallel CREATE INDEX invoke it in a worker, where
+-- subtransactions are forbidden.
+PARALLEL UNSAFE
 AS $$
 DECLARE
     value jsonb;
@@ -50,7 +53,8 @@ CREATE OR REPLACE FUNCTION public.jellyrin_metadata_timestamp(metadata jsonb, ke
 RETURNS timestamptz
 LANGUAGE plpgsql
 IMMUTABLE
-PARALLEL SAFE
+-- See jellyrin_metadata_number: this function also has an exception handler.
+PARALLEL UNSAFE
 AS $$
 DECLARE
     value jsonb;
