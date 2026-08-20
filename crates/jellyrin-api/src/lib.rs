@@ -257,7 +257,9 @@ const LIVE_TV_CHANNELS_DEFAULT_LIMIT: usize = 100;
 const LIVE_TV_CHANNELS_MAX_LIMIT: usize = 500;
 /// One catalogue refresh has one wall-clock budget, shared by every provider page.
 const LIVE_TV_PROVIDER_CATALOG_TIMEOUT: StdDuration = StdDuration::from_secs(120);
-const VOD_LIBRARY_PROVIDER_CATALOG_TIMEOUT: StdDuration = StdDuration::from_secs(2 * 60 * 60);
+const DEFAULT_VOD_LIBRARY_PROVIDER_CATALOG_TIMEOUT_SECONDS: u64 = 2 * 60 * 60;
+const MIN_VOD_LIBRARY_PROVIDER_CATALOG_TIMEOUT_SECONDS: u64 = 60;
+const MAX_VOD_LIBRARY_PROVIDER_CATALOG_TIMEOUT_SECONDS: u64 = 6 * 60 * 60;
 /// Bound a faulty provider even when every individual RPC response fits below 1 MiB.
 const LIVE_TV_PROVIDER_CATALOG_MAX_PAGES: usize = 256;
 /// Bound the aggregate JSON retained across a paginated catalogue import. The RPC framing limit
@@ -12496,6 +12498,37 @@ fn vod_library_provider_catalog_remaining(
         .ok_or_else(|| ApiError::internal("VOD library provider catalogue import timed out"))
 }
 
+fn vod_library_provider_catalog_timeout_seconds_from_value(value: Option<&str>) -> u64 {
+    value
+        .map(str::trim)
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(|seconds| {
+            seconds.clamp(
+                MIN_VOD_LIBRARY_PROVIDER_CATALOG_TIMEOUT_SECONDS,
+                MAX_VOD_LIBRARY_PROVIDER_CATALOG_TIMEOUT_SECONDS,
+            )
+        })
+        .unwrap_or(DEFAULT_VOD_LIBRARY_PROVIDER_CATALOG_TIMEOUT_SECONDS)
+}
+
+fn vod_library_provider_catalog_timeout() -> StdDuration {
+    static TIMEOUT: OnceLock<StdDuration> = OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        let seconds = vod_library_provider_catalog_timeout_seconds_from_value(
+            std::env::var("JELLYRIN_VOD_LIBRARY_PROVIDER_CATALOG_TIMEOUT_SECONDS")
+                .ok()
+                .as_deref(),
+        );
+        tracing::info!(
+            seconds,
+            maximum_seconds = MAX_VOD_LIBRARY_PROVIDER_CATALOG_TIMEOUT_SECONDS,
+            "configured VOD library provider catalogue deadline"
+        );
+        StdDuration::from_secs(seconds)
+    })
+}
+
 async fn collect_vod_library_provider_pages(
     client: &mut PluginHostStdioClient,
     plugin_id: &str,
@@ -21522,7 +21555,7 @@ async fn vod_library_plugin_media_import_admitted(
             runtime_name,
             error_prefix,
             host_path,
-            VOD_LIBRARY_PROVIDER_CATALOG_TIMEOUT,
+            vod_library_provider_catalog_timeout(),
             &mut writer,
         )
         .await?
@@ -60733,14 +60766,30 @@ mod tests {
         assert_eq!(super::VOD_LIBRARY_PROVIDER_CATALOG_MAX_PAGES, 2_048);
         assert_eq!(super::VOD_LIBRARY_PROVIDER_CATALOG_MAX_ITEMS, 1_000_000);
         assert_eq!(
-            super::VOD_LIBRARY_PROVIDER_CATALOG_TIMEOUT,
-            std::time::Duration::from_secs(2 * 60 * 60)
+            super::DEFAULT_VOD_LIBRARY_PROVIDER_CATALOG_TIMEOUT_SECONDS,
+            2 * 60 * 60
+        );
+        assert_eq!(
+            super::MAX_VOD_LIBRARY_PROVIDER_CATALOG_TIMEOUT_SECONDS,
+            6 * 60 * 60
         );
         // Live TV retains its independent in-memory safety boundary.
         assert_eq!(
             super::LIVE_TV_PROVIDER_CATALOG_MAX_ACCUMULATED_BYTES,
             64 * 1024 * 1024
         );
+    }
+
+    #[test]
+    fn vod_catalogue_timeout_configuration_is_bounded() {
+        let configured = super::vod_library_provider_catalog_timeout_seconds_from_value;
+        assert_eq!(configured(None), 2 * 60 * 60);
+        assert_eq!(configured(Some("")), 2 * 60 * 60);
+        assert_eq!(configured(Some("not-a-number")), 2 * 60 * 60);
+        assert_eq!(configured(Some("0")), 2 * 60 * 60);
+        assert_eq!(configured(Some(" 10800 ")), 3 * 60 * 60);
+        assert_eq!(configured(Some("1")), 60);
+        assert_eq!(configured(Some("999999")), 6 * 60 * 60);
     }
 
     #[tokio::test]
