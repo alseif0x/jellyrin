@@ -78,11 +78,6 @@ test.describe('deployed MAGSTV plugin settings, catalogue, and playback', () => 
     // playback probes run strictly one after another.
     await page.goto('about:blank');
 
-    const liveResult = await probeFirstPlayable(
-      snapshot.channels.items,
-      (channel) => probeScopedLiveTvPlayback(request, baseURL, auth, channel),
-      'Mags Live TV',
-    );
     const movieResult = await probeFirstPlayable(
       snapshot.movies.items,
       (movie) => probeVodWebExperience(request, baseURL, auth, movie, 'movie'),
@@ -92,6 +87,11 @@ test.describe('deployed MAGSTV plugin settings, catalogue, and playback', () => 
       snapshot.episodes.items,
       (episode) => probeVodWebExperience(request, baseURL, auth, episode, 'episode'),
       'Mags Series episode',
+    );
+    const liveResult = await probeFirstPlayable(
+      snapshot.channels.items,
+      (channel) => probeScopedLiveTvPlayback(request, baseURL, auth, channel),
+      'Mags Live TV',
     );
 
     expect(liveResult.bytes).toBeGreaterThan(0);
