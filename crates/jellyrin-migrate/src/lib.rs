@@ -162,7 +162,7 @@ pub async fn apply_schema(target_url: &str) -> anyhow::Result<SchemaReport> {
         .await
         .context("failed to disable parallel PostgreSQL migration workers")?;
     POSTGRES_MIGRATOR
-        .run(&mut *migration_connection)
+        .run_direct(None, &mut *migration_connection, false)
         .await
         .context("failed to apply embedded PostgreSQL schema migrations")?;
     drop(migration_connection);

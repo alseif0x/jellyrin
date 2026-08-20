@@ -289,7 +289,7 @@ impl PostgresDatabase {
             .await
             .context("failed to disable parallel PostgreSQL migration workers")?;
         POSTGRES_MIGRATOR
-            .run(&mut *migration_connection)
+            .run_direct(None, &mut *migration_connection, false)
             .await
             .context("failed to migrate PostgreSQL schema")?;
         drop(migration_connection);
