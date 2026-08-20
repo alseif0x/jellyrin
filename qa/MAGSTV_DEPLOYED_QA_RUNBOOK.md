@@ -12,6 +12,9 @@ MAGSTV configuration/import process may run at a time.
   already starts the VOD import.
 - Keep the administrator token and the two account fields in separate mode-0600 files. Never put
   them in command arguments, repository JSON, logs, or Git.
+- Configure `JELLYRIN_PROVIDER_EGRESS_PROXY` for the local MX sidecar and keep
+  `JELLYRIN_CACHE_DIR` writable by the Jellyrin service identity. Artwork, external subtitles and
+  the encrypted incremental detail cache fail closed when those boundaries are unavailable.
 - If the Settings submission has succeeded and the QA process later stops, use the verify-only
   recovery below. Never submit the account again merely to resume polling.
 
@@ -178,41 +181,54 @@ cmp --silent "$qa_state_dir/tuner.before.json" "$qa_state_dir/tuner.after.json"
 The final `cmp` is the no-settings-loss gate: the encrypted reference, its revision, tuner type,
 friendly name, and persisted channel count must survive package replacement unchanged.
 
-## Run Settings once and monitor the same import
+## Configure a new server exactly once
 
-The provider environment file must contain only `JELLYRIN_MAGSTV_USERNAME` and
-`JELLYRIN_MAGSTV_PASSWORD`. Set an explicit four-hour catalogue timeout even though four hours is
-also the test default. Keep `CLICK_REFRESH=0`.
+This step applies only when the `magstv` tuner and its encrypted provider-secret reference do not
+exist yet. Open the installed plugin Settings page, confirm that it exposes exactly `username` and
+`password`, enter those two account values, and click `Guardar e indexar` once. Do not also click
+`Actualizar catálogo`: the save already starts the same atomic Live TV and VOD refresh.
+
+Keep that browser session as the only account writer until the import ends. Do not start the
+verify-only suite, another Settings session, the provider app, or another server login in parallel;
+MAGSTV may invalidate the active portal session when the same account logs in elsewhere. Once the
+encrypted reference exists, never place the credentials in an environment used by verification.
+
+## Verify the deployed package without another login or refresh
+
+The final deployed suite is deliberately hard-wired to verify-only mode. It never fills, saves, or
+refreshes Settings and rejects catalogue mutations. Run it against the catalogue already published
+by the one Settings submission above (or preserved across an in-place package upgrade):
 
 ```bash
 cd "$core_repo"
-set -a
-. /secure/path/magstv-e2e-credentials.env
-set +a
-
 JELLYRIN_E2E_DEPLOYED=1 \
 JELLYRIN_E2E_MAGSTV_QA=1 \
+JELLYRIN_E2E_MAGSTV_VERIFY_ONLY=1 \
 JELLYRIN_E2E_NO_WEBSERVER=1 \
 JELLYRIN_E2E_BASE_URL=https://jellyrin.test.kode.live \
 JELLYRIN_E2E_API_TOKEN_FILE="$api_token_file" \
-JELLYRIN_E2E_MAGSTV_CLICK_REFRESH=0 \
-JELLYRIN_E2E_MAGSTV_SYNC_TIMEOUT_MS=14400000 \
+JELLYRIN_E2E_MAGSTV_VERIFY_TIMEOUT_MS=14400000 \
 PLAYWRIGHT_CHROMIUM_EXECUTABLE=/home/ubuntu/.cache/ms-playwright/chromium-1208/chrome-linux/chrome \
 npm run test:e2e:magstv-plugin
-
-unset JELLYRIN_MAGSTV_USERNAME JELLYRIN_MAGSTV_PASSWORD
 ```
 
-The suite itself emits `magstv-sync-pending` JSON every 30 seconds. Let that single process poll;
-do not open another configuration test, call the VOD refresh endpoint, or create a parallel
-provider login. A pass requires all of the following in one `magstv-e2e-passed` result:
+A pass requires all of the following in one `magstv-e2e-passed` result:
 
 - at least 1,000 live channels;
 - at least 30,000 movies;
 - at least 20,000 series and 100,001 episodes;
 - visible and openable `Mags Movies`, `Mags Series`, and `Mags Live TV` views;
-- non-empty media bytes from one live channel, one movie, and one episode;
+- a non-empty synopsis and locally proxied Primary image for one movie and one series/episode;
+- selectable provider audio-language and subtitle tracks when the sampled title exposes them;
+- a browser-compatible VOD HLS manifest and non-empty segment for one movie and one episode;
+- non-empty media bytes from one live channel;
 - no browser chunk-loading or page errors.
+
+After the first complete import has populated the encrypted revision cache, run one explicit
+refresh separately and only after the verify-only process has exited. Then run verify-only again.
+Record refresh elapsed time and the aggregate cache hit/miss counters; the second refresh must reuse
+unchanged `getItemData` results and must not create a concurrent portal session. Do not claim the
+incremental speedup from unit tests alone.
 
 ## Resume after a test timeout without another Settings save
 
