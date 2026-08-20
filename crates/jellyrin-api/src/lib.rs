@@ -63413,12 +63413,26 @@ mod tests {
         assert_eq!(movie_items[0].name, "Movie One");
         assert!(movie_items[0].path.starts_with("plugin-vod://"));
         assert!(!movie_items[0].path.starts_with("http"));
-        let episode_items = db
+        let series_items = db
             .media_items_for_virtual_folders(&[series.id])
             .await
             .unwrap();
-        assert_eq!(episode_items.len(), 1);
-        assert_eq!(episode_items[0].name, "Pilot");
+        assert_eq!(series_items.len(), 2);
+        let series_anchor = series_items
+            .iter()
+            .find(|item| item.name == "Show One")
+            .expect("VOD series anchor was not published");
+        assert_eq!(series_anchor.media_type, "Series");
+        assert_eq!(series_anchor.collection_type.as_deref(), Some("tvshows"));
+        assert!(series_anchor.path.starts_with("plugin-vod://"));
+        let episode = series_items
+            .iter()
+            .find(|item| item.name == "Pilot")
+            .expect("VOD episode was not published");
+        assert_eq!(super::media_item_type(episode), "Episode");
+        assert_eq!(episode.media_type, "Video");
+        assert_eq!(episode.collection_type.as_deref(), Some("tvshows"));
+        assert!(episode.path.starts_with("plugin-vod://"));
 
         // The explicit admin refresh re-runs the same import and reports sanitized counts.
         let response = app
