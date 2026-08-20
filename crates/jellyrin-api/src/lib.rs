@@ -24715,18 +24715,245 @@ fn is_plugin_vod_virtual_item(item: &MediaItem) -> bool {
     item.path.starts_with("plugin-vod://")
 }
 
-/// Resolves playback for one persisted plugin-VOD media item just-in-time. The `plugin-vod://`
-/// path and its metadata only carry the opaque provider reference, so every stream asks the
-/// provider plugin for a fresh signed URL through a one-shot grant on the `provider-secret`
-/// lane. The signed URL is never logged or persisted: it returns as a `SensitiveUrl` that only
-/// the internal proxy may expose. VOD playback is limited to direct-proxy MPEG-TS delivery (no
-/// HLS remux); callers must enforce `opaque_live_tv_delivery_is_safe_for_direct_proxy`.
-async fn resolve_plugin_vod_playback(
+const PLUGIN_VOD_MAX_MEDIA_STREAMS: usize = 64;
+const PLUGIN_VOD_MAX_STREAM_INDEX: i64 = 4_096;
+
+/// Copies one plugin-provided media descriptor into the API boundary's deliberately small,
+/// provider-neutral schema.  In particular, URL/path/header/token/licence fields are not merely
+/// hidden from the response: an object carrying any unrecognised field is rejected in full. This
+/// keeps track labels useful to clients without turning `MediaStreams` into a second channel for
+/// the signed source URL or provider credentials.
+fn sanitize_plugin_vod_media_stream(
+    stream: &serde_json::Value,
+) -> Result<serde_json::Value, ApiError> {
+    let object = stream.as_object().ok_or_else(|| {
+        ApiError::service_unavailable("VOD provider returned an invalid media stream")
+    })?;
+    const ALLOWED_FIELDS: &[&str] = &[
+        "Index",
+        "Type",
+        "Codec",
+        "Language",
+        "Title",
+        "DisplayTitle",
+        "IsInterlaced",
+        "IsDefault",
+        "IsForced",
+        "IsExternal",
+        "IsTextSubtitleStream",
+        "SupportsExternalStream",
+        "Channels",
+        "MagstvVariantContentId",
+        "MagstvSubtitleLanguage",
+    ];
+    if object
+        .keys()
+        .any(|field| !ALLOWED_FIELDS.contains(&field.as_str()))
+    {
+        return Err(ApiError::service_unavailable(
+            "VOD provider returned an unsafe media stream",
+        ));
+    }
+
+    let index = object
+        .get("Index")
+        .and_then(json_value_i64)
+        .filter(|index| (0..=PLUGIN_VOD_MAX_STREAM_INDEX).contains(index))
+        .ok_or_else(|| {
+            ApiError::service_unavailable("VOD provider returned an invalid media stream index")
+        })?;
+    let stream_type = object
+        .get("Type")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .and_then(|stream_type| {
+            if stream_type.eq_ignore_ascii_case("Video") {
+                Some("Video")
+            } else if stream_type.eq_ignore_ascii_case("Audio") {
+                Some("Audio")
+            } else if stream_type.eq_ignore_ascii_case("Subtitle") {
+                Some("Subtitle")
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| {
+            ApiError::service_unavailable("VOD provider returned an invalid media stream type")
+        })?;
+
+    let codec = object
+        .get("Codec")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|codec| {
+            !codec.is_empty()
+                && codec.len() <= 32
+                && codec
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        })
+        .ok_or_else(|| {
+            ApiError::service_unavailable("VOD provider returned an invalid media stream codec")
+        })?;
+
+    let safe_text = |field: &str, maximum: usize| -> Result<Option<String>, ApiError> {
+        let Some(value) = object.get(field) else {
+            return Ok(None);
+        };
+        let value = value.as_str().map(str::trim).ok_or_else(|| {
+            ApiError::service_unavailable("VOD provider returned invalid media stream metadata")
+        })?;
+        if value.is_empty() || value.len() > maximum || value.chars().any(char::is_control) {
+            return Err(ApiError::service_unavailable(
+                "VOD provider returned invalid media stream metadata",
+            ));
+        }
+        Ok(Some(value.to_string()))
+    };
+    let language = safe_text("Language", 64)?;
+    let title = safe_text("Title", 256)?;
+    let display_title = safe_text("DisplayTitle", 256)?;
+    let subtitle_language = safe_text("MagstvSubtitleLanguage", 64)?;
+    if subtitle_language.is_some() && stream_type != "Subtitle"
+        || subtitle_language
+            .as_deref()
+            .is_some_and(|subtitle_language| {
+                language
+                    .as_deref()
+                    .is_some_and(|language| !subtitle_language.eq_ignore_ascii_case(language))
+            })
+    {
+        return Err(ApiError::service_unavailable(
+            "VOD provider returned inconsistent subtitle metadata",
+        ));
+    }
+    if let Some(content_id) = safe_text("MagstvVariantContentId", 512)?
+        && (stream_type == "Subtitle" || !valid_live_tv_provider_reference(&content_id))
+    {
+        return Err(ApiError::service_unavailable(
+            "VOD provider returned invalid variant metadata",
+        ));
+    }
+
+    let safe_bool = |field: &str| -> Result<Option<bool>, ApiError> {
+        object
+            .get(field)
+            .map(|value| {
+                value.as_bool().ok_or_else(|| {
+                    ApiError::service_unavailable(
+                        "VOD provider returned invalid media stream metadata",
+                    )
+                })
+            })
+            .transpose()
+    };
+    let mut sanitized = serde_json::Map::new();
+    sanitized.insert("Index".to_string(), serde_json::json!(index));
+    sanitized.insert("Type".to_string(), serde_json::json!(stream_type));
+    sanitized.insert("Codec".to_string(), serde_json::json!(codec));
+    for (field, value) in [
+        ("Language", language),
+        ("Title", title),
+        ("DisplayTitle", display_title),
+        ("MagstvSubtitleLanguage", subtitle_language),
+    ] {
+        if let Some(value) = value {
+            sanitized.insert(field.to_string(), serde_json::json!(value));
+        }
+    }
+    for field in [
+        "IsInterlaced",
+        "IsDefault",
+        "IsForced",
+        "IsExternal",
+        "IsTextSubtitleStream",
+        "SupportsExternalStream",
+    ] {
+        if let Some(value) = safe_bool(field)? {
+            sanitized.insert(field.to_string(), serde_json::json!(value));
+        }
+    }
+    if let Some(channels) = object.get("Channels") {
+        let channels = channels
+            .as_i64()
+            .filter(|channels| (1..=32).contains(channels))
+            .ok_or_else(|| {
+                ApiError::service_unavailable(
+                    "VOD provider returned invalid audio channel metadata",
+                )
+            })?;
+        if stream_type != "Audio" {
+            return Err(ApiError::service_unavailable(
+                "VOD provider returned inconsistent audio metadata",
+            ));
+        }
+        sanitized.insert("Channels".to_string(), serde_json::json!(channels));
+    }
+    Ok(serde_json::Value::Object(sanitized))
+}
+
+fn sanitize_plugin_vod_media_streams(
+    streams: &[serde_json::Value],
+) -> Result<Vec<serde_json::Value>, ApiError> {
+    if streams.len() > PLUGIN_VOD_MAX_MEDIA_STREAMS {
+        return Err(ApiError::service_unavailable(
+            "VOD provider returned too many media streams",
+        ));
+    }
+    let mut indices = HashSet::with_capacity(streams.len());
+    let mut video_count = 0usize;
+    let mut sanitized = Vec::with_capacity(streams.len());
+    for stream in streams {
+        let stream = sanitize_plugin_vod_media_stream(stream)?;
+        let index = stream
+            .get("Index")
+            .and_then(json_value_i64)
+            .ok_or_else(|| {
+                ApiError::service_unavailable("VOD provider returned an invalid media stream")
+            })?;
+        if !indices.insert(index) {
+            return Err(ApiError::service_unavailable(
+                "VOD provider returned duplicate media stream indices",
+            ));
+        }
+        if json_string_field(&stream, "Type").as_deref() == Some("Video") {
+            video_count = video_count.saturating_add(1);
+            if video_count > 1 {
+                return Err(ApiError::service_unavailable(
+                    "VOD provider returned multiple selected video variants",
+                ));
+            }
+        }
+        sanitized.push(stream);
+    }
+    Ok(sanitized)
+}
+
+fn apply_plugin_vod_playback_descriptor(
+    item: &mut MediaItem,
+    playback: &VodPlaybackResult,
+) -> Result<(), ApiError> {
+    if !opaque_live_tv_delivery_is_safe_for_direct_proxy(playback) {
+        return Err(ApiError::service_unavailable(
+            "VOD provider did not authorize a safe direct stream",
+        ));
+    }
+    // This path remains an opaque routing token. Appending a safe filename is enough for the
+    // normal Jellyfin media-source serializer to advertise `Container=ts` and for clients which
+    // synthesize their own stream URL to request `/stream.ts`; no provider URL becomes durable.
+    let path = item.path.trim_end_matches('/');
+    item.path = format!("{path}/stream.ts");
+    item.media_streams = playback.media_streams.clone();
+    Ok(())
+}
+
+async fn invoke_plugin_vod_provider_action(
     db: &Database,
     plugin_id: &str,
     tuner_id: &str,
-    provider_reference: &str,
-) -> Result<VodPlaybackResult, ApiError> {
+    action: &str,
+    mut request_arguments: serde_json::Value,
+) -> Result<ZeroizingJsonValue, ApiError> {
     let _admission_guard = external_plugin_host_admission_slot(plugin_id, "provider-secret")
         .await
         .acquire_owned()
@@ -24779,21 +25006,25 @@ async fn resolve_plugin_vod_playback(
             hls_remux: false,
         },
     };
-    let mut request_arguments = serde_json::to_value(context)
-        .map_err(|_| ApiError::internal("invalid VOD playback context"))?;
-    request_arguments["ProviderReference"] =
-        serde_json::Value::String(provider_reference.to_string());
+    let context = serde_json::to_value(context)
+        .map_err(|_| ApiError::internal("invalid VOD provider context"))?;
+    let request_object = request_arguments
+        .as_object_mut()
+        .ok_or_else(|| ApiError::internal("invalid VOD provider action arguments"))?;
+    for (field, value) in context.as_object().into_iter().flatten() {
+        request_object.insert(field.clone(), value.clone());
+    }
     let request = vod_library_plugin_provider_request(
         db,
         &plugin,
         &persisted_tuner_config,
-        "ResolvePlayback",
+        action,
         request_arguments,
     )
     .await
     .map_err(|_| ApiError::service_unavailable("VOD provider credentials are unavailable"))?;
     let arguments = serde_json::to_value(request)
-        .map_err(|_| ApiError::internal("invalid VOD playback request"))?;
+        .map_err(|_| ApiError::internal("invalid VOD provider request"))?;
     let result = invoke_plugin_capability_via_runtime_host_path_with_timeout(
         &plugin,
         CAPABILITY_VOD_LIBRARY_PROVIDER,
@@ -24807,7 +25038,29 @@ async fn resolve_plugin_vod_playback(
     .await
     .map_err(|_| ApiError::service_unavailable("VOD provider resolution failed"))?
     .ok_or_else(|| ApiError::service_unavailable("VOD library provider runtime is unavailable"))?;
-    let result = ZeroizingJsonValue(result.value);
+    Ok(ZeroizingJsonValue(result.value))
+}
+
+/// Resolves playback for one persisted plugin-VOD media item just-in-time. The `plugin-vod://`
+/// path and its metadata only carry the opaque provider reference, so every stream asks the
+/// provider plugin for a fresh signed URL through a one-shot grant on the `provider-secret`
+/// lane. The signed URL is never logged or persisted: it returns as a `SensitiveUrl` that only
+/// the internal proxy may expose. VOD playback is limited to direct-proxy MPEG-TS delivery (no
+/// HLS remux); callers must enforce `opaque_live_tv_delivery_is_safe_for_direct_proxy`.
+async fn resolve_plugin_vod_playback(
+    db: &Database,
+    plugin_id: &str,
+    tuner_id: &str,
+    provider_reference: &str,
+) -> Result<VodPlaybackResult, ApiError> {
+    let result = invoke_plugin_vod_provider_action(
+        db,
+        plugin_id,
+        tuner_id,
+        "ResolvePlayback",
+        serde_json::json!({ "ProviderReference": provider_reference }),
+    )
+    .await?;
 
     if result
         .0
@@ -24826,14 +25079,15 @@ async fn resolve_plugin_vod_playback(
         .unwrap_or(&result.0);
     let mut playback = VodPlaybackResult::deserialize(playback_value)
         .map_err(|_| ApiError::service_unavailable("VOD provider response is invalid"))?;
-    // Same hygiene as opaque live playback: only the signed upstream URL and delivery contract
-    // are needed. Plugin-controlled media-stream objects are scrubbed and dropped so they can
-    // never become a second carrier for URLs or credentials.
+    // The URL remains a `SensitiveUrl`, while track descriptors cross a strict allowlist so Web
+    // can offer the provider's actual audio/subtitle choices. Unknown fields reject the whole
+    // response instead of being silently copied or becoming a covert URL/token carrier.
+    let sanitized_streams = sanitize_plugin_vod_media_streams(&playback.media_streams)?;
     playback
         .media_streams
         .iter_mut()
         .for_each(zeroize_json_value_strings);
-    playback.media_streams.clear();
+    playback.media_streams = sanitized_streams;
     if let Some(expires_at) = playback.expires_at.as_deref() {
         let expires_at = OffsetDateTime::parse(expires_at, &Rfc3339)
             .map_err(|_| ApiError::service_unavailable("VOD provider expiry is invalid"))?;
@@ -24844,6 +25098,130 @@ async fn resolve_plugin_vod_playback(
         }
     }
     Ok(playback)
+}
+
+struct PluginVodSubtitleResolution {
+    source_url: jellyrin_plugin_sdk::SensitiveUrl,
+    format: String,
+    _language: Option<String>,
+    requires_provider_egress: bool,
+}
+
+/// Resolves one external subtitle by the public stream index returned by `ResolvePlayback`.
+/// This is intentionally a separate one-shot grant/action: the plugin may retrieve its runtime
+/// subtitle URL, but neither that URL nor its provider-language selector is persisted in the
+/// catalogue or returned by PlaybackInfo.
+async fn resolve_plugin_vod_subtitle(
+    db: &Database,
+    plugin_id: &str,
+    tuner_id: &str,
+    provider_reference: &str,
+    stream_index: i64,
+) -> Result<PluginVodSubtitleResolution, ApiError> {
+    if !(0..=PLUGIN_VOD_MAX_STREAM_INDEX).contains(&stream_index) {
+        return Err(ApiError::not_found("Subtitle stream not found"));
+    }
+    let result = invoke_plugin_vod_provider_action(
+        db,
+        plugin_id,
+        tuner_id,
+        "ResolveSubtitle",
+        serde_json::json!({
+            "ProviderReference": provider_reference,
+            "SubtitleStreamIndex": stream_index,
+        }),
+    )
+    .await?;
+    if !result
+        .0
+        .get("Status")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|status| status.eq_ignore_ascii_case("Executed"))
+    {
+        return Err(ApiError::not_found("Subtitle stream not found"));
+    }
+    let subtitle = result
+        .0
+        .get("Subtitle")
+        .or_else(|| result.0.get("Result"))
+        .unwrap_or(&result.0)
+        .as_object()
+        .ok_or_else(|| ApiError::service_unavailable("VOD subtitle response is invalid"))?;
+    const ALLOWED_FIELDS: &[&str] = &[
+        "SourceUrl",
+        "Format",
+        "Language",
+        "StreamIndex",
+        "RequiresProviderEgress",
+        "ExpiresAt",
+    ];
+    if subtitle
+        .keys()
+        .any(|field| !ALLOWED_FIELDS.contains(&field.as_str()))
+    {
+        return Err(ApiError::service_unavailable(
+            "VOD provider returned an unsafe subtitle response",
+        ));
+    }
+    if subtitle.get("StreamIndex").and_then(json_value_i64) != Some(stream_index) {
+        return Err(ApiError::service_unavailable(
+            "VOD provider returned a mismatched subtitle stream",
+        ));
+    }
+    let source_url = subtitle
+        .get("SourceUrl")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::service_unavailable("VOD subtitle source is unavailable"))?;
+    // Validate the complete URL shape before wrapping it. DNS, redirect and egress-policy checks
+    // are repeated when the bytes are fetched.
+    validated_remote_media_url(source_url)?;
+    let format = subtitle
+        .get("Format")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .filter(|format| matches!(format.as_str(), "vtt" | "webvtt" | "srt" | "ass" | "ssa"))
+        .ok_or_else(|| ApiError::service_unavailable("VOD subtitle format is invalid"))?;
+    let language = subtitle
+        .get("Language")
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::trim)
+                .filter(|language| {
+                    !language.is_empty()
+                        && language.len() <= 64
+                        && !language.chars().any(char::is_control)
+                })
+                .map(str::to_string)
+                .ok_or_else(|| ApiError::service_unavailable("VOD subtitle language is invalid"))
+        })
+        .transpose()?;
+    let requires_provider_egress = subtitle
+        .get("RequiresProviderEgress")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| {
+            ApiError::service_unavailable("VOD subtitle delivery contract is invalid")
+        })?;
+    if let Some(expires_at) = subtitle.get("ExpiresAt") {
+        let expires_at = expires_at
+            .as_str()
+            .and_then(|expires_at| OffsetDateTime::parse(expires_at, &Rfc3339).ok())
+            .ok_or_else(|| ApiError::service_unavailable("VOD subtitle expiry is invalid"))?;
+        if expires_at <= OffsetDateTime::now_utc() + Duration::seconds(2) {
+            return Err(ApiError::service_unavailable(
+                "VOD subtitle source has expired",
+            ));
+        }
+    }
+    Ok(PluginVodSubtitleResolution {
+        source_url: jellyrin_plugin_sdk::SensitiveUrl::new(source_url.to_string()),
+        format,
+        _language: language,
+        requires_provider_egress,
+    })
 }
 
 fn contains_plaintext_provider_secret(value: &serde_json::Value) -> bool {
@@ -36536,6 +36914,25 @@ async fn playback_info_response(
         let resolved = ensure_xtream_remote_media_info(state, item, metadata).await?;
         item = resolved.item;
     }
+    if is_plugin_vod_virtual_item(&item) {
+        let reference = metadata
+            .as_ref()
+            .and_then(plugin_vod_remote_reference)
+            .ok_or_else(|| {
+                ApiError::service_unavailable("VOD provider playback route is unavailable")
+            })?;
+        // Resolve once per PlaybackInfo request. The signed URL remains inside `playback` and is
+        // dropped without ever entering the JSON response; only the validated delivery evidence
+        // and safe track descriptors are applied to this ephemeral MediaItem clone.
+        let playback = resolve_plugin_vod_playback(
+            &state.db,
+            &reference.plugin_id,
+            &reference.tuner_id,
+            &reference.provider_reference,
+        )
+        .await?;
+        apply_plugin_vod_playback_descriptor(&mut item, &playback)?;
+    }
     let metadata = metadata.as_ref();
     normalize_completed_remote_resume_position(&item, metadata, &mut options);
     apply_android_remote_subtitle_hls_policy(&item, metadata, &token.client, &mut options);
@@ -36559,7 +36956,7 @@ async fn playback_info_response(
         audio_mode = ?decision.audio,
         reasons = ?decision.reasons,
         media_type = %item.media_type,
-        remote = is_xtream_remote_media(metadata),
+        remote = is_xtream_remote_media(metadata) || is_plugin_vod_remote_media(metadata),
         video_codec = media_item_stream_codec(&item, "Video").as_deref(),
         audio_codec = options
             .audio_stream_index
@@ -36634,6 +37031,7 @@ async fn playback_info_response(
                 &token.access_token,
                 &item.id.simple().to_string(),
                 &play_session_id,
+                is_plugin_vod_remote_media(metadata),
             );
         }
     }
@@ -37225,6 +37623,7 @@ fn apply_direct_external_text_subtitle_contract(
     access_token: &str,
     item_id: &str,
     play_session_id: &str,
+    preserve_external_flag: bool,
 ) {
     let Some(streams) = media_source
         .get_mut("MediaStreams")
@@ -37253,7 +37652,10 @@ fn apply_direct_external_text_subtitle_contract(
         stream.insert("Codec".to_string(), serde_json::json!("webvtt"));
         stream.insert("IsTextSubtitleStream".to_string(), serde_json::json!(true));
         stream.insert("DeliveryMethod".to_string(), serde_json::json!("External"));
-        stream.insert("IsExternal".to_string(), serde_json::json!(false));
+        stream.insert(
+            "IsExternal".to_string(),
+            serde_json::json!(preserve_external_flag),
+        );
         stream.insert(
             "SupportsExternalStream".to_string(),
             serde_json::json!(true),
@@ -40132,7 +40534,29 @@ fn playback_delivery_decision_with_ffmpeg_mode(
     options: &PlaybackInfoOptions,
     ffmpeg_mode: FfmpegMode,
 ) -> TranscodeDecision {
-    let is_remote = is_xtream_remote_media(metadata);
+    let plugin_vod_remote = is_plugin_vod_remote_media(metadata);
+    let is_remote = is_xtream_remote_media(metadata) || plugin_vod_remote;
+    // A plugin-VOD source is an opaque, short-lived URL which may only enter the sensitive byte
+    // proxy. It cannot be handed to a local/direct-file path or an unprepared FFmpeg pipeline.
+    // The provider has already constrained the container to MPEG-TS; advertise that exact proxy
+    // whenever the client permits direct delivery, otherwise fail closed.
+    if plugin_vod_remote {
+        return TranscodeDecision {
+            delivery: if options.enable_direct_stream {
+                DeliveryMode::DirectProxy
+            } else {
+                DeliveryMode::Unsupported
+            },
+            video: if item.media_type == "Video" {
+                HlsStreamMode::Copy
+            } else {
+                HlsStreamMode::Drop
+            },
+            audio: HlsStreamMode::Copy,
+            reasons: Vec::new(),
+            output: PlaybackOutputConstraints::default(),
+        };
+    }
     let selected_audio_needs_transcode = selected_audio_stream_needs_transcode(item, options);
     let selected_subtitle_requires_processing = options
         .subtitle_stream_index
@@ -43634,6 +44058,125 @@ async fn subtitle_stream_with_ticks(
     .await
 }
 
+async fn plugin_vod_subtitle_output(
+    state: &AppState,
+    item: &MediaItem,
+    index: i64,
+    format: &str,
+    start_position_ticks: i64,
+    end_position_ticks: Option<i64>,
+) -> Result<Option<Vec<u8>>, ApiError> {
+    if !is_plugin_vod_virtual_item(item) {
+        return Ok(None);
+    }
+    let metadata_by_item = media_metadata_by_item_id(&state.db, HashSet::from([item.id])).await?;
+    let reference = metadata_by_item
+        .get(&item.id)
+        .and_then(plugin_vod_remote_reference)
+        .ok_or_else(|| {
+            ApiError::service_unavailable("VOD provider subtitle route is unavailable")
+        })?;
+    let subtitle = resolve_plugin_vod_subtitle(
+        &state.db,
+        &reference.plugin_id,
+        &reference.tuner_id,
+        &reference.provider_reference,
+        index,
+    )
+    .await?;
+    let configured_proxy = if subtitle.requires_provider_egress {
+        Some(
+            std::env::var("JELLYRIN_PROVIDER_EGRESS_PROXY").map_err(|_| {
+                ApiError::service_unavailable("VOD provider egress proxy is not configured")
+            })?,
+        )
+    } else {
+        None
+    };
+    let response = send_sensitive_remote_live_request_with_proxy(
+        subtitle.source_url.expose_secret(),
+        subtitle.requires_provider_egress,
+        configured_proxy.as_deref(),
+        LIVE_TV_REMOTE_CONTROL_TIMEOUT,
+    )
+    .await?;
+    if response.status() != reqwest::StatusCode::OK {
+        return Err(ApiError::service_unavailable(
+            "VOD subtitle source is unavailable",
+        ));
+    }
+    let bytes = tokio::time::timeout(
+        StdDuration::from_secs(30),
+        read_bounded_live_tv_remote_body(response, SUBTITLE_UPLOAD_LIMIT_BYTES),
+    )
+    .await
+    .map_err(|_| ApiError::service_unavailable("VOD subtitle source timed out"))?
+    .map_err(|_| ApiError::service_unavailable("VOD subtitle source is invalid"))?;
+    if bytes.is_empty() {
+        return Err(ApiError::not_found("Subtitle stream not found"));
+    }
+
+    let source_format = if subtitle.format == "webvtt" {
+        "vtt"
+    } else {
+        subtitle.format.as_str()
+    };
+    if source_format == "srt" && format == "vtt" {
+        let output = subtitle_srt_to_vtt(&bytes)?;
+        return Ok(Some(if let Some(end_position_ticks) = end_position_ticks {
+            subtitle_vtt_cues_starting_in_window(output, start_position_ticks, end_position_ticks)
+        } else {
+            output
+        }));
+    }
+    if source_format == format && start_position_ticks == 0 && end_position_ticks.is_none() {
+        return Ok(Some(bytes));
+    }
+
+    // The signed URL is never passed as an FFmpeg argument (which could surface in process lists
+    // or diagnostics). Download a bounded payload through the trusted egress proxy, convert from
+    // a short-lived private temp file, then let TempDir remove it immediately.
+    let temp = tempfile::tempdir()
+        .map_err(|_| ApiError::service_unavailable("VOD subtitle conversion is unavailable"))?;
+    let source_path = temp.path().join(format!("subtitle.{source_format}"));
+    tokio::fs::write(&source_path, bytes)
+        .await
+        .map_err(|_| ApiError::service_unavailable("VOD subtitle conversion is unavailable"))?;
+    let output = subtitle_output_from_external_path(
+        source_path.to_string_lossy().as_ref(),
+        format,
+        start_position_ticks,
+        end_position_ticks,
+    )
+    .await?;
+    Ok(Some(output))
+}
+
+fn subtitle_srt_to_vtt(bytes: &[u8]) -> Result<Vec<u8>, ApiError> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| ApiError::service_unavailable("VOD subtitle text is invalid"))?;
+    let normalized = text
+        .strip_prefix('\u{feff}')
+        .unwrap_or(text)
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    let mut output = String::from("WEBVTT\n\n");
+    for line in normalized.lines() {
+        if let Some((start, end)) = line.split_once("-->") {
+            output.push_str(&start.trim().replace(',', "."));
+            output.push_str(" --> ");
+            output.push_str(&end.trim().replace(',', "."));
+        } else {
+            output.push_str(line);
+        }
+        output.push('\n');
+    }
+    if !output.ends_with("\n\n") {
+        output.push('\n');
+    }
+    Ok(output.into_bytes())
+}
+
 pub(crate) async fn subtitle_stream_response(
     state: &AppState,
     _headers: &HeaderMap,
@@ -43669,7 +44212,20 @@ pub(crate) async fn subtitle_stream_response(
     let extraction_end_position_ticks = end_position_ticks;
 
     let item = subtitle_media_item(state, item_id, Some(media_source_id)).await?;
-    let stream = subtitle_stream_info(&item, index)?;
+    let plugin_vod_output = plugin_vod_subtitle_output(
+        state,
+        &item,
+        index,
+        extraction_format,
+        start_position_ticks,
+        extraction_end_position_ticks,
+    )
+    .await?;
+    let stream = if plugin_vod_output.is_none() {
+        Some(subtitle_stream_info(&item, index)?)
+    } else {
+        None
+    };
     let output = if requested_format == "vtt"
         && let Some(output) =
             subtitle_output_from_transcode_vtt_segment(state, &query, index, start_position_ticks)
@@ -43681,7 +44237,13 @@ pub(crate) async fn subtitle_stream_response(
             subtitle_output_from_transcode_vtt_segments(state, &query, index).await?
     {
         output
-    } else if let Some(path) = stream.get("Path").and_then(serde_json::Value::as_str) {
+    } else if let Some(output) = plugin_vod_output {
+        output
+    } else if let Some(path) = stream
+        .as_ref()
+        .and_then(|stream| stream.get("Path"))
+        .and_then(serde_json::Value::as_str)
+    {
         subtitle_output_from_external_path(
             path,
             extraction_format,
@@ -53042,7 +53604,7 @@ fn media_item_to_json_with_playback_and_metadata(
         "Bitrate": item.bitrate,
     });
     let mut media_source = media_source;
-    if is_xtream_remote_media(metadata)
+    if (is_xtream_remote_media(metadata) || is_plugin_vod_remote_media(metadata))
         && let Some(object) = media_source.as_object_mut()
     {
         object.insert("Protocol".to_string(), serde_json::json!("Http"));
@@ -53122,7 +53684,7 @@ fn media_item_to_json_with_playback_and_metadata(
         "LocationType": "FileSystem",
         "MediaSources": [media_source],
     });
-    if is_xtream_remote_media(metadata)
+    if (is_xtream_remote_media(metadata) || is_plugin_vod_remote_media(metadata))
         && let Some(object) = value.as_object_mut()
     {
         object.insert("LocationType".to_string(), serde_json::json!("Remote"));
@@ -61450,6 +62012,68 @@ mod tests {
         assert!(!super::is_plugin_vod_remote_media(None));
     }
 
+    #[test]
+    fn plugin_vod_media_stream_allowlist_preserves_tracks_and_rejects_secret_carriers() {
+        let streams = vec![
+            json!({
+                "Index": 0,
+                "Type": "Video",
+                "Codec": "h264",
+                "DisplayTitle": "1080p H264",
+                "IsDefault": true,
+                "IsExternal": false,
+                "MagstvVariantContentId": "variant-1"
+            }),
+            json!({
+                "Index": 1,
+                "Type": "Audio",
+                "Codec": "aac",
+                "Language": "spa",
+                "DisplayTitle": "Español",
+                "IsDefault": true,
+                "IsExternal": false,
+                "MagstvVariantContentId": "variant-1"
+            }),
+            json!({
+                "Index": 2,
+                "Type": "Subtitle",
+                "Codec": "srt",
+                "Language": "spa",
+                "Title": "Español",
+                "DisplayTitle": "Español",
+                "IsDefault": false,
+                "IsExternal": true,
+                "IsTextSubtitleStream": true,
+                "SupportsExternalStream": true,
+                "MagstvSubtitleLanguage": "spa"
+            }),
+        ];
+        let sanitized = super::sanitize_plugin_vod_media_streams(&streams).unwrap();
+        assert_eq!(sanitized.len(), 3);
+        assert_eq!(sanitized[1]["Language"], "spa");
+        assert_eq!(sanitized[2]["Title"], "Español");
+        assert_eq!(sanitized[2]["IsExternal"], true);
+        assert!(sanitized[0].get("MagstvVariantContentId").is_none());
+
+        for forbidden in [
+            json!({"Index": 0, "Type": "Video", "Codec": "h264", "Url": "https://provider.invalid/video.ts?token=secret"}),
+            json!({"Index": 0, "Type": "Video", "Codec": "h264", "Token": "secret"}),
+            json!({"Index": 0, "Type": "Video", "Codec": "h264", "LicenseList": ["secret"]}),
+            json!({"Index": 0, "Type": "Video", "Codec": "h264", "RequiredHttpHeaders": {"Authorization": "secret"}}),
+        ] {
+            let error = super::sanitize_plugin_vod_media_streams(&[forbidden])
+                .expect_err("secret carrier must fail closed");
+            assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+        assert!(
+            super::sanitize_plugin_vod_media_streams(&[
+                json!({"Index": 0, "Type": "Video", "Codec": "h264"}),
+                json!({"Index": 0, "Type": "Audio", "Codec": "aac"}),
+            ])
+            .is_err()
+        );
+    }
+
     #[cfg(unix)]
     async fn start_fixed_ts_upstream(
         payload: Vec<u8>,
@@ -61656,17 +62280,21 @@ mod tests {
             .await
             .unwrap();
 
-        // The resolver itself scrubs plugin-controlled media streams and never opens the
-        // upstream on its own.
+        // The resolver keeps only allowlisted track descriptors and never opens the upstream on
+        // its own. Provider URLs and credentials have no field through which to cross.
         let playback =
             super::resolve_plugin_vod_playback(&db, plugin_id, "vod-tuner", "provider:v1:movie-1")
                 .await
                 .unwrap();
         assert_eq!(playback.source_url.expose_secret(), signed_url);
-        assert!(
-            playback.media_streams.is_empty(),
-            "plugin media streams must be scrubbed and dropped"
-        );
+        assert_eq!(playback.media_streams.len(), 4);
+        assert_eq!(playback.media_streams[1]["Language"], "spa");
+        assert_eq!(playback.media_streams[2]["Language"], "eng");
+        assert_eq!(playback.media_streams[3]["MagstvSubtitleLanguage"], "spa");
+        let serialized_streams = serde_json::to_string(&playback.media_streams).unwrap();
+        assert!(!serialized_streams.contains("http"));
+        assert!(!serialized_streams.contains("token"));
+        assert!(!serialized_streams.contains("license"));
         assert!(super::opaque_live_tv_delivery_is_safe_for_direct_proxy(
             &playback
         ));
@@ -61730,6 +62358,243 @@ mod tests {
         assert_eq!(
             resolve["Payload"]["Arguments"]["SecretGrant"]["TunerId"],
             "vod-tuner"
+        );
+        super::stop_external_plugin_host(plugin_id).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial(plugin_host)]
+    async fn plugin_vod_web_playback_info_and_subtitle_proxy_work_for_movie_and_episode() {
+        use std::sync::atomic::Ordering;
+
+        let plugin_id = "66666666-7777-4888-9999-000000000011";
+        let ts_payload = vec![0x47_u8; 188 * 4];
+        let (upstream_base, upstream_connections) =
+            start_fixed_ts_upstream(ts_payload.clone()).await;
+        let srt_payload = b"1\n00:00:01,000 --> 00:00:03,000\nHola desde MAGSTV\n\n".to_vec();
+        let (subtitle_base, subtitle_connections) =
+            start_fixed_ts_upstream(srt_payload.clone()).await;
+        let (db, tmp, api_key, movie_id) = prepare_vod_playback_environment(plugin_id).await;
+        let episode_id = db
+            .media_items()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|item| item.name == "Pilot")
+            .expect("fixture episode was not published")
+            .id;
+        let signed_url = format!("{upstream_base}/vod/item.ts?signature=signed-vod-secret");
+        let signed_subtitle_url =
+            format!("{subtitle_base}/vod/subtitle.srt?signature=signed-subtitle-secret");
+        tokio::fs::write(tmp.path().join("vod-source-url"), &signed_url)
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("vod-subtitle-url"), &signed_subtitle_url)
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("vod-delivery-mode"), "mpegts")
+            .await
+            .unwrap();
+
+        let app = router(AppState {
+            db: db.clone(),
+            web_dir: ".".into(),
+            log_dir: tmp.path().join("logs"),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+        let web_profile = json!({
+            "EnableDirectPlay": true,
+            "EnableDirectStream": true,
+            "EnableTranscoding": true,
+            "AudioStreamIndex": 2,
+            "SubtitleStreamIndex": 3,
+            "DeviceProfile": {
+                "SubtitleProfiles": [{ "Format": "vtt", "Method": "External" }]
+            }
+        });
+        for item_id in [movie_id, episode_id] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(format!("/Items/{}/PlaybackInfo", item_id.simple()))
+                        .header("X-Emby-Token", &api_key)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(web_profile.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let body_text = String::from_utf8_lossy(&body);
+            for secret in [
+                "signed-vod-secret",
+                "signed-subtitle-secret",
+                "vod-user",
+                "vod-pass",
+                "vod-canary-token-0123456789",
+            ] {
+                assert!(!body_text.contains(secret), "{body_text}");
+            }
+            let playback: Value = serde_json::from_slice(&body).unwrap();
+            let source = &playback["MediaSources"][0];
+            assert_eq!(source["Protocol"], "Http");
+            assert_eq!(source["Container"], "ts");
+            assert_eq!(source["IsRemote"], true);
+            assert_eq!(source["LocationType"], "Remote");
+            assert_eq!(source["SupportsDirectPlay"], false);
+            assert_eq!(source["SupportsDirectStream"], true);
+            assert_eq!(source["SupportsTranscoding"], false);
+            assert_eq!(source["DefaultAudioStreamIndex"], 2);
+            assert_eq!(source["DefaultSubtitleStreamIndex"], 3);
+            let direct_url = source["DirectStreamUrl"].as_str().unwrap();
+            assert!(direct_url.contains(&format!("/Videos/{}/stream.ts?", item_id.simple())));
+            assert!(!direct_url.contains("/stream.?"));
+            assert!(source["Path"].as_str().unwrap().ends_with("/stream.ts"));
+            let streams = source["MediaStreams"].as_array().unwrap();
+            assert_eq!(streams[1]["Language"], "spa");
+            assert_eq!(streams[2]["Language"], "eng");
+            assert_eq!(streams[3]["Language"], "spa");
+            assert_eq!(streams[3]["Title"], "Español");
+            assert_eq!(streams[3]["Codec"], "webvtt");
+            assert_eq!(streams[3]["IsExternal"], true);
+            assert_eq!(streams[3]["SupportsExternalStream"], true);
+            assert_eq!(streams[3]["DeliveryMethod"], "External");
+            assert!(
+                streams[3]["DeliveryUrl"]
+                    .as_str()
+                    .is_some_and(|url| url.contains("/Subtitles/3/Stream.vtt?"))
+            );
+        }
+        assert_eq!(
+            upstream_connections.load(Ordering::SeqCst),
+            0,
+            "PlaybackInfo must not open or expose the signed media URL"
+        );
+
+        // The same opaque item route works for an episode and returns actual TS bytes.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Videos/{}/stream.ts", episode_id.simple()))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(bytes.as_ref(), ts_payload.as_slice());
+
+        let subtitle_route = format!(
+            "/Videos/{0}/{0}/Subtitles/3/Stream.srt?api_key={1}",
+            movie_id.simple(),
+            api_key
+        );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&subtitle_route)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(bytes.as_ref(), srt_payload.as_slice());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(subtitle_route.replace("Stream.srt", "Stream.vtt"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let vtt = String::from_utf8_lossy(&bytes);
+        assert!(vtt.starts_with("WEBVTT"), "{vtt}");
+        assert!(vtt.contains("Hola desde MAGSTV"), "{vtt}");
+        assert!(!vtt.contains("signed-subtitle-secret"));
+        assert_eq!(upstream_connections.load(Ordering::SeqCst), 1);
+        assert_eq!(subtitle_connections.load(Ordering::SeqCst), 2);
+
+        let invokes = tokio::fs::read_to_string(tmp.path().join("external-invokes"))
+            .await
+            .unwrap();
+        let subtitle_invokes = invokes
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|line| line["Payload"]["Arguments"]["Action"] == "ResolveSubtitle")
+            .collect::<Vec<_>>();
+        assert_eq!(subtitle_invokes.len(), 2);
+        assert!(subtitle_invokes.iter().all(|invoke| {
+            invoke["Payload"]["Arguments"]["Arguments"]["ProviderReference"]
+                == "provider:v1:movie-1"
+                && invoke["Payload"]["Arguments"]["Arguments"]["SubtitleStreamIndex"] == 3
+                && invoke["Payload"]["Arguments"]["SecretGrant"]["Action"] == "ResolveSubtitle"
+        }));
+        assert!(!invokes.contains("signed-subtitle-secret"));
+        super::stop_external_plugin_host(plugin_id).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial(plugin_host)]
+    async fn plugin_vod_subtitle_proxy_rejects_malicious_provider_response() {
+        use std::sync::atomic::Ordering;
+
+        let plugin_id = "66666666-7777-4888-9999-000000000012";
+        let (subtitle_base, subtitle_connections) =
+            start_fixed_ts_upstream(b"malicious body must never be fetched".to_vec()).await;
+        let (db, tmp, api_key, movie_id) = prepare_vod_playback_environment(plugin_id).await;
+        tokio::fs::write(
+            tmp.path().join("vod-subtitle-url"),
+            format!("{subtitle_base}/subtitle.srt?signature=signed-subtitle-secret"),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(tmp.path().join("vod-delivery-mode"), "malicious-subtitle")
+            .await
+            .unwrap();
+
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: tmp.path().join("logs"),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Videos/{0}/{0}/Subtitles/3/Stream.vtt?api_key={1}",
+                        movie_id.simple(),
+                        api_key
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&body);
+        assert!(!body.contains("malicious-subtitle-secret"));
+        assert!(!body.contains("signed-subtitle-secret"));
+        assert_eq!(
+            subtitle_connections.load(Ordering::SeqCst),
+            0,
+            "unsafe subtitle metadata must be rejected before opening its URL"
         );
         super::stop_external_plugin_host(plugin_id).await;
     }
@@ -65045,6 +65910,22 @@ while IFS= read -r line; do
     InvokeCapability)
       printf '%s\n' "$line" >> '__INVOKE_FILE__'
       case "$line" in
+        *'"Action":"ResolveSubtitle"'*)
+          case "$line" in
+            *'"ProviderReference":"provider:v1:movie-1"'*'"SubtitleStreamIndex":3'*|*'"ProviderReference":"provider:v1:episode-1"'*'"SubtitleStreamIndex":3'*)
+              subtitle_url="$(cat '__SUBTITLE_URL_FILE__')"
+              mode="$(cat '__MODE_FILE__')"
+              if [ "$mode" = "malicious-subtitle" ]; then
+                printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"Status":"Executed","Subtitle":{"SourceUrl":"%s","Format":"srt","Language":"spa","StreamIndex":3,"RequiresProviderEgress":false,"Token":"malicious-subtitle-secret"}}}}\n' "$corr" "$subtitle_url"
+              else
+                printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"Status":"Executed","Subtitle":{"SourceUrl":"%s","Format":"srt","Language":"spa","StreamIndex":3,"RequiresProviderEgress":false,"ExpiresAt":"2099-01-01T00:00:00Z"}}}}\n' "$corr" "$subtitle_url"
+              fi
+              ;;
+            *)
+              printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"Status":"Failed","Error":"unknown subtitle stream"}}}\n' "$corr"
+              ;;
+          esac
+          ;;
         *'"Action":"ResolvePlayback"'*)
           case "$line" in
             *'"ProviderReference":"provider:v1:movie-1"'*|*'"ProviderReference":"provider:v1:episode-1"'*)
@@ -65053,7 +65934,7 @@ while IFS= read -r line; do
               if [ "$mode" = "hls" ]; then
                 printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"Playback":{"SourceUrl":"%s","Delivery":{"Container":"hls","Preferred":"HlsRemux","RequiresProviderEgress":false},"MediaStreams":[{"Type":"Video","Url":"%s/stream-canary","Token":"vod-canary-token-0123456789"}]}}}}\n' "$corr" "$source_url" "$source_url"
               else
-                printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"Playback":{"SourceUrl":"%s","ExpiresAt":"2099-01-01T00:00:00Z","Delivery":{"Container":"mpegts","Preferred":"DirectProxy","RequiresProviderEgress":false},"MediaStreams":[{"Type":"Video","Url":"%s/stream-canary","Token":"vod-canary-token-0123456789"}]}}}}\n' "$corr" "$source_url" "$source_url"
+                printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"Playback":{"SourceUrl":"%s","ExpiresAt":"2099-01-01T00:00:00Z","Delivery":{"Container":"mpegts","Preferred":"DirectProxy","RequiresProviderEgress":false},"MediaStreams":[{"Index":0,"Type":"Video","Codec":"h264","DisplayTitle":"1080p H264","IsDefault":true,"IsForced":false,"IsExternal":false,"MagstvVariantContentId":"movie-variant-1"},{"Index":1,"Type":"Audio","Codec":"aac","Language":"spa","DisplayTitle":"Español","IsDefault":true,"IsForced":false,"IsExternal":false,"MagstvVariantContentId":"movie-variant-1"},{"Index":2,"Type":"Audio","Codec":"aac","Language":"eng","DisplayTitle":"English","IsDefault":false,"IsForced":false,"IsExternal":false,"MagstvVariantContentId":"movie-variant-1"},{"Index":3,"Type":"Subtitle","Codec":"srt","Language":"spa","Title":"Español","DisplayTitle":"Español","IsDefault":false,"IsForced":false,"IsExternal":true,"IsTextSubtitleStream":true,"SupportsExternalStream":true,"MagstvSubtitleLanguage":"spa"}]}}}}\n' "$corr" "$source_url"
               fi
               ;;
             *)
@@ -65107,6 +65988,10 @@ done
         .replace(
             "__MODE_FILE__",
             &root.join("vod-delivery-mode").to_string_lossy(),
+        )
+        .replace(
+            "__SUBTITLE_URL_FILE__",
+            &root.join("vod-subtitle-url").to_string_lossy(),
         );
         tokio::fs::write(&path, script).await.unwrap();
         let mut permissions = tokio::fs::metadata(&path).await.unwrap().permissions();
@@ -101800,6 +102685,7 @@ done
             "secret-token",
             "episode-id",
             "play-session",
+            false,
         );
         let subtitle = &media_source["MediaStreams"][2];
         assert_eq!(subtitle["Codec"], "webvtt");
