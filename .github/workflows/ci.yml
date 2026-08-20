@@ -51,6 +51,10 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@35d8a35b823d6c20db516f5c35eb0a9640942c17 # 1.94.0
+      - name: Install FFmpeg test dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends ffmpeg
       - run: cargo test --locked --workspace --all-targets --all-features
       - name: Verify counts-only runtime hygiene gate
         run: node qa/runtime-hygiene-smoke.js

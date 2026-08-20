@@ -60740,8 +60740,10 @@ mod tests {
                 .is_err()
         );
 
-        let mut item_limited = super::VodPluginCatalogPages::default();
-        item_limited.media_item_count = super::VOD_LIBRARY_PROVIDER_CATALOG_MAX_ITEMS;
+        let mut item_limited = super::VodPluginCatalogPages {
+            media_item_count: super::VOD_LIBRARY_PROVIDER_CATALOG_MAX_ITEMS,
+            ..Default::default()
+        };
         assert!(
             item_limited
                 .push(json!({ "MediaItems": [{ "ItemType": "Movie" }] }))
@@ -61413,21 +61415,30 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let folders = db.virtual_folders().await.unwrap();
-        let movies = folders
-            .iter()
-            .find(|folder| folder.name == "VOD Provider Movies")
-            .expect("VOD movies library was not published");
-        let items = db
-            .media_items_for_virtual_folders(&[movies.id])
-            .await
-            .unwrap();
-        let movie = items
-            .iter()
-            .find(|item| item.name == "Movie One")
-            .expect("imported plugin-VOD movie is missing");
-        assert!(movie.path.starts_with("plugin-vod://"));
-        (db, tmp, api_key, movie.id)
+        // Tuner provisioning deliberately returns before the chained VOD import. Wait for the
+        // atomic publication instead of racing its background task when the full suite is busy.
+        let movie_id = tokio::time::timeout(StdDuration::from_secs(5), async {
+            loop {
+                let folders = db.virtual_folders().await.unwrap();
+                if let Some(movies) = folders
+                    .iter()
+                    .find(|folder| folder.name == "VOD Provider Movies")
+                {
+                    let items = db
+                        .media_items_for_virtual_folders(&[movies.id])
+                        .await
+                        .unwrap();
+                    if let Some(movie) = items.iter().find(|item| item.name == "Movie One") {
+                        assert!(movie.path.starts_with("plugin-vod://"));
+                        break movie.id;
+                    }
+                }
+                tokio::time::sleep(StdDuration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("VOD movies library and fixture item were not published");
+        (db, tmp, api_key, movie_id)
     }
 
     #[cfg(unix)]
