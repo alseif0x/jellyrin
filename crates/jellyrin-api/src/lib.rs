@@ -162,7 +162,7 @@ use jellyrin_plugin_rpc::{
     CapabilityResult, EmbeddedImageRequest, HandshakeRequest, HandshakeResponse,
     InvokeCapabilityRequest, LoadPluginRequest, LoadedPlugin, PLUGIN_RPC_PROTOCOL_VERSION,
     PluginHealth, PluginHealthStatus, PluginHostStdioClient, PluginIdentity, PluginRpcEnvelope,
-    PluginRpcMethod, PluginRuntime, PluginWebPage, UpdateConfigurationRequest,
+    PluginRpcErrorCode, PluginRpcMethod, PluginRuntime, PluginWebPage, UpdateConfigurationRequest,
 };
 use jellyrin_plugin_sdk::{
     CAPABILITY_LIVE_TV_PROVIDER, CAPABILITY_VOD_LIBRARY_PROVIDER, LiveTvDeliveryCapabilities,
@@ -11967,9 +11967,7 @@ async fn invoke_plugin_capability_via_runtime_host_path_with_timeout(
                 .await
         };
         let mut result = match response {
-            Ok(response) if contains_secret_grant => rpc_result(response).map_err(|_| {
-                ApiError::internal("ExternalProcess provider-secret invocation failed")
-            }),
+            Ok(response) if contains_secret_grant => provider_secret_rpc_result(response),
             Ok(response) => rpc_result(response),
             Err(error) if !contains_secret_grant => {
                 host_lease.shutdown().await;
@@ -13641,11 +13639,70 @@ fn rpc_result<T>(
     // credentials, or other provider secrets. Only surface the typed, bounded error code.
     let code = response
         .error
-        .map(|error| serde_json::to_string(&error.code).unwrap_or_else(|_| "Unknown".to_string()))
-        .unwrap_or_else(|| "Unknown".to_string());
+        .as_ref()
+        .map(|error| plugin_rpc_error_code_label(&error.code))
+        .unwrap_or("Unknown");
     Err(ApiError::internal(format!(
         "Plugin runtime request failed ({code})"
     )))
+}
+
+fn plugin_rpc_error_code_label(code: &PluginRpcErrorCode) -> &'static str {
+    match code {
+        PluginRpcErrorCode::InvalidRequest => "InvalidRequest",
+        PluginRpcErrorCode::ProtocolVersionMismatch => "ProtocolVersionMismatch",
+        PluginRpcErrorCode::UnsupportedMethod => "UnsupportedMethod",
+        PluginRpcErrorCode::PluginNotFound => "PluginNotFound",
+        PluginRpcErrorCode::PluginNotLoaded => "PluginNotLoaded",
+        PluginRpcErrorCode::CapabilityNotFound => "CapabilityNotFound",
+        PluginRpcErrorCode::PermissionDenied => "PermissionDenied",
+        PluginRpcErrorCode::Timeout => "Timeout",
+        PluginRpcErrorCode::HostUnavailable => "HostUnavailable",
+        PluginRpcErrorCode::HostFailed => "HostFailed",
+    }
+}
+
+fn provider_secret_rpc_result<T>(
+    response: jellyrin_plugin_rpc::PluginRpcResponse<T>,
+) -> Result<Option<T>, ApiError> {
+    let code = response
+        .error
+        .as_ref()
+        .map(|error| plugin_rpc_error_code_label(&error.code))
+        .unwrap_or("Unknown");
+    rpc_result(response).map_err(|_| {
+        ApiError::internal(format!(
+            "ExternalProcess provider-secret invocation failed ({code})"
+        ))
+    })
+}
+
+fn bounded_plugin_runtime_error_code(error: &ApiError) -> &'static str {
+    let message = error.error.to_string();
+    let code = [
+        "Plugin runtime request failed (",
+        "ExternalProcess provider-secret invocation failed (",
+    ]
+    .iter()
+    .find_map(|prefix| {
+        message
+            .strip_prefix(prefix)
+            .and_then(|value| value.strip_suffix(')'))
+    })
+    .map(|value| value.trim_matches('"'));
+    match code {
+        Some("InvalidRequest") => "InvalidRequest",
+        Some("ProtocolVersionMismatch") => "ProtocolVersionMismatch",
+        Some("UnsupportedMethod") => "UnsupportedMethod",
+        Some("PluginNotFound") => "PluginNotFound",
+        Some("PluginNotLoaded") => "PluginNotLoaded",
+        Some("CapabilityNotFound") => "CapabilityNotFound",
+        Some("PermissionDenied") => "PermissionDenied",
+        Some("Timeout") => "Timeout",
+        Some("HostUnavailable") => "HostUnavailable",
+        Some("HostFailed") => "HostFailed",
+        _ => "RuntimeFailure",
+    }
 }
 
 fn rust_wasi_host_binary_path() -> Option<PathBuf> {
@@ -24809,11 +24866,7 @@ async fn resolve_opaque_live_tv_playback(
     )
     .await
     .map_err(|error| {
-        let message = error.error.to_string();
-        let provider_error_code = message
-            .strip_prefix("Plugin runtime request failed (")
-            .and_then(|value| value.strip_suffix(')'))
-            .unwrap_or("RuntimeFailure");
+        let provider_error_code = bounded_plugin_runtime_error_code(&error);
         tracing::warn!(
             provider_error_code,
             "Live TV plugin playback resolution failed"
@@ -62160,6 +62213,41 @@ mod tests {
                 "JELLYRIN_MAGSTV_SIGN_O3_SECRET_HEX".to_string(),
                 "MAGSTV_DEVICE_TOKEN".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn provider_secret_rpc_failure_retains_only_the_allowlisted_code() {
+        let message_canary = "signed-url-or-password-canary";
+        let detail_canary = "provider-response-detail-canary";
+        let mut rpc_error = jellyrin_plugin_rpc::PluginRpcError::new(
+            jellyrin_plugin_rpc::PluginRpcErrorCode::HostFailed,
+            message_canary,
+        );
+        rpc_error.details.push(detail_canary.to_string());
+        let response = jellyrin_plugin_rpc::PluginRpcResponse::<serde_json::Value>::failure(
+            "provider-secret-code-test",
+            rpc_error,
+        );
+
+        let error = super::provider_secret_rpc_result(response)
+            .expect_err("a failed provider response must remain an error");
+        let rendered = error.error.to_string();
+        assert_eq!(
+            rendered,
+            "ExternalProcess provider-secret invocation failed (HostFailed)"
+        );
+        assert!(!rendered.contains(message_canary));
+        assert!(!rendered.contains(detail_canary));
+        assert_eq!(
+            super::bounded_plugin_runtime_error_code(&error),
+            "HostFailed"
+        );
+        assert_eq!(
+            super::bounded_plugin_runtime_error_code(&ApiError::internal(
+                "untrusted runtime text HostFailed"
+            )),
+            "RuntimeFailure"
         );
     }
 
