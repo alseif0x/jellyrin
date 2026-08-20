@@ -2477,7 +2477,9 @@ mod tests {
                     )
                     .fetch_one(&target)
                     .await?,
-                    (2, 2, 4)
+                    // Stable facet IDs live on `media_item_facets`; the alias projection keeps
+                    // only the imported person's UUID in its canonical and compact forms.
+                    (2, 2, 2)
                 );
                 assert_eq!(
                     sqlx::query_scalar::<_, String>(
@@ -2493,6 +2495,16 @@ mod tests {
                         "SELECT COUNT(*) FROM media_item_facet_aliases \
                          WHERE facet_kind = 'person' AND entity_id = \
                          'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'",
+                    )
+                    .fetch_one(&target)
+                    .await?,
+                    1
+                );
+                assert_eq!(
+                    sqlx::query_scalar::<_, i64>(
+                        "SELECT COUNT(*) FROM media_item_facet_aliases \
+                         WHERE facet_kind = 'person' AND entity_id = \
+                         'aaaaaaaabbbbccccddddeeeeeeeeeeee'",
                     )
                     .fetch_one(&target)
                     .await?,
