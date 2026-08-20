@@ -257,6 +257,7 @@ const LIVE_TV_CHANNELS_DEFAULT_LIMIT: usize = 100;
 const LIVE_TV_CHANNELS_MAX_LIMIT: usize = 500;
 /// One catalogue refresh has one wall-clock budget, shared by every provider page.
 const LIVE_TV_PROVIDER_CATALOG_TIMEOUT: StdDuration = StdDuration::from_secs(120);
+const VOD_LIBRARY_PROVIDER_CATALOG_TIMEOUT: StdDuration = StdDuration::from_secs(30 * 60);
 /// Bound a faulty provider even when every individual RPC response fits below 1 MiB.
 const LIVE_TV_PROVIDER_CATALOG_MAX_PAGES: usize = 256;
 /// Bound the aggregate JSON retained across a paginated catalogue import. The RPC framing limit
@@ -21351,7 +21352,7 @@ async fn vod_library_plugin_media_import(
         runtime_name,
         error_prefix,
         host_path,
-        LIVE_TV_PROVIDER_CATALOG_TIMEOUT,
+        VOD_LIBRARY_PROVIDER_CATALOG_TIMEOUT,
     )
     .await?
     .ok_or_else(|| ApiError::internal("VOD library plugin runtime is unavailable"))?;
