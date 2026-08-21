@@ -24468,7 +24468,8 @@ async fn live_tv_stream_file(
     Query(query): Query<AuthQuery>,
     Path((stream_id, container)): Path<(String, String)>,
 ) -> Result<axum::response::Response, ApiError> {
-    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let (user, token) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let user_context = Some(plugin_user_context(&user, &token));
     if let Ok(recording) = live_tv_recording_by_id(&state.db, &stream_id).await {
         let path = live_tv_recording_path(&recording)?;
         let path_container = path
@@ -24488,7 +24489,7 @@ async fn live_tv_stream_file(
         ) {
             return Err(ApiError::not_found("Live TV stream not found"));
         }
-        return stream_live_tv_channel(channel, &headers, &state.db).await;
+        return stream_live_tv_channel(channel, &headers, &state.db, user_context).await;
     }
     let path = live_tv_channel_path(&channel)?;
     if !live_tv_channel_is_remote(&path) && !live_tv_channel_is_legacy_hdhomerun_path(&path) {
@@ -24500,7 +24501,7 @@ async fn live_tv_stream_file(
             return Err(ApiError::not_found("Live TV stream not found"));
         }
     }
-    stream_live_tv_channel(channel, &headers, &state.db).await
+    stream_live_tv_channel(channel, &headers, &state.db, user_context).await
 }
 
 async fn live_tv_recordings(
@@ -24689,6 +24690,7 @@ async fn stream_live_tv_channel(
     channel: serde_json::Value,
     headers: &HeaderMap,
     db: &Database,
+    user_context: Option<jellyrin_plugin_sdk::PluginUserContext>,
 ) -> Result<axum::response::Response, ApiError> {
     if live_tv_channel_uses_opaque_provider(&channel) {
         let channel_id = live_tv_channel_playback_id(&channel).ok_or_else(|| {
@@ -24697,7 +24699,7 @@ async fn stream_live_tv_channel(
         let (tuner_host_id, tuner_count) = live_tv_channel_tuner_limit(db, &channel).await;
         let tuner_lease =
             acquire_unshared_live_tuner_lease(tuner_host_id, &channel_id, tuner_count)?;
-        let playback = resolve_opaque_live_tv_playback(db, &channel).await?;
+        let playback = resolve_opaque_live_tv_playback(db, &channel, user_context).await?;
         if !opaque_live_tv_delivery_is_safe_for_direct_proxy(&playback) {
             return Err(ApiError::service_unavailable(
                 "Live TV provider did not authorize a safe direct stream",
@@ -24762,6 +24764,7 @@ fn opaque_live_tv_delivery_is_safe_for_direct_proxy(playback: &LiveTvPlaybackRes
 async fn resolve_opaque_live_tv_playback(
     db: &Database,
     channel: &serde_json::Value,
+    user_context: Option<jellyrin_plugin_sdk::PluginUserContext>,
 ) -> Result<LiveTvPlaybackResult, ApiError> {
     let provider_reference = live_tv_channel_provider_reference(channel).ok_or_else(|| {
         ApiError::service_unavailable("Live TV provider reference is unavailable")
@@ -24874,7 +24877,7 @@ async fn resolve_opaque_live_tv_playback(
     let mut request_arguments = serde_json::to_value(context)
         .map_err(|_| ApiError::internal("invalid Live TV playback context"))?;
     request_arguments["ProviderReference"] = serde_json::Value::String(provider_reference);
-    let request = live_tv_plugin_provider_request(
+    let mut request = live_tv_plugin_provider_request(
         db,
         &plugin,
         &persisted_tuner_config,
@@ -24883,6 +24886,9 @@ async fn resolve_opaque_live_tv_playback(
     )
     .await
     .map_err(|_| ApiError::service_unavailable("Live TV provider credentials are unavailable"))?;
+    if let Some(user_context) = user_context {
+        request = request.with_user_context(user_context);
+    }
     let arguments = serde_json::to_value(request)
         .map_err(|_| ApiError::internal("invalid Live TV playback request"))?;
     let result = invoke_plugin_capability_via_runtime_host_path_with_timeout(
@@ -25488,6 +25494,7 @@ async fn resolve_plugin_vod_subtitle(
     tuner_id: &str,
     provider_reference: &str,
     stream_index: i64,
+    user_context: Option<jellyrin_plugin_sdk::PluginUserContext>,
 ) -> Result<PluginVodSubtitleResolution, ApiError> {
     if !(0..=PLUGIN_VOD_MAX_STREAM_INDEX).contains(&stream_index) {
         return Err(ApiError::not_found("Subtitle stream not found"));
@@ -25501,7 +25508,7 @@ async fn resolve_plugin_vod_subtitle(
             "ProviderReference": provider_reference,
             "SubtitleStreamIndex": stream_index,
         }),
-        None,
+        user_context,
     )
     .await?;
     if !result
@@ -29212,7 +29219,7 @@ async fn open_opaque_live_tv_recording_stream(
     channel_id: &str,
 ) -> Result<reqwest::Response, ApiError> {
     let channel = live_tv_channel_by_id(db, channel_id).await?;
-    let playback = resolve_opaque_live_tv_playback(db, &channel).await?;
+    let playback = resolve_opaque_live_tv_playback(db, &channel, None).await?;
     if !opaque_live_tv_delivery_is_safe_for_direct_proxy(&playback) {
         return Err(ApiError::service_unavailable(
             "Live TV provider did not authorize a safe recording stream",
@@ -45905,6 +45912,7 @@ async fn plugin_vod_subtitle_output(
     format: &str,
     start_position_ticks: i64,
     end_position_ticks: Option<i64>,
+    user_context: Option<jellyrin_plugin_sdk::PluginUserContext>,
 ) -> Result<Option<Vec<u8>>, ApiError> {
     if !is_plugin_vod_virtual_item(item) {
         return Ok(None);
@@ -45922,6 +45930,7 @@ async fn plugin_vod_subtitle_output(
         &reference.tuner_id,
         &reference.provider_reference,
         index,
+        user_context,
     )
     .await?;
     let configured_proxy = if subtitle.requires_provider_egress {
@@ -46019,10 +46028,11 @@ fn subtitle_srt_to_vtt(bytes: &[u8]) -> Result<Vec<u8>, ApiError> {
 
 pub(crate) async fn subtitle_stream_response(
     state: &AppState,
-    _headers: &HeaderMap,
+    headers: &HeaderMap,
     route: SubtitleStreamRoute,
     query: SubtitleStreamQuery,
 ) -> Result<axum::response::Response, ApiError> {
+    let (user, token) = require_user(&state.db, headers, query._api_key.as_deref()).await?;
     let item_id = query.item_id.as_deref().unwrap_or(&route.item_id);
     let media_source_id = query
         .media_source_id
@@ -46059,6 +46069,7 @@ pub(crate) async fn subtitle_stream_response(
         extraction_format,
         start_position_ticks,
         extraction_end_position_ticks,
+        Some(plugin_user_context(&user, &token)),
     )
     .await?;
     let stream = if plugin_vod_output.is_none() {
@@ -47180,7 +47191,7 @@ async fn active_hls_transcode_session_for(
     query: &HlsQuery,
     media_type: &str,
 ) -> Result<TranscodeSession, ApiError> {
-    let user = require_request_user(&state.db, headers, query.api_key.as_deref()).await?;
+    let (user, token) = require_user(&state.db, headers, query.api_key.as_deref()).await?;
     let play_session_id = query
         .play_session_id
         .as_deref()
@@ -47202,6 +47213,7 @@ async fn active_hls_transcode_session_for(
             query.subtitle_stream_index,
             media_type,
             user.id,
+            Some(plugin_user_context(&user, &token)),
             live_tv_channel,
         )
         .await;
@@ -47241,6 +47253,7 @@ async fn active_hls_transcode_session_for_live_tv(
     subtitle_stream_index: Option<i64>,
     media_type: &str,
     user_id: Uuid,
+    user_context: Option<jellyrin_plugin_sdk::PluginUserContext>,
     channel: Option<serde_json::Value>,
 ) -> Result<TranscodeSession, ApiError> {
     if media_type != "Video" {
@@ -47342,7 +47355,7 @@ async fn active_hls_transcode_session_for_live_tv(
             state,
             InternalRemoteRelayTarget::LiveTvChannel {
                 channel_id: channel_id.to_string(),
-                user_context: None,
+                user_context,
             },
             INTERNAL_REMOTE_RELAY_TRANSCODE_TTL,
         )?;
@@ -47521,7 +47534,8 @@ async fn direct_stream_media(
     if media_type == "Video"
         && let Some(channel) = live_tv_channel_json_for_playable_item(&state.db, item_id).await?
     {
-        let mut response = stream_live_tv_channel(channel, headers, &state.db).await?;
+        let mut response =
+            stream_live_tv_channel(channel, headers, &state.db, user_context.clone()).await?;
         if !include_body {
             *response.body_mut() = Body::empty();
         }
@@ -47813,10 +47827,11 @@ async fn internal_remote_media_response(
         }
         InternalRemoteRelayTarget::LiveTvChannel {
             channel_id,
-            user_context: _,
+            user_context,
         } => {
             let channel = live_tv_channel_by_id(&state.db, &channel_id).await?;
-            let mut response = stream_live_tv_channel(channel, headers, &state.db).await?;
+            let mut response =
+                stream_live_tv_channel(channel, headers, &state.db, user_context).await?;
             if !include_body {
                 *response.body_mut() = Body::empty();
             }
@@ -112611,6 +112626,7 @@ done
                 None,
                 "Video",
                 uuid::Uuid::nil(),
+                None,
                 None,
             )
             .await;
