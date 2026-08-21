@@ -152,9 +152,11 @@ Los resultados completos, incluidos imágenes, gzip e índices, están en
 Para Compose completo, definir `REDIS_PASSWORD`, habilitar el profile `cache` y
 proporcionar `JELLYRIN_REDIS_URL` en el fichero de entorno protegido. En un
 despliegue bare-metal de Jellyrin con Redis aislado en Docker se usa
-`ops/docker-compose.redis-cache.yml`: recibe un `redis.conf` root-only y un
-fichero root-only con la contraseña para el healthcheck, publica únicamente
-`127.0.0.1:16379` y mantiene 64 MiB de `maxmemory` dentro de un cgroup de 96 MiB.
+`ops/docker-compose.redis-cache.yml`: recibe un fichero root-only con la
+contraseña, deriva un ACL SHA-256 solo dentro del tmpfs
+del contenedor, publica únicamente `127.0.0.1:16379` y mantiene 64 MiB de
+`maxmemory` dentro de un cgroup de 96 MiB. La contraseña no aparece en argv,
+variables Docker ni `docker inspect`.
 
 La URL de Jellyrin se guarda aparte, por ejemplo
 `redis://:CONTRASEÑA@127.0.0.1:16379/0`, en un fichero 0400/0440 fuera del repo.

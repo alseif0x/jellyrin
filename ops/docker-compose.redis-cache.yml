@@ -3,17 +3,49 @@ services:
     image: ${REDIS_IMAGE:-docker.io/library/redis:8.2.8-bookworm@sha256:2f7462b9e93e0a7ae2edf3a0a0babc8a4d29f8bfc50849b906b7caaef925edc1}
     container_name: jellyrin-redis-cache
     restart: unless-stopped
-    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        read -r redis_password < /run/secrets/redis_password
+        redis_password_hash="$$(printf '%s' "$${redis_password}" | sha256sum | cut -d ' ' -f 1)"
+        unset redis_password
+        printf 'user default on #%s ~* +@all\n' "$${redis_password_hash}" > /tmp/users.acl
+        unset redis_password_hash
+        chmod 0400 /tmp/users.acl
+        chown redis:redis /tmp/users.acl
+        exec /usr/bin/setpriv \
+          --reuid redis \
+          --regid redis \
+          --clear-groups \
+          --nnp \
+          --inh-caps=-all \
+          --ambient-caps=-all \
+          --bounding-set=-all \
+          redis-server \
+          --save "" \
+          --appendonly no \
+          --maxmemory 64mb \
+          --maxmemory-policy allkeys-lru \
+          --maxclients 64 \
+          --aclfile /tmp/users.acl
     ports:
       - "127.0.0.1:${JELLYRIN_REDIS_HOST_PORT:-16379}:6379"
     volumes:
-      - ${JELLYRIN_REDIS_CONFIG_FILE:?set JELLYRIN_REDIS_CONFIG_FILE}:/usr/local/etc/redis/redis.conf:ro
       - ${JELLYRIN_REDIS_PASSWORD_FILE:?set JELLYRIN_REDIS_PASSWORD_FILE}:/run/secrets/redis_password:ro
     read_only: true
     tmpfs:
       - /tmp:size=8m,mode=1777
+      - /data:size=8m,mode=0700,uid=999,gid=999
     cap_drop:
       - ALL
+    # The root entrypoint reads the host root-only secret, writes an ACL into tmpfs and immediately
+    # drops to the redis UID. The long-running redis-server process retains no capabilities.
+    cap_add:
+      - CHOWN
+      - DAC_READ_SEARCH
+      - SETGID
+      - SETUID
     security_opt:
       - no-new-privileges:true
     mem_limit: 96m
