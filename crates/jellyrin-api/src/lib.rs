@@ -25305,6 +25305,7 @@ async fn invoke_plugin_vod_provider_action(
     tuner_id: &str,
     action: &str,
     mut request_arguments: serde_json::Value,
+    user_context: Option<jellyrin_plugin_sdk::PluginUserContext>,
 ) -> Result<ZeroizingJsonValue, ApiError> {
     let jit_lane = external_provider_jit_lane(tuner_id)
         .ok_or_else(|| ApiError::service_unavailable("VOD provider tuner is unavailable"))?;
@@ -25369,7 +25370,7 @@ async fn invoke_plugin_vod_provider_action(
     for (field, value) in context.as_object().into_iter().flatten() {
         request_object.insert(field.clone(), value.clone());
     }
-    let request = vod_library_plugin_provider_request(
+    let mut request = vod_library_plugin_provider_request(
         db,
         &plugin,
         &persisted_tuner_config,
@@ -25378,6 +25379,9 @@ async fn invoke_plugin_vod_provider_action(
     )
     .await
     .map_err(|_| ApiError::service_unavailable("VOD provider credentials are unavailable"))?;
+    if let Some(user_context) = user_context {
+        request = request.with_user_context(user_context);
+    }
     let arguments = serde_json::to_value(request)
         .map_err(|_| ApiError::internal("invalid VOD provider request"))?;
     let result = invoke_plugin_capability_via_runtime_host_path_with_timeout(
@@ -25409,6 +25413,7 @@ async fn resolve_plugin_vod_playback(
     plugin_id: &str,
     tuner_id: &str,
     provider_reference: &str,
+    user_context: Option<jellyrin_plugin_sdk::PluginUserContext>,
 ) -> Result<VodPlaybackResult, ApiError> {
     let result = invoke_plugin_vod_provider_action(
         db,
@@ -25416,6 +25421,7 @@ async fn resolve_plugin_vod_playback(
         tuner_id,
         "ResolvePlayback",
         serde_json::json!({ "ProviderReference": provider_reference }),
+        user_context,
     )
     .await?;
 
@@ -25457,6 +25463,14 @@ async fn resolve_plugin_vod_playback(
     Ok(playback)
 }
 
+fn plugin_user_context(user: &User, token: &DeviceToken) -> jellyrin_plugin_sdk::PluginUserContext {
+    jellyrin_plugin_sdk::PluginUserContext {
+        user_id: user.id.to_string(),
+        device_id: token.device_id.clone(),
+        is_administrator: user.is_administrator,
+    }
+}
+
 struct PluginVodSubtitleResolution {
     source_url: jellyrin_plugin_sdk::SensitiveUrl,
     format: String,
@@ -25487,6 +25501,7 @@ async fn resolve_plugin_vod_subtitle(
             "ProviderReference": provider_reference,
             "SubtitleStreamIndex": stream_index,
         }),
+        None,
     )
     .await?;
     if !result
@@ -38658,6 +38673,7 @@ async fn playback_info_response(
             &reference.plugin_id,
             &reference.tuner_id,
             &reference.provider_reference,
+            Some(plugin_user_context(user, token)),
         )
         .await?;
         apply_plugin_vod_playback_descriptor(&mut item, &playback)?;
@@ -47570,6 +47586,7 @@ async fn stream_plugin_vod_media(
             &reference.plugin_id,
             &reference.tuner_id,
             &reference.provider_reference,
+            None,
         )
         .await?;
         if !opaque_live_tv_delivery_is_safe_for_direct_proxy(&playback) {
@@ -65899,10 +65916,15 @@ mod tests {
 
         // The resolver keeps only allowlisted track descriptors and never opens the upstream on
         // its own. Provider URLs and credentials have no field through which to cross.
-        let playback =
-            super::resolve_plugin_vod_playback(&db, plugin_id, "vod-tuner", "provider:v1:movie-1")
-                .await
-                .unwrap();
+        let playback = super::resolve_plugin_vod_playback(
+            &db,
+            plugin_id,
+            "vod-tuner",
+            "provider:v1:movie-1",
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(playback.source_url.expose_secret(), signed_url);
         assert_eq!(playback.media_streams.len(), 4);
         assert_eq!(playback.media_streams[1]["Language"], "spa");
@@ -66493,6 +66515,7 @@ mod tests {
             plugin_id,
             "missing-tuner",
             "provider:v1:movie-1",
+            None,
         )
         .await
         .expect_err("an unknown tuner must fail closed");
@@ -66508,10 +66531,15 @@ mod tests {
         }
 
         // Unknown provider reference: the plugin is invoked but its error surfaces sanitized.
-        let error =
-            super::resolve_plugin_vod_playback(&db, plugin_id, "vod-tuner", "provider:v1:unknown")
-                .await
-                .expect_err("the fixture rejects unknown provider references");
+        let error = super::resolve_plugin_vod_playback(
+            &db,
+            plugin_id,
+            "vod-tuner",
+            "provider:v1:unknown",
+            None,
+        )
+        .await
+        .expect_err("the fixture rejects unknown provider references");
         assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
         let message = error.error.to_string();
         for secret in [
