@@ -278,7 +278,7 @@ resolve_docker_hub_ref() {
 resolve_docker_hub_ref rust:1.94.0-bookworm
 resolve_docker_hub_ref debian:bookworm-slim
 resolve_docker_hub_ref postgres:17.10-bookworm
-resolve_docker_hub_ref redis:7.2.14-bookworm
+resolve_docker_hub_ref redis:8.2.8-bookworm
 ```
 
 Before accepting a result, fetch the manifest by digest and confirm that `sha256sum` of the raw

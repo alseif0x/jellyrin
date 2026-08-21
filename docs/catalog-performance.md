@@ -15,7 +15,7 @@ sin límite en varias capas:
   `Fields`;
 - JSON viajaba sin compresión en nginx.
 
-Los cambios `6892c97` y `7d6a26c` acotan esos caminos. PostgreSQL pagina el catálogo, las rejillas
+Los cambios `6892c97`, `7d6a26c` y `c2f276e` acotan esos caminos. PostgreSQL pagina el catálogo, las rejillas
 usan únicamente imágenes ya cacheadas o placeholder, las miniaturas tienen derivados JPEG
 cacheados y single-flight, y nginx comprime JSON. `NextUp` mantiene dos contratos:
 
@@ -30,16 +30,16 @@ Mediciones locales end-to-end, 20 elementos, PostgreSQL con el catálogo real:
 | --- | ---: | ---: |
 | `Latest` | 9,5 s | 14–22 ms |
 | `NextUp`, sin total exacto | 10–14 s; a veces timeout 500 | 31–54 ms |
-| `NextUp`, total exacto | 10–14 s | 487–540 ms |
+| `NextUp`, total exacto | 10–14 s | plan PostgreSQL ~12 ms; pendiente medida end-to-end del release |
 | Abrir una serie | no aislado | 73–83 ms |
 | Listar episodios de una serie | no aislado | 4 ms |
 | Abrir una película con enriquecimiento aún frío | no aislado | 1,62 s la primera vez |
 | Volver a abrir esa película | no aislado | 11 ms |
 
 La consulta PostgreSQL de `NextUp` sin total promedia 0,407 ms en `pg_stat_statements`; la
-validación conservadora de cobertura/unicidad de la proyección cuesta unos 22 ms. Con total exacto
-la consulta promedia 466 ms porque debe examinar las 43.363 series. Esta diferencia es intencional:
-el cliente que no va a mostrar un total no debe pagarlo.
+validación conservadora de cobertura/unicidad de la proyección cuesta unos 22 ms. El conteo exacto
+ya no materializa todas las series: cuenta la proyección y resta únicamente las series afectadas
+por estados reproducidos del usuario; el plan equivalente sobre el catálogo real tarda unos 12 ms.
 
 Una carátula de prueba bajó de 4.537.535 bytes (PNG 1920×1080) a 13.889 bytes (JPEG 200×113). La
 primera generación tardó 139 ms y la lectura cacheada 80 ms. Una respuesta JSON de 91.300 bytes se
@@ -88,11 +88,11 @@ verificar constraints y medir escritura/lectura antes y después.
 
 ## Decisión de caché
 
-No se añade Redis para esta topología. Los cuellos demostrados eran cardinalidad, serialización,
-imágenes y trabajo de proveedor; Redis habría cacheado respuestas de consultas incorrectamente
-acotadas sin mejorar el primer acceso. PostgreSQL caliente ya igualó a Redis en el benchmark de
-lookup documentado en `redis-decision.md`, y el nuevo `NextUp` tarda menos de un milisegundo dentro
-de PostgreSQL cuando no pide total.
+Redis se añade de forma opcional después de corregir cardinalidad, serialización, imágenes e
+índices. No cachea `NextUp`, progreso ni respuestas finales personalizadas. Su único consumidor
+inicial son las facetas públicas compartidas por biblioteca: géneros, estudios, personas,
+etiquetas y años. El diseño cache-aside usa TTL 30 s, máximo 64 KiB, timeout 20 ms, claves
+versionadas/hasheadas, single-flight y bypass automático de cinco segundos ante fallo.
 
 Las cachés adecuadas siguen siendo específicas y cerca del propietario:
 
@@ -102,9 +102,8 @@ Las cachés adecuadas siguen siendo específicas y cerca del propietario:
 - single-flight local para evitar trabajo duplicado en el mismo proceso.
 
 Con varios usuarios, progreso, asignaciones de cuenta y límites de dispositivos permanecen en
-PostgreSQL. Redis se reconsidera solo con dos o más nodos o cuando una medición atribuya al menos
-30 % del p95 de un endpoint a una lectura PostgreSQL repetida, con hit ratio esperado de al menos
-80 % y una mejora A/B end-to-end de al menos 25 % y 10 ms.
+PostgreSQL. Antes de ampliar Redis se exige hit ratio estable de al menos 80 %, evictions menores
+al 1 % y una mejora A/B material del endpoint candidato.
 
 ## Comprobación operativa
 

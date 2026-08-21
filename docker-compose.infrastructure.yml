@@ -68,12 +68,12 @@ services:
       - jellyrin-backend
 
   redis:
-    image: ${REDIS_IMAGE:-docker.io/library/redis:7.2.14-bookworm@sha256:f0707c78ea880b293ccdeb410c9c0a8ccae93fe7128799b751333a698b0a39a7}
+    image: ${REDIS_IMAGE:-docker.io/library/redis:8.2.8-bookworm@sha256:2f7462b9e93e0a7ae2edf3a0a0babc8a4d29f8bfc50849b906b7caaef925edc1}
     profiles: ["cache", "distributed-cache"]
     restart: unless-stopped
     environment:
-      # Dormant benchmark/future-reevaluation scaffold. It is not part of the current topology and
-      # fails closed if an operator deliberately enables a profile without a secret.
+      # Optional cache-aside service. It is never a source of truth and fails closed if an operator
+      # deliberately enables a profile without a secret.
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
     command:
       - /bin/sh

@@ -1,0 +1,7 @@
+[Service]
+# Optional systemd integration for the fail-open shared catalogue cache. Keep the URL (including
+# its password) in a root-owned 0400/0440 regular file; PID 1 presents an immutable per-unit copy.
+LoadCredential=redis-url:/etc/jellyrin-secrets/redis-url
+Environment=JELLYRIN_REDIS_URL_FILE=%d/redis-url
+Environment=JELLYRIN_CATALOG_CACHE_TTL_SECONDS=30
+Environment=JELLYRIN_REDIS_COMMAND_TIMEOUT_MILLISECONDS=20

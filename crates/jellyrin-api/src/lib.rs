@@ -8,6 +8,7 @@ mod auxiliary_ffmpeg_telemetry;
 mod backup;
 mod builtin_metadata;
 mod capabilities;
+mod catalog_cache;
 mod configuration_service;
 mod dlna;
 mod errors;
@@ -51,6 +52,7 @@ pub(crate) use auth_handlers::{
 };
 pub(crate) use backup::{backup_manifest, backups, create_backup, restore_backup};
 pub(crate) use capabilities::{parse_bool_query_value, update_session_capabilities};
+pub use catalog_cache::configure_shared_catalog_cache;
 pub(crate) use configuration_service::ConfigurationService;
 pub use errors::ApiError;
 pub(crate) use file_service::FileService;
@@ -13549,6 +13551,7 @@ const EXTERNAL_PROCESS_PROTECTED_ENV_PREFIXES: &[&str] = &[
     "REDIS_",
     "JELLYRIN_DB_",
     "JELLYRIN_E2E_",
+    "JELLYRIN_REDIS_",
     "JELLYRIN_PROVIDER_EGRESS_",
     "JELLYRIN_PROVIDER_SECRET_",
     "JELLYRIN_TEST_",
@@ -50060,11 +50063,12 @@ async fn metadata_collection_keys(
     if metadata_facet_query_is_supported(&facet_query)
         && let Some(folder_ids) = metadata_facet_folder_scope(&state.db, &facet_query).await?
     {
-        let values = MediaCatalogStore::media_item_facet_values(&state.db, facet_kind, &folder_ids)
-            .await?
-            .into_iter()
-            .map(|facet| facet.display_value)
-            .collect();
+        let values = catalog_cache::cached_media_item_facet_display_values(
+            &state.db,
+            facet_kind,
+            &folder_ids,
+        )
+        .await?;
         let server_id = state.db.server_state().await?.server_id.to_string();
         return Ok(Json(metadata_values_response(
             values, &server_id, item_type, &query,
@@ -64650,6 +64654,9 @@ mod tests {
         ));
         assert!(!super::external_process_environment_pattern_valid(
             "JELLYRIN_TEST_POSTGRES_URL"
+        ));
+        assert!(!super::external_process_environment_pattern_valid(
+            "JELLYRIN_REDIS_URL"
         ));
         assert!(!super::external_process_environment_pattern_valid(
             "PGPASSWORD"
