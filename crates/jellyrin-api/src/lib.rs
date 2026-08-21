@@ -20685,6 +20685,7 @@ async fn live_tv_plugin_provider_request(
         tuner_config,
         arguments,
         secret_grant: None,
+        user_context: None,
     };
     if let Some((reference, credentials)) = previous {
         let (username, password) = credentials.into_parts();
@@ -20719,6 +20720,7 @@ async fn vod_library_plugin_provider_request(
         provider_config: request.tuner_config,
         arguments: request.arguments,
         secret_grant: request.secret_grant,
+        user_context: request.user_context,
     })
 }
 

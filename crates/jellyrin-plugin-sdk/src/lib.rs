@@ -466,6 +466,8 @@ pub struct LiveTvProviderRequest {
     pub arguments: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_grant: Option<LiveTvProviderSecretGrant>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_context: Option<PluginUserContext>,
 }
 
 impl std::fmt::Debug for LiveTvProviderRequest {
@@ -476,6 +478,7 @@ impl std::fmt::Debug for LiveTvProviderRequest {
             .field("tuner_config", &"[REDACTED]")
             .field("arguments", &"[REDACTED]")
             .field("secret_grant", &self.secret_grant)
+            .field("user_context_present", &self.user_context.is_some())
             .finish()
     }
 }
@@ -487,6 +490,7 @@ impl LiveTvProviderRequest {
             tuner_config,
             arguments: json!({}),
             secret_grant: None,
+            user_context: None,
         }
     }
 
@@ -496,6 +500,7 @@ impl LiveTvProviderRequest {
             tuner_config,
             arguments: json!({}),
             secret_grant: None,
+            user_context: None,
         }
     }
 
@@ -505,6 +510,7 @@ impl LiveTvProviderRequest {
             tuner_config,
             arguments: json!({}),
             secret_grant: None,
+            user_context: None,
         }
     }
 
@@ -528,6 +534,7 @@ impl LiveTvProviderRequest {
             tuner_config,
             arguments,
             secret_grant: None,
+            user_context: None,
         }
     }
 
@@ -535,6 +542,21 @@ impl LiveTvProviderRequest {
         self.secret_grant = Some(secret_grant);
         self
     }
+
+    pub fn with_user_context(mut self, user_context: PluginUserContext) -> Self {
+        self.user_context = Some(user_context);
+        self
+    }
+}
+
+/// Provider-neutral identity derived by Jellyrin from an authenticated device
+/// token. Clients cannot supply or override this object.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase", deny_unknown_fields)]
+pub struct PluginUserContext {
+    pub user_id: String,
+    pub device_id: String,
+    pub is_administrator: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -767,6 +789,8 @@ pub struct VodLibraryProviderRequest {
     pub arguments: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_grant: Option<VodLibraryProviderSecretGrant>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_context: Option<PluginUserContext>,
 }
 
 impl std::fmt::Debug for VodLibraryProviderRequest {
@@ -777,6 +801,7 @@ impl std::fmt::Debug for VodLibraryProviderRequest {
             .field("provider_config", &"[REDACTED]")
             .field("arguments", &"[REDACTED]")
             .field("secret_grant", &self.secret_grant)
+            .field("user_context_present", &self.user_context.is_some())
             .finish()
     }
 }
@@ -790,6 +815,7 @@ impl VodLibraryProviderRequest {
             provider_config,
             arguments: json!({}),
             secret_grant: None,
+            user_context: None,
         }
     }
 
@@ -823,11 +849,17 @@ impl VodLibraryProviderRequest {
             provider_config,
             arguments,
             secret_grant: None,
+            user_context: None,
         }
     }
 
     pub fn with_secret_grant(mut self, secret_grant: VodLibraryProviderSecretGrant) -> Self {
         self.secret_grant = Some(secret_grant);
+        self
+    }
+
+    pub fn with_user_context(mut self, user_context: PluginUserContext) -> Self {
+        self.user_context = Some(user_context);
         self
     }
 }
@@ -1364,6 +1396,41 @@ mod tests {
         assert_eq!(grant.username.expose_secret(), "provider-user");
         assert_eq!(grant.password.expose_secret(), "provider-password");
         assert_eq!(grant.fields["DeviceId"].expose_secret(), "device-secret");
+    }
+
+    #[test]
+    fn authenticated_user_context_is_optional_and_provider_neutral() {
+        let context = PluginUserContext {
+            user_id: "user-a".to_string(),
+            device_id: "device-a".to_string(),
+            is_administrator: false,
+        };
+        let request =
+            LiveTvProviderRequest::import_channels(json!({})).with_user_context(context.clone());
+        let wire = serde_json::to_value(&request).unwrap();
+        assert_eq!(wire["UserContext"]["UserId"], "user-a");
+        assert_eq!(wire["UserContext"]["DeviceId"], "device-a");
+        assert_eq!(wire["UserContext"]["IsAdministrator"], false);
+        assert_eq!(
+            serde_json::from_value::<LiveTvProviderRequest>(wire)
+                .unwrap()
+                .user_context,
+            Some(context.clone())
+        );
+
+        let vod = VodLibraryProviderRequest::import_media(json!({})).with_user_context(context);
+        assert!(
+            serde_json::to_value(vod)
+                .unwrap()
+                .get("UserContext")
+                .is_some()
+        );
+        assert!(
+            serde_json::to_value(LiveTvProviderRequest::import_channels(json!({})))
+                .unwrap()
+                .get("UserContext")
+                .is_none()
+        );
     }
 
     #[test]
