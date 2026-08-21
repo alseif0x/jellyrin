@@ -484,6 +484,18 @@ impl std::fmt::Debug for LiveTvProviderRequest {
 }
 
 impl LiveTvProviderRequest {
+    /// Asks the provider whether the authenticated user may discover items from this tuner.
+    /// This action uses public tuner configuration only and must not carry a secret grant.
+    pub fn authorize_user(tuner_config: Value, user_context: PluginUserContext) -> Self {
+        Self {
+            action: "AuthorizeUser".to_string(),
+            tuner_config,
+            arguments: json!({}),
+            secret_grant: None,
+            user_context: Some(user_context),
+        }
+    }
+
     pub fn import_channels(tuner_config: Value) -> Self {
         Self {
             action: "ImportChannels".to_string(),
@@ -557,6 +569,15 @@ pub struct PluginUserContext {
     pub user_id: String,
     pub device_id: String,
     pub is_administrator: bool,
+}
+
+/// Provider-neutral discovery decision returned by a plugin for one authenticated user and
+/// one configured provider instance. The plugin owns the assignment semantics; Jellyrin only
+/// enforces the boolean result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase", deny_unknown_fields)]
+pub struct PluginUserAuthorizationResult {
+    pub allowed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -807,6 +828,18 @@ impl std::fmt::Debug for VodLibraryProviderRequest {
 }
 
 impl VodLibraryProviderRequest {
+    /// Asks the provider whether the authenticated user may discover items from this instance.
+    /// This action uses public provider configuration only and must not carry a secret grant.
+    pub fn authorize_user(provider_config: Value, user_context: PluginUserContext) -> Self {
+        Self {
+            action: "AuthorizeUser".to_string(),
+            provider_config,
+            arguments: json!({}),
+            secret_grant: None,
+            user_context: Some(user_context),
+        }
+    }
+
     /// Imports one catalog page. The host paginates by sending back the continuation token
     /// returned by the previous [`VodLibraryProviderResult`].
     pub fn import_media(provider_config: Value) -> Self {
@@ -1144,6 +1177,16 @@ impl std::fmt::Debug for CapabilityResponse {
 }
 
 impl CapabilityResponse {
+    pub fn user_authorization(
+        capability: impl Into<String>,
+        result: PluginUserAuthorizationResult,
+    ) -> Self {
+        Self::executed(
+            capability,
+            serde_json::to_value(result).expect("PluginUserAuthorizationResult must serialize"),
+        )
+    }
+
     pub fn executed(capability: impl Into<String>, result: Value) -> Self {
         Self {
             status: "Executed".to_string(),
@@ -1431,6 +1474,33 @@ mod tests {
                 .get("UserContext")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn user_authorization_requests_never_carry_secret_grants() {
+        let context = PluginUserContext {
+            user_id: "user-a".to_string(),
+            device_id: "device-a".to_string(),
+            is_administrator: false,
+        };
+        let live =
+            LiveTvProviderRequest::authorize_user(json!({ "Id": "tuner-a" }), context.clone());
+        let vod = VodLibraryProviderRequest::authorize_user(json!({ "Id": "tuner-a" }), context);
+        for wire in [
+            serde_json::to_value(live).unwrap(),
+            serde_json::to_value(vod).unwrap(),
+        ] {
+            assert_eq!(wire["Action"], "AuthorizeUser");
+            assert!(wire.get("SecretGrant").is_none());
+            assert_eq!(wire["UserContext"]["UserId"], "user-a");
+        }
+
+        let response = CapabilityResponse::user_authorization(
+            CAPABILITY_VOD_LIBRARY_PROVIDER,
+            PluginUserAuthorizationResult { allowed: true },
+        )
+        .into_host_value();
+        assert_eq!(response["Allowed"], true);
     }
 
     #[test]
