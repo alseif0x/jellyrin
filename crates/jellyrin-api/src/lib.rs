@@ -22882,10 +22882,7 @@ async fn live_tv_discover_hdhomerun_tuners_with_socket(
 
     let deadline = tokio::time::Instant::now() + discovery_duration;
     let mut buffer = [0u8; 8192];
-    loop {
-        let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) else {
-            break;
-        };
+    while let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) {
         match tokio::time::timeout(remaining, socket.recv_from(&mut buffer)).await {
             Ok(Ok((received, remote))) => {
                 if received <= 13 || buffer[1] != 3 {
@@ -34272,7 +34269,7 @@ fn child_virtual_folders<'a>(
                 .any(|location| parent_locations.contains(&location))
         })
         .collect::<Vec<_>>();
-    children.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+    children.sort_by_key(|item| item.name.to_lowercase());
     children
 }
 
@@ -34965,8 +34962,8 @@ async fn movie_recommendations(
             liked.push((item.clone(), playback.clone()));
         }
     }
-    recently_played.sort_by(|(_, left), (_, right)| right.updated_at.cmp(&left.updated_at));
-    liked.sort_by(|(_, left), (_, right)| right.updated_at.cmp(&left.updated_at));
+    recently_played.sort_by_key(|(_, item)| std::cmp::Reverse(item.updated_at));
+    liked.sort_by_key(|(_, item)| std::cmp::Reverse(item.updated_at));
 
     let server_id = state.db.server_state().await?.server_id.to_string();
     let recommendation_context = MovieRecommendationContext {
@@ -47978,6 +47975,7 @@ async fn active_hls_transcode_session_for(
 // Uses an in-memory registry (LIVE_HLS_SESSIONS) because live TV channels are not in the
 // media_items DB table and therefore cannot be stored via the standard transcode DB path.
 // Registers stop_tx in TRANSCODE_STOPS so DELETE ActiveEncodings kills ffmpeg cleanly.
+#[allow(clippy::too_many_arguments)]
 async fn active_hls_transcode_session_for_live_tv(
     state: &AppState,
     channel_id: &str,
@@ -61434,7 +61432,7 @@ async fn stored_images_for_type(
             path,
         });
     }
-    images.sort_by(|left, right| left.index.cmp(&right.index));
+    images.sort_by_key(|image| image.index);
     Ok(images)
 }
 
@@ -89093,10 +89091,7 @@ done
         session_id: &str,
     ) -> Value {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        loop {
-            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
-                break;
-            };
+        while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
             let event = tokio::time::timeout(remaining, receiver.recv())
                 .await
                 .unwrap_or_else(|_| {

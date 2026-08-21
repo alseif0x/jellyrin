@@ -4487,13 +4487,10 @@ fn search_criteria_expression_matches(
     if and_terms.len() > 1 {
         let mut recognized = false;
         for term in and_terms {
-            if let Some(matches) = search_criteria_expression_matches(item, metadata, term) {
-                recognized = true;
-                if !matches {
-                    return Some(false);
-                }
-            } else {
-                return None;
+            let matches = search_criteria_expression_matches(item, metadata, term)?;
+            recognized = true;
+            if !matches {
+                return Some(false);
             }
         }
         return recognized.then_some(true);

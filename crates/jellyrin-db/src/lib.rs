@@ -16502,7 +16502,7 @@ fn ffprobe_hex_dump_bytes(value: &str, max_bytes: usize) -> Option<Vec<u8>> {
             if group.is_empty() || group.len() > 8 || group.len() % 2 != 0 {
                 return None;
             }
-            for pair in group.as_bytes().chunks_exact(2) {
+            for pair in group.as_bytes().as_chunks::<2>().0 {
                 let pair = std::str::from_utf8(pair).ok()?;
                 bytes.push(u8::from_str_radix(pair, 16).ok()?);
                 if bytes.len() > max_bytes {
@@ -16544,7 +16544,9 @@ fn ffprobe_teletext_services(stream: &Value) -> Vec<Value> {
     }
     let languages = normalized_teletext_languages(stream);
     descriptors
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .take(MAX_TELETEXT_SERVICES)
         .enumerate()
         .filter_map(|(index, descriptor)| {
