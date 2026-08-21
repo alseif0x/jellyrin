@@ -96,7 +96,8 @@ inicial son las facetas públicas compartidas por biblioteca: géneros, estudios
 etiquetas y años. El diseño cache-aside usa TTL 30 s, máximo 64 KiB, timeout 20 ms, claves
 versionadas/hasheadas, single-flight y bypass automático de cinco segundos ante fallo.
 
-En el despliegue real, Géneros de Películas midió 185 ms en frío y 6–8 ms en caliente, con cinco
+En el despliegue real, Redis tiene `maxmemory=128 MiB` y un cgroup de 192 MiB. Géneros de
+Películas midió 185 ms en frío y 6–8 ms en caliente, con cinco
 hits confirmados, cero errores y unos 645 KiB usados por Redis. Con Redis detenido respondió 200
 desde PostgreSQL en 205 ms; tras recuperarlo, el ciclo repoblación→hit midió 186 ms→6 ms. Los
 payloads fueron idénticos en todas las rutas y Jellyrin no se reinició. Estos números validan el

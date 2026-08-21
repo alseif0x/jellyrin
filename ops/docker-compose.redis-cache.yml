@@ -25,7 +25,7 @@ services:
           redis-server \
           --save "" \
           --appendonly no \
-          --maxmemory 64mb \
+          --maxmemory 128mb \
           --maxmemory-policy allkeys-lru \
           --maxclients 64 \
           --aclfile /tmp/users.acl
@@ -48,7 +48,7 @@ services:
       - SETUID
     security_opt:
       - no-new-privileges:true
-    mem_limit: 96m
+    mem_limit: 192m
     cpus: 0.25
     pids_limit: 64
     healthcheck:

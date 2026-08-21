@@ -129,8 +129,10 @@ promedia 0,407 ms y el endpoint completo 31–54 ms. El conteo exacto posterior 
 466 ms a unos 12 ms. Esos caminos dependientes del usuario no entran en Redis. La activación se
 limita a facetas compartidas, donde muchos usuarios reutilizan el mismo resultado.
 
-El rollout real se hizo con Redis 8.2.8, autenticado, limitado a loopback, `maxmemory=64 MiB`
-y cgroup de 96 MiB. Tras vaciar exclusivamente la caché efímera, la faceta de géneros de
+El rollout real se hizo con Redis 8.2.8, autenticado y limitado a loopback. El presupuesto
+inicial se amplió preventivamente a `maxmemory=128 MiB` dentro de un cgroup de 192 MiB, aunque
+el working set observado todavía es inferior a 1 MiB. Tras vaciar exclusivamente la caché
+efímera, la faceta de géneros de
 Películas (56 valores, respuesta de 36.676 bytes) tardó 185 ms en frío y 6–8 ms en cinco
 lecturas calientes. Redis confirmó cinco hits, dos misses del fill con recheck, cero errores y
 un único valor con TTL; `used_memory` fue aproximadamente 645 KiB. Las seis respuestas fueron
@@ -174,8 +176,8 @@ proporcionar `JELLYRIN_REDIS_URL` en el fichero de entorno protegido. En un
 despliegue bare-metal de Jellyrin con Redis aislado en Docker se usa
 `ops/docker-compose.redis-cache.yml`: recibe un fichero root-only con la
 contraseña, deriva un ACL SHA-256 solo dentro del tmpfs
-del contenedor, publica únicamente `127.0.0.1:16379` y mantiene 64 MiB de
-`maxmemory` dentro de un cgroup de 96 MiB. La contraseña no aparece en argv,
+del contenedor, publica únicamente `127.0.0.1:16379` y mantiene 128 MiB de
+`maxmemory` dentro de un cgroup de 192 MiB. La contraseña no aparece en argv,
 variables Docker ni `docker inspect`.
 
 La URL de Jellyrin se guarda aparte, por ejemplo
@@ -210,8 +212,8 @@ otro tipo de dato debe cumplir **todos** los criterios siguientes:
    con jitter y working set medido, no estimado.
 4. **Presupuesto:** RSS Redis menor al 5 % de la RAM del host y quedan al menos
    512 MiB libres durante un encode FFmpeg de peor caso. En este host se empieza
-   con `maxmemory` de 32–64 MiB, no 96 MiB, y se dimensiona el cgroup con RSS
-   saturado, no con `used_memory` vacío.
+   con un presupuesto inicial medido y se dimensiona el cgroup con RSS saturado, no con
+   `used_memory` vacío. La instalación actual reserva 128 MiB de datos y 192 MiB de cgroup.
 5. **Degradación segura:** timeout corto, circuit breaker y fallback a
    PostgreSQL mantienen el SLO cuando Redis está detenido o saturado. Redis no
    participa en `/readyz` si solo es caché y su caída no impide login, browse ni
