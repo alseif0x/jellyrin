@@ -218,6 +218,8 @@ const SYNCPLAY_DRIFT_THRESHOLD_TICKS: i64 = 5_000_000;
 const IMAGE_UPLOAD_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 const REMOTE_IMAGE_CLIENT_CACHE_MAX_ENTRIES: usize = 64;
 const REMOTE_IMAGE_CLIENT_CACHE_TTL: StdDuration = StdDuration::from_secs(10 * 60);
+const PLUGIN_VOD_GRID_IMAGE_MAX_IN_FLIGHT: usize = 8;
+const PLUGIN_VOD_GRID_IMAGE_WAIT_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 const ISO_639_2_DATA: &str = include_str!("localization/iso6392.txt");
 const COUNTRIES_DATA: &str = include_str!("localization/countries.json");
 const TERMINAL_TRANSCODE_CLEANUP_INTERVAL_SECONDS: u64 = 60 * 60;
@@ -336,6 +338,7 @@ static TRANSCODE_LAST_ACCESS: OnceLock<Mutex<HashMap<String, tokio::time::Instan
 static SYNCPLAY_GROUPS: OnceLock<Mutex<HashMap<String, SyncPlayGroup>>> = OnceLock::new();
 static AUTH_FAILURES: OnceLock<Mutex<AuthFailureRegistry>> = OnceLock::new();
 static REMOTE_IMAGE_HTTP_CLIENTS: OnceLock<Mutex<RemoteImageClientCache>> = OnceLock::new();
+static PLUGIN_VOD_GRID_IMAGE_ADMISSION: OnceLock<Arc<Semaphore>> = OnceLock::new();
 static INTERNAL_REMOTE_RELAYS: OnceLock<StdMutex<HashMap<String, InternalRemoteRelayEntry>>> =
     OnceLock::new();
 static CONFIGURED_PLUGIN_PACKAGES_ROOT: OnceLock<PathBuf> = OnceLock::new();
@@ -1002,6 +1005,8 @@ static LIVE_TUNER_LEASES: OnceLock<StdMutex<HashMap<LiveTunerLeaseKey, LiveTuner
 static TEST_RUST_WASI_HOST_BINARY_PATH: OnceLock<StdMutex<Option<PathBuf>>> = OnceLock::new();
 #[cfg(test)]
 static TEST_DOTNET_HOST_BINARY_PATH: OnceLock<StdMutex<Option<PathBuf>>> = OnceLock::new();
+#[cfg(test)]
+static TEST_PROVIDER_EGRESS_PROXY: OnceLock<StdMutex<Option<String>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 struct LiveTunerLeaseKey {
@@ -26333,7 +26338,7 @@ async fn fetch_plugin_vod_remote_image(source_url: &str) -> Result<Vec<u8>, ApiE
         log_plugin_vod_artwork_failure(PluginVodArtworkFailure::InvalidSource);
         return Err(error);
     }
-    let proxy = match std::env::var("JELLYRIN_PROVIDER_EGRESS_PROXY") {
+    let proxy = match configured_provider_egress_proxy() {
         Ok(proxy) => proxy,
         Err(_) => {
             log_plugin_vod_artwork_failure(PluginVodArtworkFailure::MissingProxy);
@@ -26389,6 +26394,19 @@ async fn fetch_plugin_vod_remote_image(source_url: &str) -> Result<Vec<u8>, ApiE
     };
     validate_plugin_vod_image_payload(&bytes, nonstandard_content_type)?;
     Ok(bytes)
+}
+
+fn configured_provider_egress_proxy() -> Result<String, std::env::VarError> {
+    #[cfg(test)]
+    if let Some(proxy) = TEST_PROVIDER_EGRESS_PROXY
+        .get_or_init(|| StdMutex::new(None))
+        .lock()
+        .expect("test provider egress proxy lock poisoned")
+        .clone()
+    {
+        return Ok(proxy);
+    }
+    std::env::var("JELLYRIN_PROVIDER_EGRESS_PROXY")
 }
 
 fn plugin_vod_image_payload_len_is_allowed(length: usize) -> bool {
@@ -60305,39 +60323,61 @@ async fn bitrate_test(
 
 async fn item_placeholder_image(
     State(state): State<AppState>,
+    method: axum::http::Method,
     headers: HeaderMap,
     Query(size): Query<ImageResizeQuery>,
     Path((item_id, image_type)): Path<(String, String)>,
 ) -> Result<axum::response::Response, ApiError> {
-    let response =
-        item_image_or_placeholder(&state, &item_id, &image_type, 0, size.normalized()).await?;
-    Ok(conditional_image_response(&headers, response))
-}
-
-async fn item_placeholder_image_by_index(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(size): Query<ImageResizeQuery>,
-    Path((item_id, image_type, image_index)): Path<(String, String, String)>,
-) -> Result<axum::response::Response, ApiError> {
-    let image_index = parse_image_index(&image_index)?;
+    let resize = size.normalized();
     let response = item_image_or_placeholder(
         &state,
         &item_id,
         &image_type,
-        image_index,
-        size.normalized(),
+        0,
+        ItemImageRequest {
+            resize,
+            headers: &headers,
+            query_token: size.api_key.as_deref(),
+            allow_plugin_vod_fill: method == axum::http::Method::GET,
+        },
     )
     .await?;
     Ok(conditional_image_response(&headers, response))
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize)]
+async fn item_placeholder_image_by_index(
+    State(state): State<AppState>,
+    method: axum::http::Method,
+    headers: HeaderMap,
+    Query(size): Query<ImageResizeQuery>,
+    Path((item_id, image_type, image_index)): Path<(String, String, String)>,
+) -> Result<axum::response::Response, ApiError> {
+    let image_index = parse_image_index(&image_index)?;
+    let resize = size.normalized();
+    let response = item_image_or_placeholder(
+        &state,
+        &item_id,
+        &image_type,
+        image_index,
+        ItemImageRequest {
+            resize,
+            headers: &headers,
+            query_token: size.api_key.as_deref(),
+            allow_plugin_vod_fill: method == axum::http::Method::GET,
+        },
+    )
+    .await?;
+    Ok(conditional_image_response(&headers, response))
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
 struct ImageResizeQuery {
     #[serde(alias = "MaxWidth", alias = "maxWidth")]
     max_width: Option<u32>,
     #[serde(alias = "MaxHeight", alias = "maxHeight")]
     max_height: Option<u32>,
+    #[serde(alias = "api_key", alias = "ApiKey", alias = "apiKey")]
+    api_key: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60347,7 +60387,7 @@ struct ImageResize {
 }
 
 impl ImageResizeQuery {
-    fn normalized(self) -> Option<ImageResize> {
+    fn normalized(&self) -> Option<ImageResize> {
         const MAX_IMAGE_EDGE: u32 = 4096;
         let requested_width = self.max_width.filter(|value| *value > 0);
         let requested_height = self.max_height.filter(|value| *value > 0);
@@ -60378,6 +60418,7 @@ type ExtendedItemImagePath = (
 
 async fn item_placeholder_image_extended(
     State(state): State<AppState>,
+    method: axum::http::Method,
     headers: HeaderMap,
     Query(query_size): Query<ImageResizeQuery>,
     Path((
@@ -60396,10 +60437,22 @@ async fn item_placeholder_image_extended(
     let path_size = ImageResizeQuery {
         max_width: max_width.parse().ok(),
         max_height: max_height.parse().ok(),
+        api_key: None,
     };
     let size = query_size.normalized().or_else(|| path_size.normalized());
-    let response =
-        item_image_or_placeholder(&state, &item_id, &image_type, image_index, size).await?;
+    let response = item_image_or_placeholder(
+        &state,
+        &item_id,
+        &image_type,
+        image_index,
+        ItemImageRequest {
+            resize: size,
+            headers: &headers,
+            query_token: query_size.api_key.as_deref(),
+            allow_plugin_vod_fill: method == axum::http::Method::GET,
+        },
+    )
+    .await?;
     Ok(conditional_image_response(&headers, response))
 }
 
@@ -60972,13 +61025,72 @@ async fn item_image_from_plugins(
     Ok(None)
 }
 
+fn plugin_vod_grid_image_admission() -> Arc<Semaphore> {
+    Arc::clone(
+        PLUGIN_VOD_GRID_IMAGE_ADMISSION
+            .get_or_init(|| Arc::new(Semaphore::new(PLUGIN_VOD_GRID_IMAGE_MAX_IN_FLIGHT))),
+    )
+}
+
+/// Progressively fills an authenticated plugin-VOD grid without letting one page fan out an
+/// unbounded number of credentialed provider calls. The provider JIT lane remains serial; this
+/// outer admission bound caps queued HTTP work. Running the fill in a detached Tokio task means a
+/// browser cancelling an image request does not cancel the credentialed RPC midway or discard an
+/// image that is already being validated and written.
+async fn hydrate_plugin_vod_grid_image(
+    state: &AppState,
+    item: &MediaItem,
+    metadata: &serde_json::Value,
+    request_headers: &HeaderMap,
+    query_token: Option<&str>,
+) -> Result<Option<PathBuf>, ApiError> {
+    if require_request_user(&state.db, request_headers, query_token)
+        .await
+        .is_err()
+    {
+        return Ok(None);
+    }
+    let Some(target) = plugin_vod_item_metadata_target(item, metadata) else {
+        return Ok(None);
+    };
+    let Ok(permit) = plugin_vod_grid_image_admission().try_acquire_owned() else {
+        return Ok(None);
+    };
+    let state = state.clone();
+    let owner_id = target.owner_id.clone();
+    let mut fill = tokio::spawn(async move {
+        let _permit = permit;
+        if let Err(error) = ensure_plugin_vod_metadata(&state, &target).await {
+            tracing::warn!(
+                status = %error.status(),
+                "VOD grid artwork enrichment was unavailable"
+            );
+            return Ok(None);
+        }
+        find_stored_image(&state, ImageOwner::Item(&owner_id), "Primary", 0).await
+    });
+    match tokio::time::timeout(PLUGIN_VOD_GRID_IMAGE_WAIT_TIMEOUT, &mut fill).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Ok(None),
+        // Dropping JoinHandle detaches rather than aborts the task. The bounded fill completes in
+        // the background and the next browser request or refresh reads the durable cache entry.
+        Err(_) => Ok(None),
+    }
+}
+
 async fn item_image_or_placeholder(
     state: &AppState,
     item_id: &str,
     image_type: &str,
     image_index: usize,
-    resize: Option<ImageResize>,
+    request: ItemImageRequest<'_>,
 ) -> Result<axum::response::Response, ApiError> {
+    let ItemImageRequest {
+        resize,
+        headers: request_headers,
+        query_token,
+        allow_plugin_vod_fill,
+    } = request;
     if let Some(item) = live_tv_item_for_image(&state.db, item_id).await? {
         if let Some(response) =
             live_tv_item_image_response(state, &item, image_type, image_index).await?
@@ -61030,8 +61142,18 @@ async fn item_image_or_placeholder(
     {
         return Ok(response);
     }
-    // Grid image requests must never wait for a credentialed provider RPC. Item detail/playback
-    // enrichment populates the cache; until then the UI receives a cheap placeholder.
+    if allow_plugin_vod_fill
+        && is_plugin_vod_virtual_item(&item)
+        && image_index == 0
+        && normalize_image_type(image_type).eq_ignore_ascii_case("primary")
+        && let Some(path) =
+            hydrate_plugin_vod_grid_image(state, &item, &metadata, request_headers, query_token)
+                .await?
+    {
+        return stored_image_response_sized(state, path, resize).await;
+    }
+    // Unauthenticated, saturated or failed grid requests receive a cheap placeholder. A bounded
+    // authenticated fill may still be completing in the background after its HTTP wait expires.
     if let Some(local_image) = find_local_item_image(&item, image_type, image_index).await? {
         return stored_image_response_sized(state, local_image, resize).await;
     }
@@ -61048,6 +61170,13 @@ async fn item_image_or_placeholder(
         return stored_image_response_sized(state, generated_image, resize).await;
     }
     Ok(placeholder_png_response())
+}
+
+struct ItemImageRequest<'a> {
+    resize: Option<ImageResize>,
+    headers: &'a HeaderMap,
+    query_token: Option<&'a str>,
+    allow_plugin_vod_fill: bool,
 }
 
 async fn find_local_item_image(
@@ -64123,6 +64252,7 @@ mod tests {
             super::ImageResizeQuery {
                 max_width: Some(200),
                 max_height: None,
+                api_key: None,
             }
             .normalized(),
             Some(super::ImageResize {
@@ -64134,6 +64264,7 @@ mod tests {
             super::ImageResizeQuery {
                 max_width: Some(99_999),
                 max_height: Some(0),
+                api_key: None,
             }
             .normalized(),
             Some(super::ImageResize {
@@ -67320,6 +67451,117 @@ mod tests {
         .await
         .expect("VOD movies library and fixture item were not published");
         (db, tmp, api_key, movie_id)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial(plugin_host)]
+    async fn authenticated_plugin_vod_grid_image_progressively_fills_cache_once() {
+        let plugin_id = "66666666-7777-4888-9999-000000000000";
+        let (db, tmp, api_key, movie_id) = prepare_vod_playback_environment(plugin_id).await;
+        let expected_image = test_distinct_png_bytes();
+        let mut proxy_response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            expected_image.len()
+        )
+        .into_bytes();
+        proxy_response.extend_from_slice(&expected_image);
+        let (proxy_endpoint, image_request) = spawn_single_raw_http_response(proxy_response).await;
+        let _proxy_guard =
+            ProviderEgressProxyGuard::set(proxy_endpoint.trim_end_matches("/image").to_string());
+        let image_url = "http://artwork.invalid/channel-image.png".to_string();
+        tokio::fs::write(tmp.path().join("vod-image-url"), &image_url)
+            .await
+            .unwrap();
+        let app = router(AppState {
+            db: db.clone(),
+            web_dir: ".".into(),
+            log_dir: tmp.path().join("logs"),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+        let image_uri = format!("/Items/{}/Images/Primary", movie_id.simple());
+        let authenticated_image_uri = format!("{image_uri}?api_key={api_key}");
+
+        // Public image routes may serve already-cached bytes, but cannot initiate a credentialed
+        // provider call without an authenticated Jellyfin request.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&image_uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let public_body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_ne!(public_body.as_ref(), expected_image.as_slice());
+        let invokes_before = tokio::fs::read_to_string(tmp.path().join("external-invokes"))
+            .await
+            .unwrap();
+        assert_eq!(
+            invokes_before
+                .lines()
+                .filter(|line| line.contains("\"Action\":\"ResolveMetadata\""))
+                .count(),
+            0
+        );
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&authenticated_image_uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let authenticated_body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(authenticated_body.as_ref(), expected_image.as_slice());
+        let upstream_request = image_request.await.unwrap();
+        assert!(upstream_request.starts_with(&format!("GET {image_url} HTTP/1.1")));
+
+        // A repeat is served from the durable image cache and must not invoke either metadata or
+        // the remote image endpoint again.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&authenticated_image_uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let cached_body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(cached_body.as_ref(), expected_image.as_slice());
+        let invokes = tokio::fs::read_to_string(tmp.path().join("external-invokes"))
+            .await
+            .unwrap();
+        assert_eq!(
+            invokes
+                .lines()
+                .filter(|line| line.contains("\"Action\":\"ResolveMetadata\""))
+                .count(),
+            1
+        );
+        let metadata = super::metadata_payload_for_item(&db, movie_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            super::json_field_case_insensitive(&metadata, "PluginVodImageAvailable")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        let metadata_text = serde_json::to_string(&metadata).unwrap();
+        assert!(!metadata_text.contains(&image_url));
+        assert!(!metadata_text.contains("http://"));
+
+        super::stop_external_plugin_host(plugin_id).await;
     }
 
     #[cfg(unix)]
@@ -71271,10 +71513,20 @@ while IFS= read -r line; do
         *'"Action":"ResolveMetadata"'*)
           case "$line" in
             *'"ProviderReference":"provider:v1:movie-1"'*)
-              printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"Status":"Executed","Metadata":{"Overview":"Movie metadata","RuntimeTicks":54000000000}}}}\n' "$corr"
+              image_url="$(cat '__IMAGE_URL_FILE__' 2>/dev/null)"
+              if [ -n "$image_url" ]; then
+                printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"Status":"Executed","Metadata":{"Overview":"Movie metadata","RuntimeTicks":54000000000,"ImageUrl":"%s"}}}}\n' "$corr" "$image_url"
+              else
+                printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"Status":"Executed","Metadata":{"Overview":"Movie metadata","RuntimeTicks":54000000000}}}}\n' "$corr"
+              fi
               ;;
             *'"ProviderReference":"provider:v1:episode-1"'*)
-              printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"Status":"Executed","Metadata":{"Overview":"Episode metadata","RuntimeTicks":27000000000}}}}\n' "$corr"
+              image_url="$(cat '__IMAGE_URL_FILE__' 2>/dev/null)"
+              if [ -n "$image_url" ]; then
+                printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"Status":"Executed","Metadata":{"Overview":"Episode metadata","RuntimeTicks":27000000000,"ImageUrl":"%s"}}}}\n' "$corr" "$image_url"
+              else
+                printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"Status":"Executed","Metadata":{"Overview":"Episode metadata","RuntimeTicks":27000000000}}}}\n' "$corr"
+              fi
               ;;
             *)
               printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"Status":"Failed","Error":"unknown provider reference"}}}\n' "$corr"
@@ -71363,6 +71615,10 @@ done
         .replace(
             "__SUBTITLE_URL_FILE__",
             &root.join("vod-subtitle-url").to_string_lossy(),
+        )
+        .replace(
+            "__IMAGE_URL_FILE__",
+            &root.join("vod-image-url").to_string_lossy(),
         );
         tokio::fs::write(&path, script).await.unwrap();
         let mut permissions = tokio::fs::metadata(&path).await.unwrap().permissions();
@@ -71654,12 +71910,46 @@ done
         ]
     }
 
+    fn test_distinct_png_bytes() -> Vec<u8> {
+        let image = image::RgbaImage::from_pixel(2, 1, image::Rgba([220, 40, 60, 255]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        bytes.into_inner()
+    }
+
     // These guards mutate process-global statics (TEST_RUST_WASI_HOST_BINARY_PATH and
     // TEST_DOTNET_HOST_BINARY_PATH).  Tests that set them carry #[serial(plugin_host)] so
     // they never run concurrently; without serialisation concurrent tests can read a
     // neighbour's host path and fail with assertion or 500 errors.
     struct RustWasiHostPathGuard {
         previous: Option<PathBuf>,
+    }
+
+    struct ProviderEgressProxyGuard {
+        previous: Option<String>,
+    }
+
+    impl ProviderEgressProxyGuard {
+        fn set(proxy: String) -> Self {
+            let mut configured = super::TEST_PROVIDER_EGRESS_PROXY
+                .get_or_init(|| std::sync::Mutex::new(None))
+                .lock()
+                .expect("test provider egress proxy lock poisoned");
+            Self {
+                previous: configured.replace(proxy),
+            }
+        }
+    }
+
+    impl Drop for ProviderEgressProxyGuard {
+        fn drop(&mut self) {
+            *super::TEST_PROVIDER_EGRESS_PROXY
+                .get_or_init(|| std::sync::Mutex::new(None))
+                .lock()
+                .expect("test provider egress proxy lock poisoned") = self.previous.take();
+        }
     }
 
     impl RustWasiHostPathGuard {
