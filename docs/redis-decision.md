@@ -143,6 +143,12 @@ contenido idéntico. El contenedor terminó `healthy`, sin reinicios ni OOM. Est
 25–30 veces en caliente sí supera el umbral de activación para una proyección compartida por
 muchos usuarios; no justifica cachear respuestas personalizadas.
 
+Una ráfaga adicional de 32 solicitudes simultáneas con la clave vacía terminó 32/32 en 200, con
+un único payload y p95 de 240 ms durante el fill frío. Redis observó 33 misses y 31 hits por el
+recheck bajo lock, pero exactamente **un** `SET`: el single-flight evitó que los 32 solicitantes
+repitieran en paralelo la proyección PostgreSQL. Tras ese fill todos comparten la lectura caliente
+de 6–8 ms hasta el TTL.
+
 Los resultados completos, incluidos imágenes, gzip e índices, están en
 [`catalog-performance.md`](catalog-performance.md).
 

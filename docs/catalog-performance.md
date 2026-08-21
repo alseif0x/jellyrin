@@ -101,6 +101,8 @@ hits confirmados, cero errores y unos 645 KiB usados por Redis. Con Redis deteni
 desde PostgreSQL en 205 ms; tras recuperarlo, el ciclo repoblación→hit midió 186 ms→6 ms. Los
 payloads fueron idénticos en todas las rutas y Jellyrin no se reinició. Estos números validan el
 uso compartido para muchos usuarios sin convertir Redis en dependencia de disponibilidad.
+En una ráfaga fría de 32 peticiones simultáneas, todas respondieron 200 con contenido idéntico y
+Redis ejecutó un solo `SET`; el single-flight convirtió el stampede potencial en un único fill.
 
 Las cachés adecuadas siguen siendo específicas y cerca del propietario:
 
