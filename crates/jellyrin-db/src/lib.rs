@@ -22,7 +22,9 @@ use jellyrin_core::{
     effective_media_item_type,
 };
 #[cfg(any(test, feature = "sqlite"))]
-use jellyrin_core::{StartupConfig, tv_episode_path_info};
+use jellyrin_core::{
+    StartupConfig, compare_tv_episode_items, tv_episode_path_info, tv_episode_series_key,
+};
 use jellyrin_transcode::{
     BoundedCommandOutputError, BoundedCommandOutputOptions, TranscodeJobPermit,
     acquire_multimedia_probe, run_bounded_command_output,
@@ -912,6 +914,17 @@ pub struct MediaItemCatalogPage {
 pub struct TvSeriesCatalogPage {
     pub series: Vec<TvSeriesCatalogKey>,
     pub episodes: Vec<MediaItemCatalogEntry>,
+    pub total_record_count: usize,
+    pub start_index: usize,
+}
+
+/// A bounded page of the first visible unplayed episode for each TV series.
+///
+/// Items intentionally omit `media_streams`; callers hydrate only this bounded page before
+/// serializing it.
+#[derive(Debug, Clone)]
+pub struct TvNextUpPage {
+    pub items: Vec<MediaItem>,
     pub total_record_count: usize,
     pub start_index: usize,
 }
@@ -1897,6 +1910,15 @@ pub trait MediaCatalogStore: DatabaseBackend {
         user_id: Uuid,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItem>>> + Send + '_;
 
+    /// Database-paged form of the common `/Shows/NextUp` request.
+    fn tv_next_up_candidate_page(
+        &self,
+        user_id: Uuid,
+        start_index: usize,
+        limit: usize,
+        include_total_record_count: bool,
+    ) -> impl std::future::Future<Output = anyhow::Result<TvNextUpPage>> + Send + '_;
+
     /// Exact visible items for a bounded id list, preserving the caller's order.
     fn media_items_by_ids<'a>(
         &'a self,
@@ -2071,6 +2093,22 @@ impl MediaCatalogStore for PostgresDatabase {
         user_id: Uuid,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItem>>> + Send + '_ {
         PostgresDatabase::tv_next_up_candidate_items(self, user_id)
+    }
+
+    fn tv_next_up_candidate_page(
+        &self,
+        user_id: Uuid,
+        start_index: usize,
+        limit: usize,
+        include_total_record_count: bool,
+    ) -> impl std::future::Future<Output = anyhow::Result<TvNextUpPage>> + Send + '_ {
+        PostgresDatabase::tv_next_up_candidate_page(
+            self,
+            user_id,
+            start_index,
+            limit,
+            include_total_record_count,
+        )
     }
 
     fn media_items_by_ids<'a>(
@@ -2267,6 +2305,22 @@ impl MediaCatalogStore for SqliteDatabase {
         user_id: Uuid,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItem>>> + Send + '_ {
         SqliteDatabase::tv_next_up_candidate_items(self, user_id)
+    }
+
+    fn tv_next_up_candidate_page(
+        &self,
+        user_id: Uuid,
+        start_index: usize,
+        limit: usize,
+        include_total_record_count: bool,
+    ) -> impl std::future::Future<Output = anyhow::Result<TvNextUpPage>> + Send + '_ {
+        SqliteDatabase::tv_next_up_candidate_page(
+            self,
+            user_id,
+            start_index,
+            limit,
+            include_total_record_count,
+        )
     }
 
     fn media_items_by_ids<'a>(
@@ -10056,6 +10110,48 @@ impl SqliteDatabase {
             u64::try_from(items.len()).unwrap_or(u64::MAX)
         });
         result
+    }
+
+    /// SQLite/test implementation of the bounded NextUp page.
+    ///
+    /// Production PostgreSQL performs grouping, ordering and paging in SQL. SQLite retains the
+    /// exact compatibility parser here so both adapters expose the same repository contract.
+    pub async fn tv_next_up_candidate_page(
+        &self,
+        user_id: Uuid,
+        start_index: usize,
+        limit: usize,
+        include_total_record_count: bool,
+    ) -> anyhow::Result<TvNextUpPage> {
+        let candidates = self.tv_next_up_candidate_items(user_id).await?;
+        let mut next_by_series = HashMap::<String, MediaItem>::new();
+        for candidate in candidates {
+            if effective_media_item_type(&candidate) != "Episode" {
+                continue;
+            }
+            let key = tv_episode_series_key(&candidate);
+            match next_by_series.get(&key) {
+                Some(existing)
+                    if compare_tv_episode_items(existing, &candidate)
+                        != std::cmp::Ordering::Greater => {}
+                _ => {
+                    next_by_series.insert(key, candidate);
+                }
+            }
+        }
+        let mut items = next_by_series.into_values().collect::<Vec<_>>();
+        items.sort_by(compare_tv_episode_items);
+        let total_record_count = if include_total_record_count {
+            items.len()
+        } else {
+            0
+        };
+        let items = items.into_iter().skip(start_index).take(limit).collect();
+        Ok(TvNextUpPage {
+            items,
+            total_record_count,
+            start_index,
+        })
     }
 
     /// Exact visible items for a bounded id list, preserving the caller's order.

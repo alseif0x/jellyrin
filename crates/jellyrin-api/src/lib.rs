@@ -35408,6 +35408,34 @@ async fn shows_next_up(
     }
 
     let common_next_up_query = is_common_next_up_query(&query);
+    if common_next_up_query
+        && query.series_id.is_none()
+        && let Some(limit) = query.limit
+    {
+        let start_index = query.start_index.unwrap_or(0);
+        let candidate_page = MediaCatalogStore::tv_next_up_candidate_page(
+            &state.db,
+            requested_user_id,
+            start_index,
+            limit,
+            query_flag(&query._enable_total_record_count).unwrap_or(true),
+        )
+        .await?;
+        let page_ids = candidate_page
+            .items
+            .iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
+        let page = MediaCatalogStore::media_items_by_ids(&state.db, &page_ids).await?;
+        let server_id = state.db.server_state().await?.server_id.to_string();
+        let items =
+            items_to_json(&state.db, page, &server_id, Some(requested_user_id), false).await?;
+        return Ok(Json(query_result_with_total(
+            items,
+            candidate_page.total_record_count,
+            candidate_page.start_index,
+        )));
+    }
     let mut prefetched_metadata = HashMap::new();
     // Only the SeriesId filter reads candidate metadata. Without it nothing downstream touches the
     // streams or metadata payloads before paging, so leave both unfetched and hydrate the retained
@@ -98624,6 +98652,26 @@ done
         assert_eq!(next_up["Items"][0]["MediaStreams"][0]["Width"], 1920);
         assert_eq!(next_up["Items"][0]["RunTimeTicks"], 12_345_000_000_i64);
         let series_id = next_up["Items"][0]["SeriesId"].as_str().unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/shows/nextup?UserId={}&Limit=1&EnableTotalRecordCount=false",
+                        user.id
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let next_up_without_total: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(next_up_without_total["TotalRecordCount"], 0);
+        assert_eq!(next_up_without_total["Items"].as_array().unwrap().len(), 1);
 
         let response = app
             .clone()
