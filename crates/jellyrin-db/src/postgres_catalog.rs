@@ -2937,7 +2937,7 @@ impl PostgresDatabase {
                 LEFT JOIN LATERAL (
                     SELECT candidate.item_id, candidate.virtual_folder_id,
                            candidate.item_name, candidate.item_path,
-                           series.series_name, series.series_id, series.virtual_folder_id
+                           series.series_name, series.series_id
                     FROM media_item_tv_series AS series
                     JOIN LATERAL (
                         SELECT member.item_id, member.virtual_folder_id,
