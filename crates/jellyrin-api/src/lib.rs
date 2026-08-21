@@ -39119,7 +39119,10 @@ async fn playback_transcode_info_response(
     let input_relay = if is_xtream_remote_media(metadata) || is_plugin_vod_remote_media(metadata) {
         Some(register_internal_remote_relay(
             state,
-            InternalRemoteRelayTarget::MediaItem(item.id),
+            InternalRemoteRelayTarget::MediaItem {
+                item_id: item.id,
+                user_context: Some(plugin_user_context(user, token)),
+            },
             INTERNAL_REMOTE_RELAY_TRANSCODE_TTL,
         )?)
     } else {
@@ -44672,7 +44675,7 @@ async fn audio_hls_segment_response(
     if !item_container.eq_ignore_ascii_case(container) {
         return Err(ApiError::not_found("Audio HLS segment not found"));
     }
-    stream_resolved_media_item(state, item, headers, true).await
+    stream_resolved_media_item(state, item, headers, true, None).await
 }
 
 async fn audio_hls_legacy_segment_response(
@@ -47337,7 +47340,10 @@ async fn active_hls_transcode_session_for_live_tv(
     } else if uses_opaque_provider {
         let relay = register_internal_remote_relay(
             state,
-            InternalRemoteRelayTarget::LiveTvChannel(channel_id.to_string()),
+            InternalRemoteRelayTarget::LiveTvChannel {
+                channel_id: channel_id.to_string(),
+                user_context: None,
+            },
             INTERNAL_REMOTE_RELAY_TRANSCODE_TTL,
         )?;
         (relay.url().to_string(), None, None, Some(relay))
@@ -47508,7 +47514,8 @@ async fn direct_stream_media(
     media_type: &str,
     include_body: bool,
 ) -> Result<axum::response::Response, ApiError> {
-    require_request_user(&state.db, headers, api_key).await?;
+    let (user, token) = require_user(&state.db, headers, api_key).await?;
+    let user_context = Some(plugin_user_context(&user, &token));
     // Some Jellyfin clients ignore DirectStreamUrl and synthesize /Videos/{id}/stream.* from the
     // media-source id. Keep that native-client fallback working for opaque Live TV ids as well.
     if media_type == "Video"
@@ -47530,7 +47537,7 @@ async fn direct_stream_media(
         )));
     }
 
-    stream_resolved_media_item(state, item, headers, include_body).await
+    stream_resolved_media_item(state, item, headers, include_body, user_context).await
 }
 
 pub(crate) async fn stream_resolved_media_item(
@@ -47538,6 +47545,7 @@ pub(crate) async fn stream_resolved_media_item(
     item: MediaItem,
     headers: &HeaderMap,
     include_body: bool,
+    user_context: Option<jellyrin_plugin_sdk::PluginUserContext>,
 ) -> Result<axum::response::Response, ApiError> {
     if is_xtream_virtual_item(&item) {
         let metadata_by_item =
@@ -47565,7 +47573,8 @@ pub(crate) async fn stream_resolved_media_item(
             .ok_or_else(|| {
                 ApiError::service_unavailable("VOD provider playback route is unavailable")
             })?;
-        return stream_plugin_vod_media(state, &reference, headers, include_body).await;
+        return stream_plugin_vod_media(state, &reference, headers, include_body, user_context)
+            .await;
     }
 
     stream_media_item(item, headers, include_body).await
@@ -47579,6 +47588,7 @@ async fn stream_plugin_vod_media(
     reference: &PluginVodRemoteReference,
     headers: &HeaderMap,
     include_body: bool,
+    user_context: Option<jellyrin_plugin_sdk::PluginUserContext>,
 ) -> Result<axum::response::Response, ApiError> {
     for attempt in 0..2 {
         let playback = resolve_plugin_vod_playback(
@@ -47586,7 +47596,7 @@ async fn stream_plugin_vod_media(
             &reference.plugin_id,
             &reference.tuner_id,
             &reference.provider_reference,
-            None,
+            user_context.clone(),
         )
         .await?;
         if !opaque_live_tv_delivery_is_safe_for_direct_proxy(&playback) {
@@ -47788,7 +47798,10 @@ async fn internal_remote_media_response(
     let target = internal_remote_relay_target(token)
         .ok_or_else(|| ApiError::not_found("remote media relay not found"))?;
     match target {
-        InternalRemoteRelayTarget::MediaItem(item_id) => {
+        InternalRemoteRelayTarget::MediaItem {
+            item_id,
+            user_context,
+        } => {
             let item = state.db.media_item_by_id(item_id).await?;
             if !is_xtream_virtual_item(&item) && !is_plugin_vod_virtual_item(&item) {
                 return Err(ApiError::not_found("remote media relay not found"));
@@ -47796,9 +47809,12 @@ async fn internal_remote_media_response(
             // Both virtual-item kinds share the library streaming pipeline: Xtream resolves its
             // cached source URL; plugin-VOD resolves a fresh signed URL through the provider
             // gate and the sensitive remote proxy.
-            stream_resolved_media_item(state, item, headers, include_body).await
+            stream_resolved_media_item(state, item, headers, include_body, user_context).await
         }
-        InternalRemoteRelayTarget::LiveTvChannel(channel_id) => {
+        InternalRemoteRelayTarget::LiveTvChannel {
+            channel_id,
+            user_context: _,
+        } => {
             let channel = live_tv_channel_by_id(&state.db, &channel_id).await?;
             let mut response = stream_live_tv_channel(channel, headers, &state.db).await?;
             if !include_body {
@@ -48160,13 +48176,20 @@ async fn library_item_file_response(
     media_source_id: Option<&str>,
     download: bool,
 ) -> Result<axum::response::Response, ApiError> {
-    require_request_user(&state.db, headers, api_key).await?;
+    let (user, token) = require_user(&state.db, headers, api_key).await?;
     let requested_item = media_item_by_id(&state.db, item_id).await?;
     let item = resolve_media_source_item(&state.db, requested_item, media_source_id)
         .await?
         .ok_or_else(|| ApiError::not_found("File not found"))?;
     let file_name = download.then(|| media_item_download_file_name(&item));
-    let mut response = stream_resolved_media_item(state, item, headers, true).await?;
+    let mut response = stream_resolved_media_item(
+        state,
+        item,
+        headers,
+        true,
+        Some(plugin_user_context(&user, &token)),
+    )
+    .await?;
     if let Some(file_name) = file_name {
         response.headers_mut().insert(
             header::CONTENT_DISPOSITION,
@@ -56623,10 +56646,39 @@ struct ResolvedXtreamSource {
     source_revision: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum InternalRemoteRelayTarget {
-    MediaItem(Uuid),
-    LiveTvChannel(String),
+    MediaItem {
+        item_id: Uuid,
+        user_context: Option<jellyrin_plugin_sdk::PluginUserContext>,
+    },
+    LiveTvChannel {
+        channel_id: String,
+        user_context: Option<jellyrin_plugin_sdk::PluginUserContext>,
+    },
+}
+
+impl std::fmt::Debug for InternalRemoteRelayTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MediaItem {
+                item_id,
+                user_context,
+            } => formatter
+                .debug_struct("MediaItem")
+                .field("item_id", item_id)
+                .field("user_context_present", &user_context.is_some())
+                .finish(),
+            Self::LiveTvChannel {
+                channel_id,
+                user_context,
+            } => formatter
+                .debug_struct("LiveTvChannel")
+                .field("channel_id", channel_id)
+                .field("user_context_present", &user_context.is_some())
+                .finish(),
+        }
+    }
 }
 
 struct InternalRemoteRelayEntry {
@@ -56787,7 +56839,10 @@ async fn ensure_plugin_vod_media_runtime(
     };
     let relay = register_internal_remote_relay(
         state,
-        InternalRemoteRelayTarget::MediaItem(item.id),
+        InternalRemoteRelayTarget::MediaItem {
+            item_id: item.id,
+            user_context: None,
+        },
         INTERNAL_REMOTE_RELAY_PROBE_TTL,
     )?;
     let media_info =
@@ -57093,7 +57148,10 @@ async fn ensure_live_tv_stream_probe(
     };
     let relay = register_internal_remote_relay(
         state,
-        InternalRemoteRelayTarget::LiveTvChannel(channel_id.clone()),
+        InternalRemoteRelayTarget::LiveTvChannel {
+            channel_id: channel_id.clone(),
+            user_context: None,
+        },
         INTERNAL_REMOTE_RELAY_PROBE_TTL,
     )?;
     let observed_at = OffsetDateTime::now_utc();
@@ -57229,7 +57287,10 @@ async fn ensure_xtream_remote_media_info(
     };
     let probe_relay = register_internal_remote_relay(
         state,
-        InternalRemoteRelayTarget::MediaItem(item.id),
+        InternalRemoteRelayTarget::MediaItem {
+            item_id: item.id,
+            user_context: None,
+        },
         INTERNAL_REMOTE_RELAY_PROBE_TTL,
     )?;
     let media_info =
@@ -57551,7 +57612,10 @@ pub(crate) async fn media_process_input(
     }
     let relay = register_internal_remote_relay(
         state,
-        InternalRemoteRelayTarget::MediaItem(item.id),
+        InternalRemoteRelayTarget::MediaItem {
+            item_id: item.id,
+            user_context: None,
+        },
         relay_ttl,
     )?;
     Ok(MediaProcessInput {
@@ -62566,6 +62630,22 @@ mod tests {
         xtream_probe_lock_for, xtream_remote_media_probe_current, xtream_remote_source_revision,
         xtream_vod_info_current,
     };
+
+    #[test]
+    fn internal_remote_relay_debug_redacts_plugin_user_context() {
+        let target = InternalRemoteRelayTarget::MediaItem {
+            item_id: Uuid::nil(),
+            user_context: Some(jellyrin_plugin_sdk::PluginUserContext {
+                user_id: "private-user-canary".to_string(),
+                device_id: "private-device-canary".to_string(),
+                is_administrator: false,
+            }),
+        };
+        let debug = format!("{target:?}");
+        assert!(debug.contains("user_context_present: true"));
+        assert!(!debug.contains("private-user-canary"));
+        assert!(!debug.contains("private-device-canary"));
+    }
     use crate::Database;
     use crate::dlna;
     use crate::live_tv_xtream::{
@@ -65177,7 +65257,11 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             assert!(
                 !relay_registry.values().any(|entry| {
-                    entry.target == super::InternalRemoteRelayTarget::MediaItem(movie_id)
+                    matches!(
+                        &entry.target,
+                        super::InternalRemoteRelayTarget::MediaItem { item_id, .. }
+                            if *item_id == movie_id
+                    )
                 }),
                 "the bounded probe relay lease must be removed after the request completes"
             );
@@ -105219,7 +105303,10 @@ done
         let token = input.as_str().rsplit('/').next().unwrap();
         assert_eq!(
             internal_remote_relay_target(token),
-            Some(InternalRemoteRelayTarget::MediaItem(item.id))
+            Some(InternalRemoteRelayTarget::MediaItem {
+                item_id: item.id,
+                user_context: None,
+            })
         );
         let persisted = db
             .media_item_metadata_by_item_ids(&HashSet::from([item.id]))
