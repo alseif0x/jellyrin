@@ -34,6 +34,12 @@ provider-authenticated token — never a URL — and resolves ephemeral playback
 URLs just in time through the `ResolvePlayback` action. Imported items are
 sanitised onto the SDK contract, persisted through the transactional remote
 media catalog staging, and never carry credentials, licenses or signed URLs.
+One plugin may own multiple configured tuner instances. A catalog refresh
+enumerates those instances in stable tuner-id order, locks every instance, and
+imports each scoped grant into the same transaction. Item metadata retains its
+originating tuner id so JIT playback returns to the correct secret boundary.
+The visible movie/series snapshots publish only after every instance succeeds;
+an incomplete refresh leaves the previous complete snapshots visible.
 VOD playback reuses the live-TV delivery contract: only `DirectProxy` of
 MPEG-TS is accepted, fail-closed.
 
