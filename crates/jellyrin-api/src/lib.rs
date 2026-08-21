@@ -166,11 +166,13 @@ use jellyrin_plugin_rpc::{
     PluginRpcErrorCode, PluginRpcMethod, PluginRuntime, PluginWebPage, UpdateConfigurationRequest,
 };
 use jellyrin_plugin_sdk::{
-    CAPABILITY_LIVE_TV_PROVIDER, CAPABILITY_VOD_LIBRARY_PROVIDER, LiveTvDeliveryCapabilities,
-    LiveTvPlaybackContext, LiveTvPlaybackDelivery, LiveTvPlaybackResult, LiveTvProviderRequest,
-    LiveTvProviderSecretGrant, PERMISSION_PROVIDER_SECRETS, SensitiveString, SensitiveUrl,
-    VOD_ITEM_TYPE_EPISODE, VOD_ITEM_TYPE_MOVIE, VOD_ITEM_TYPE_SERIES, VodLibraryProviderRequest,
-    VodMediaItem, VodPlaybackContext, VodPlaybackResult,
+    CAPABILITY_LIVE_TV_PROVIDER, CAPABILITY_USER_CATALOG_AUTHORIZATION,
+    CAPABILITY_VOD_LIBRARY_PROVIDER, LiveTvDeliveryCapabilities, LiveTvPlaybackContext,
+    LiveTvPlaybackDelivery, LiveTvPlaybackResult, LiveTvProviderRequest, LiveTvProviderSecretGrant,
+    PERMISSION_PROVIDER_SECRETS, PluginUserAuthorizationRequest, PluginUserAuthorizationResult,
+    SensitiveString, SensitiveUrl, VOD_ITEM_TYPE_EPISODE, VOD_ITEM_TYPE_MOVIE,
+    VOD_ITEM_TYPE_SERIES, VodLibraryProviderRequest, VodMediaItem, VodPlaybackContext,
+    VodPlaybackResult,
 };
 use jellyrin_transcode::{
     BoundedCommandOutputError, BoundedCommandOutputOptions,
@@ -11890,6 +11892,221 @@ async fn invoke_installed_plugin_capability_via_runtime_host(
     invoke_plugin_capability_via_runtime_host(&plugin, capability, arguments).await
 }
 
+/// Delegates per-user catalog visibility to plugins that explicitly advertise the optional
+/// authorization capability. Plugins without it preserve the historical visible-to-all behavior.
+/// A declared capability is fail-closed: malformed, unavailable or missing decisions deny access.
+async fn plugin_user_may_access_tuner_catalog(
+    db: &Database,
+    plugin_id: &str,
+    tuner_id: &str,
+    user_context: jellyrin_plugin_sdk::PluginUserContext,
+) -> Result<bool, ApiError> {
+    let Some(plugin) = db.installed_plugin_json(plugin_id).await? else {
+        return Ok(false);
+    };
+    if !json_string_field(&plugin, "Status")
+        .is_some_and(|status| status.eq_ignore_ascii_case("Active"))
+    {
+        return Ok(false);
+    }
+    if !plugin_string_array(plugin.get("Capabilities"))
+        .iter()
+        .any(|capability| capability.eq_ignore_ascii_case(CAPABILITY_USER_CATALOG_AUTHORIZATION))
+    {
+        return Ok(true);
+    }
+    let Some(configuration) = db.live_tv_tuner_configuration_by_id(tuner_id).await? else {
+        return Ok(false);
+    };
+    let provider_type = json_string_field(&configuration, "Type")
+        .ok_or_else(|| ApiError::service_unavailable("Plugin tuner route is unavailable"))?;
+    let Some(routed_plugin_id) = live_tv_plugin_id_from_payload(&configuration, &provider_type)
+    else {
+        return Ok(false);
+    };
+    if !routed_plugin_id.eq_ignore_ascii_case(plugin_id) {
+        return Ok(false);
+    }
+    let provider_config = redacted_live_tv_plugin_tuner_config(configuration)?;
+    let config_bytes = serde_json::to_vec(&provider_config)
+        .map_err(|_| ApiError::internal("Invalid plugin tuner configuration"))?;
+    let cache_key = format!(
+        "{}:{}:{}:{}:{:016x}",
+        plugin_id.to_ascii_lowercase(),
+        tuner_id.to_ascii_lowercase(),
+        user_context.user_id,
+        user_context.is_administrator,
+        fnv1a64(&config_bytes, 0x82a2_b175_229d_6a5b),
+    );
+    let now = StdInstant::now();
+    {
+        let mut cache = plugin_catalog_authorization_cache().lock().await;
+        cache.retain(|_, entry| entry.expires_at > now);
+        if let Some(entry) = cache.get(&cache_key) {
+            return Ok(entry.allowed);
+        }
+    }
+    let request = PluginUserAuthorizationRequest::authorize_catalog(provider_config, user_context);
+    let arguments = serde_json::to_value(request)
+        .map_err(|_| ApiError::internal("Invalid plugin catalog authorization request"))?;
+    let Some(result) = invoke_installed_plugin_capability_via_runtime_host(
+        db,
+        &plugin,
+        CAPABILITY_USER_CATALOG_AUTHORIZATION,
+        arguments,
+    )
+    .await?
+    else {
+        return Ok(false);
+    };
+    let decision = serde_json::from_value::<PluginUserAuthorizationResult>(serde_json::json!({
+        "Allowed": json_field_case_insensitive(&result.value, "Allowed")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    }))
+    .map_err(|_| ApiError::service_unavailable("Plugin catalog authorization is invalid"))?;
+    let mut cache = plugin_catalog_authorization_cache().lock().await;
+    if cache.len() >= 4_096 {
+        cache.clear();
+    }
+    cache.insert(
+        cache_key,
+        PluginCatalogAuthorizationCacheEntry {
+            allowed: decision.allowed,
+            expires_at: StdInstant::now() + StdDuration::from_secs(15),
+        },
+    );
+    Ok(decision.allowed)
+}
+
+#[derive(Clone, Copy)]
+struct PluginCatalogAuthorizationCacheEntry {
+    allowed: bool,
+    expires_at: StdInstant,
+}
+
+fn plugin_catalog_authorization_cache()
+-> &'static tokio::sync::Mutex<HashMap<String, PluginCatalogAuthorizationCacheEntry>> {
+    static CACHE: OnceLock<
+        tokio::sync::Mutex<HashMap<String, PluginCatalogAuthorizationCacheEntry>>,
+    > = OnceLock::new();
+    CACHE.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+}
+
+async fn release_plugin_user_device_lease(
+    db: &Database,
+    plugin_id: &str,
+    tuner_id: &str,
+    user_context: jellyrin_plugin_sdk::PluginUserContext,
+) -> Result<(), ApiError> {
+    let Some(plugin) = db.installed_plugin_json(plugin_id).await? else {
+        return Ok(());
+    };
+    if !json_string_field(&plugin, "Status")
+        .is_some_and(|status| status.eq_ignore_ascii_case("Active"))
+        || !plugin_string_array(plugin.get("Capabilities"))
+            .iter()
+            .any(|capability| {
+                capability.eq_ignore_ascii_case(CAPABILITY_USER_CATALOG_AUTHORIZATION)
+            })
+    {
+        return Ok(());
+    }
+    let Some(configuration) = db.live_tv_tuner_configuration_by_id(tuner_id).await? else {
+        return Ok(());
+    };
+    let provider_type = json_string_field(&configuration, "Type")
+        .ok_or_else(|| ApiError::service_unavailable("Plugin tuner route is unavailable"))?;
+    if !live_tv_plugin_id_from_payload(&configuration, &provider_type)
+        .is_some_and(|routed| routed.eq_ignore_ascii_case(plugin_id))
+    {
+        return Ok(());
+    }
+    let request = PluginUserAuthorizationRequest::release_device(
+        redacted_live_tv_plugin_tuner_config(configuration)?,
+        user_context,
+    );
+    let arguments = serde_json::to_value(request)
+        .map_err(|_| ApiError::internal("Invalid plugin device release request"))?;
+    let _ = invoke_installed_plugin_capability_via_runtime_host(
+        db,
+        &plugin,
+        CAPABILITY_USER_CATALOG_AUTHORIZATION,
+        arguments,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn authorized_live_tv_tuner_ids(
+    db: &Database,
+    user_context: &jellyrin_plugin_sdk::PluginUserContext,
+) -> Result<Option<Vec<String>>, ApiError> {
+    let configuration = db
+        .named_configuration("livetv")
+        .await?
+        .unwrap_or_else(default_live_tv_configuration);
+    let tuners = configuration
+        .get("TunerHosts")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut filtered = false;
+    let mut allowed = Vec::new();
+    for tuner in tuners {
+        let Some(tuner_id) = json_string_field(&tuner, "Id") else {
+            continue;
+        };
+        let Some(provider_type) = json_string_field(&tuner, "Type") else {
+            allowed.push(tuner_id);
+            continue;
+        };
+        let Some(plugin_id) = live_tv_plugin_id_from_payload(&tuner, &provider_type) else {
+            allowed.push(tuner_id);
+            continue;
+        };
+        let plugin = db.installed_plugin_json(&plugin_id).await?;
+        let declares_authorization = plugin.as_ref().is_some_and(|plugin| {
+            plugin_string_array(plugin.get("Capabilities"))
+                .iter()
+                .any(|capability| {
+                    capability.eq_ignore_ascii_case(CAPABILITY_USER_CATALOG_AUTHORIZATION)
+                })
+        });
+        if !declares_authorization {
+            allowed.push(tuner_id);
+            continue;
+        }
+        filtered = true;
+        if plugin_user_may_access_tuner_catalog(db, &plugin_id, &tuner_id, user_context.clone())
+            .await?
+        {
+            allowed.push(tuner_id);
+        }
+    }
+    Ok(filtered.then_some(allowed))
+}
+
+async fn scope_items_query_for_plugin_catalogs(
+    db: &Database,
+    query: &mut ItemsQuery,
+    authenticated_user: &User,
+    token: &DeviceToken,
+    requested_user_id: Option<Uuid>,
+) -> Result<(), ApiError> {
+    let user_id = requested_user_id.unwrap_or(authenticated_user.id);
+    query.allowed_plugin_tuner_ids = authorized_live_tv_tuner_ids(
+        db,
+        &jellyrin_plugin_sdk::PluginUserContext {
+            user_id: user_id.to_string(),
+            device_id: token.device_id.clone(),
+            is_administrator: authenticated_user.is_administrator,
+        },
+    )
+    .await?;
+    Ok(())
+}
+
 async fn invoke_plugin_capability_via_runtime_host_path(
     plugin: &serde_json::Value,
     capability: &str,
@@ -17224,9 +17441,8 @@ async fn report_playback(
 ) -> Result<StatusCode, ApiError> {
     let (user, token) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
     let service = SessionService::new(&state.db);
-    if live_tv_channel_json_for_playable_item(&state.db, &payload.item_id)
-        .await?
-        .is_some()
+    if let Some(channel) =
+        live_tv_channel_json_for_playable_item(&state.db, &payload.item_id).await?
     {
         if !playback_active {
             if let Some(play_session_id) = payload
@@ -17238,6 +17454,20 @@ async fn report_playback(
                 stop_live_hls_session_by_id(play_session_id).await;
             }
             service.clear_active_playback(&token.access_token).await?;
+            if let (Some(plugin_id), Some(tuner_id)) = (
+                json_string_field(&channel, "PluginProviderId"),
+                json_string_field(&channel, "TunerHostId"),
+            ) && release_plugin_user_device_lease(
+                &state.db,
+                &plugin_id,
+                &tuner_id,
+                plugin_user_context(&user, &token),
+            )
+            .await
+            .is_err()
+            {
+                tracing::warn!("plugin device lease release was unavailable");
+            }
         }
         broadcast_sessions_message(&state.db, &token.access_token, &user).await?;
         return Ok(StatusCode::NO_CONTENT);
@@ -17286,6 +17516,21 @@ async fn report_playback(
             .await?;
     } else {
         service.clear_active_playback(&token.access_token).await?;
+        if is_plugin_vod_virtual_item(&item) {
+            let metadata = media_metadata_by_item_id(&state.db, HashSet::from([item.id])).await?;
+            if let Some(reference) = metadata.get(&item.id).and_then(plugin_vod_remote_reference)
+                && release_plugin_user_device_lease(
+                    &state.db,
+                    &reference.plugin_id,
+                    &reference.tuner_id,
+                    plugin_user_context(&user, &token),
+                )
+                .await
+                .is_err()
+            {
+                tracing::warn!("plugin device lease release was unavailable");
+            }
+        }
     }
     broadcast_sessions_message(&state.db, &token.access_token, &user).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -23648,7 +23893,13 @@ async fn live_tv_channels(
     Query(query): Query<LiveTvChannelsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let service = LiveTvService::new(&state.db);
-    let user = require_request_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
+    let (user, token) = require_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
+    let user_context = jellyrin_plugin_sdk::PluginUserContext {
+        user_id: user.id.to_string(),
+        device_id: token.device_id,
+        is_administrator: user.is_administrator,
+    };
+    let authorized_tuner_ids = authorized_live_tv_tuner_ids(&state.db, &user_context).await?;
     let favorite_ids = live_tv_favorite_ids(&state.db, user.id).await?;
     let favorite_filter = live_tv_favorite_filter(&query);
     // Cap explicit limits at 500, and apply a sane default page size when the
@@ -23667,6 +23918,25 @@ async fn live_tv_channels(
     };
     let category_ids = live_tv_channel_category_filter(&state.db, &query).await?;
     let requested_start_index = query.start_index.unwrap_or(0);
+    let tuner_ids = match (&authorized_tuner_ids, tuner_id.as_ref()) {
+        (Some(allowed), Some(requested))
+            if !allowed.iter().any(|id| id.eq_ignore_ascii_case(requested)) =>
+        {
+            return Ok(Json(query_result_with_total(Vec::new(), 0, 0)));
+        }
+        (Some(allowed), Some(requested)) => allowed
+            .iter()
+            .find(|id| id.eq_ignore_ascii_case(requested))
+            .cloned()
+            .into_iter()
+            .collect(),
+        (Some(allowed), None) if allowed.is_empty() => {
+            return Ok(Json(query_result_with_total(Vec::new(), 0, 0)));
+        }
+        (Some(allowed), None) => allowed.clone(),
+        (None, Some(requested)) => vec![requested.clone()],
+        (None, None) => Vec::new(),
+    };
     let db_query = LiveTvChannelQuery {
         start_index: favorite_filter.map_or(requested_start_index, |_| 0),
         limit: if favorite_filter.is_some() {
@@ -23675,7 +23945,7 @@ async fn live_tv_channels(
             Some(limit)
         },
         search_term: query.search_term.clone(),
-        tuner_ids: tuner_id.clone().into_iter().collect(),
+        tuner_ids,
         category_ids,
     };
     let page = service.channel_page(db_query).await?;
@@ -23713,6 +23983,15 @@ async fn live_tv_channels(
         .unwrap_or_else(default_live_tv_configuration);
     let server_id = state.db.server_state().await?.server_id.to_string();
     let mut channels = live_tv_channel_items(&config, &server_id);
+    if let Some(allowed) = authorized_tuner_ids.as_ref() {
+        channels.retain(|channel| {
+            json_string_field(channel, "TunerHostId").is_some_and(|id| {
+                allowed
+                    .iter()
+                    .any(|allowed| allowed.eq_ignore_ascii_case(&id))
+            })
+        });
+    }
     if let Some(tuner_id) = tuner_id.as_deref() {
         channels.retain(|channel| {
             json_string_field(channel, "TunerHostId")
@@ -23837,9 +24116,21 @@ async fn live_tv_channel(
     Query(query): Query<AuthQuery>,
     Path(channel_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let (user, token) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let allowed_tuners = authorized_live_tv_tuner_ids(
+        &state.db,
+        &jellyrin_plugin_sdk::PluginUserContext {
+            user_id: user.id.to_string(),
+            device_id: token.device_id,
+            is_administrator: user.is_administrator,
+        },
+    )
+    .await?;
     let favorite_ids = live_tv_favorite_ids(&state.db, user.id).await?;
     if let Some(mut channel) = live_tv_channel_json_by_id(&state.db, &channel_id).await? {
+        if !live_tv_item_is_visible_to_tuners(&channel, allowed_tuners.as_deref()) {
+            return Err(ApiError::not_found("Live TV item not found"));
+        }
         apply_live_tv_favorite_state(&mut channel, &favorite_ids);
         return Ok(Json(channel));
     }
@@ -23858,8 +24149,24 @@ async fn live_tv_channel(
                 .any(|id| jellyfin_id_matches(&id, channel_id.trim()))
         })
         .ok_or_else(|| ApiError::not_found("Live TV item not found"))?;
+    if !live_tv_item_is_visible_to_tuners(&channel, allowed_tuners.as_deref()) {
+        return Err(ApiError::not_found("Live TV item not found"));
+    }
     apply_live_tv_favorite_state(&mut channel, &favorite_ids);
     Ok(Json(channel))
+}
+
+fn live_tv_item_is_visible_to_tuners(
+    item: &serde_json::Value,
+    allowed_tuner_ids: Option<&[String]>,
+) -> bool {
+    allowed_tuner_ids.is_none_or(|allowed| {
+        json_string_field(item, "TunerHostId").is_some_and(|tuner_id| {
+            allowed
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(&tuner_id))
+        })
+    })
 }
 
 async fn live_tv_channel_by_id(
@@ -24016,7 +24323,16 @@ async fn live_tv_programs(
     Query(auth_query): Query<AuthQuery>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let (user, token) = require_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let allowed_tuners = authorized_live_tv_tuner_ids(
+        &state.db,
+        &jellyrin_plugin_sdk::PluginUserContext {
+            user_id: user.id.to_string(),
+            device_id: token.device_id,
+            is_administrator: user.is_administrator,
+        },
+    )
+    .await?;
     let query = parse_live_tv_programs_query(raw_query.as_deref());
     let channel_ids = query.channel_ids;
     let requested =
@@ -24030,6 +24346,7 @@ async fn live_tv_programs(
         query.start_index,
         query.limit,
         query.filters,
+        allowed_tuners.as_deref(),
     )
     .await
 }
@@ -24104,7 +24421,16 @@ async fn live_tv_programs_post(
     Query(query): Query<AuthQuery>,
     body: Body,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let (user, token) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let allowed_tuners = authorized_live_tv_tuner_ids(
+        &state.db,
+        &jellyrin_plugin_sdk::PluginUserContext {
+            user_id: user.id.to_string(),
+            device_id: token.device_id,
+            is_administrator: user.is_administrator,
+        },
+    )
+    .await?;
     let payload = optional_json_body(body).await?;
     let channel_ids = json_string_list_field(&payload, "ChannelIds").unwrap_or_default();
     let requested = json_string_list_field(&payload, "GenreIds")
@@ -24122,6 +24448,7 @@ async fn live_tv_programs_post(
         start_index,
         limit,
         filters,
+        allowed_tuners.as_deref(),
     )
     .await
 }
@@ -24153,10 +24480,22 @@ async fn live_tv_program(
     Query(query): Query<AuthQuery>,
     Path(program_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let (user, token) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let allowed_tuners = authorized_live_tv_tuner_ids(
+        &state.db,
+        &jellyrin_plugin_sdk::PluginUserContext {
+            user_id: user.id.to_string(),
+            device_id: token.device_id,
+            is_administrator: user.is_administrator,
+        },
+    )
+    .await?;
     let program = live_tv_program_by_id(&state.db, &program_id)
         .await?
         .ok_or_else(|| ApiError::not_found("Live TV item not found"))?;
+    if !live_tv_item_is_visible_to_tuners(&program, allowed_tuners.as_deref()) {
+        return Err(ApiError::not_found("Live TV item not found"));
+    }
     Ok(Json(program))
 }
 
@@ -24257,6 +24596,7 @@ async fn live_tv_program_result(
     start_index: Option<usize>,
     limit: Option<usize>,
     filters: LiveTvProgramFilters,
+    allowed_tuner_ids: Option<&[String]>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let config = db
         .named_configuration("livetv")
@@ -24264,6 +24604,15 @@ async fn live_tv_program_result(
         .unwrap_or_else(default_live_tv_configuration);
     let server_id = db.server_state().await?.server_id.to_string();
     let mut programs = live_tv_program_items(&config, &server_id);
+    if let Some(allowed) = allowed_tuner_ids {
+        programs.retain(|program| {
+            json_string_field(program, "TunerHostId").is_some_and(|id| {
+                allowed
+                    .iter()
+                    .any(|allowed| allowed.eq_ignore_ascii_case(&id))
+            })
+        });
+    }
     if !channel_ids.is_empty() {
         let channel_ids = channel_ids
             .iter()
@@ -24320,8 +24669,15 @@ async fn live_tv_program_result(
         if !channel_ids.is_empty() {
             let channels = live_tv_channel_records_by_any_ids(db, channel_ids)
                 .await?
-                .iter()
-                .map(|record| live_tv_channel_record_to_json(record, &server_id))
+                .into_iter()
+                .filter(|record| {
+                    allowed_tuner_ids.is_none_or(|allowed| {
+                        allowed
+                            .iter()
+                            .any(|id| id.eq_ignore_ascii_case(&record.tuner_id))
+                    })
+                })
+                .map(|record| live_tv_channel_record_to_json(&record, &server_id))
                 .collect::<Vec<_>>();
             if !channels.is_empty() {
                 programs = live_tv_fallback_program_items(&channels, &[], &server_id);
@@ -24341,8 +24697,14 @@ async fn live_tv_program_result(
                 )));
             }
         }
+        let tuner_ids = allowed_tuner_ids
+            .map(<[String]>::to_vec)
+            .unwrap_or_default();
         let persisted_count = db
-            .live_tv_channel_count(&LiveTvChannelQuery::default())
+            .live_tv_channel_count(&LiveTvChannelQuery {
+                tuner_ids: tuner_ids.clone(),
+                ..LiveTvChannelQuery::default()
+            })
             .await?;
         if persisted_count > 0 {
             let category_ids_filter = category_ids.to_vec();
@@ -24351,7 +24713,7 @@ async fn live_tv_program_result(
                     start_index: 0,
                     limit: None,
                     search_term: None,
-                    tuner_ids: Vec::new(),
+                    tuner_ids: tuner_ids.clone(),
                     category_ids: category_ids_filter.clone(),
                 })
                 .await?;
@@ -24361,7 +24723,7 @@ async fn live_tv_program_result(
                         start_index: 0,
                         limit: Some(persisted_count.min(LIVE_TV_XTREAM_MAX_IMPORT_LIMIT)),
                         search_term: None,
-                        tuner_ids: Vec::new(),
+                        tuner_ids: tuner_ids.clone(),
                         category_ids: category_ids_filter,
                     })
                     .await?;
@@ -24397,7 +24759,7 @@ async fn live_tv_program_result(
                     start_index,
                     limit: Some(limit),
                     search_term: None,
-                    tuner_ids: Vec::new(),
+                    tuner_ids,
                     category_ids: category_ids.to_vec(),
                 })
                 .await?;
@@ -28477,6 +28839,7 @@ fn live_tv_fallback_program_item(
         "JellyrinChannelId",
         "Path",
         "MediaSources",
+        "TunerHostId",
     ] {
         if let Some(value) = json_field_case_insensitive(channel, key) {
             program[key] = value.clone();
@@ -28644,6 +29007,7 @@ fn live_tv_program_item(
     base["Type"] = serde_json::json!("Program");
     base["ServerId"] = serde_json::json!(server_id);
     base["MediaType"] = serde_json::json!("Video");
+    base["TunerHostId"] = serde_json::json!(source_id);
     base["ChannelId"] = serde_json::json!(channel_id);
     base["JellyrinChannelId"] = serde_json::json!(raw_channel_id);
     base["ChannelName"] = channel_name
@@ -31707,15 +32071,32 @@ async fn user_views_result(
     headers: HeaderMap,
     Query(query): Query<UserViewsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let auth_user =
-        require_request_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
-    if let Some(user_id) = query.user_id.as_deref().map(resolve_user_id).transpose()? {
+    let (auth_user, token) =
+        require_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
+    let requested_user_id = query.user_id.as_deref().map(resolve_user_id).transpose()?;
+    if let Some(user_id) = requested_user_id {
         ensure_user_access(&auth_user, user_id)?;
     }
     let folders = state.db.virtual_folders().await?;
     let server_id = state.db.server_state().await?.server_id.to_string();
     let item_counts = state.db.media_item_counts_by_virtual_folder().await?;
-    let live_tv_tuners = configured_live_tv_tuner_views(&state.db).await?;
+    let allowed = authorized_live_tv_tuner_ids(
+        &state.db,
+        &jellyrin_plugin_sdk::PluginUserContext {
+            user_id: requested_user_id.unwrap_or(auth_user.id).to_string(),
+            device_id: token.device_id,
+            is_administrator: auth_user.is_administrator,
+        },
+    )
+    .await?;
+    let mut live_tv_tuners = configured_live_tv_tuner_views(&state.db).await?;
+    if let Some(allowed) = allowed {
+        live_tv_tuners.retain(|tuner| {
+            allowed
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(&tuner.tuner_id))
+        });
+    }
     let items = user_views_for_query(&folders, &item_counts, &live_tv_tuners, &server_id, &query);
     Ok(Json(query_result(items)))
 }
@@ -31726,14 +32107,30 @@ async fn user_views_result_legacy(
     Query(query): Query<UserViewsQuery>,
     Path(user_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let auth_user =
-        require_request_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
+    let (auth_user, token) =
+        require_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
     let requested_user_id = resolve_user_id(&user_id)?;
     ensure_user_access(&auth_user, requested_user_id)?;
     let folders = state.db.virtual_folders().await?;
     let server_id = state.db.server_state().await?.server_id.to_string();
     let item_counts = state.db.media_item_counts_by_virtual_folder().await?;
-    let live_tv_tuners = configured_live_tv_tuner_views(&state.db).await?;
+    let allowed = authorized_live_tv_tuner_ids(
+        &state.db,
+        &jellyrin_plugin_sdk::PluginUserContext {
+            user_id: requested_user_id.to_string(),
+            device_id: token.device_id,
+            is_administrator: auth_user.is_administrator,
+        },
+    )
+    .await?;
+    let mut live_tv_tuners = configured_live_tv_tuner_views(&state.db).await?;
+    if let Some(allowed) = allowed {
+        live_tv_tuners.retain(|tuner| {
+            allowed
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(&tuner.tuner_id))
+        });
+    }
     let items = user_views_for_query(&folders, &item_counts, &live_tv_tuners, &server_id, &query);
     Ok(Json(query_result(items)))
 }
@@ -32316,6 +32713,8 @@ struct ItemsQuery {
         alias = "excludeLocationType"
     )]
     exclude_location_types: Vec<String>,
+    #[serde(skip)]
+    allowed_plugin_tuner_ids: Option<Vec<String>>,
 }
 
 fn parse_items_query(raw_query: Option<&str>) -> ItemsQuery {
@@ -32615,6 +33014,7 @@ fn media_catalog_query_for_items(
         start_index: query.start_index.unwrap_or(0),
         limit: limit.min(MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE),
         ids: ids.unwrap_or_default(),
+        allowed_plugin_tuner_ids: query.allowed_plugin_tuner_ids.clone(),
         include_item_types: query.include_item_types.clone(),
         exclude_item_types: query.exclude_item_types.clone(),
         media_types: query.media_types.clone(),
@@ -32801,6 +33201,9 @@ async fn mixed_series_episode_search_items_result(
     server_id: &str,
     user_id: Option<Uuid>,
 ) -> Result<Option<Json<serde_json::Value>>, ApiError> {
+    if query.allowed_plugin_tuner_ids.is_some() {
+        return Ok(None);
+    }
     let Some(search_term) = query
         .search_term
         .as_deref()
@@ -32902,6 +33305,9 @@ async fn random_movie_series_items_result(
     server_id: &str,
     user_id: Option<Uuid>,
 ) -> Result<Option<Json<serde_json::Value>>, ApiError> {
+    if query.allowed_plugin_tuner_ids.is_some() {
+        return Ok(None);
+    }
     let Some(limit) = query.limit.filter(|limit| *limit > 0) else {
         return Ok(None);
     };
@@ -33026,13 +33432,21 @@ async fn items_result(
     Query(auth_query): Query<AuthQuery>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let query = parse_items_query(raw_query.as_deref());
-    let auth_user =
-        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let mut query = parse_items_query(raw_query.as_deref());
+    let (auth_user, token) =
+        require_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
     let requested_user_id = query.user_id.as_deref().map(resolve_user_id).transpose()?;
     if let Some(requested_user_id) = requested_user_id {
         ensure_user_access(&auth_user, requested_user_id)?;
     }
+    scope_items_query_for_plugin_catalogs(
+        &state.db,
+        &mut query,
+        &auth_user,
+        &token,
+        requested_user_id,
+    )
+    .await?;
     let server_id = state.db.server_state().await?.server_id.to_string();
     if let Some(parent_id) = query.parent_id.as_deref()
         && let Some(tuner) = live_tv_tuner_view_by_id(&state.db, parent_id).await?
@@ -33079,7 +33493,7 @@ async fn items_result(
     {
         return Ok(result);
     }
-    if query_requests_only_item_type(&query, "Series") {
+    if query_requests_only_item_type(&query, "Series") && query.allowed_plugin_tuner_ids.is_none() {
         return tv_series_items_result(&state.db, &query, requested_user_id, &server_id).await;
     }
     let filtered_items = filtered_media_items(
@@ -33141,11 +33555,19 @@ async fn user_items_result(
     Path(user_id): Path<String>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let query = parse_items_query(raw_query.as_deref());
-    let auth_user =
-        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let mut query = parse_items_query(raw_query.as_deref());
+    let (auth_user, token) =
+        require_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
     let requested_user_id = resolve_user_id(&user_id)?;
     ensure_user_access(&auth_user, requested_user_id)?;
+    scope_items_query_for_plugin_catalogs(
+        &state.db,
+        &mut query,
+        &auth_user,
+        &token,
+        Some(requested_user_id),
+    )
+    .await?;
     let server_id = state.db.server_state().await?.server_id.to_string();
     if let Some(parent_id) = query.parent_id.as_deref()
         && let Some(tuner) = live_tv_tuner_view_by_id(&state.db, parent_id).await?
@@ -33192,7 +33614,7 @@ async fn user_items_result(
     {
         return Ok(result);
     }
-    if query_requests_only_item_type(&query, "Series") {
+    if query_requests_only_item_type(&query, "Series") && query.allowed_plugin_tuner_ids.is_none() {
         return tv_series_items_result(&state.db, &query, Some(requested_user_id), &server_id)
             .await;
     }
@@ -33345,11 +33767,29 @@ async fn live_tv_channel_items_result(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let requested_limit = query.limit.unwrap_or(25);
     let limit = requested_limit.min(500);
+    let tuner_ids = match (&query.allowed_plugin_tuner_ids, tuner_id) {
+        (Some(allowed), Some(requested)) => {
+            let matching = allowed
+                .iter()
+                .find(|allowed| allowed.eq_ignore_ascii_case(requested))
+                .cloned();
+            let Some(matching) = matching else {
+                return Ok(Json(query_result_with_total(Vec::new(), 0, 0)));
+            };
+            vec![matching]
+        }
+        (Some(allowed), None) if allowed.is_empty() => {
+            return Ok(Json(query_result_with_total(Vec::new(), 0, 0)));
+        }
+        (Some(allowed), None) => allowed.clone(),
+        (None, Some(requested)) => vec![requested.to_string()],
+        (None, None) => Vec::new(),
+    };
     let db_query = LiveTvChannelQuery {
         start_index: query.start_index.unwrap_or(0),
         limit: Some(limit),
         search_term: query.search_term.clone(),
-        tuner_ids: tuner_id.map(ToOwned::to_owned).into_iter().collect(),
+        tuner_ids,
         category_ids: Vec::new(),
     };
     let page = LiveTvService::new(db).channel_page(db_query).await?;
@@ -33367,6 +33807,15 @@ async fn live_tv_channel_items_result(
     }
 
     let mut items = configured_live_tv_channel_items(db).await?;
+    if let Some(allowed) = query.allowed_plugin_tuner_ids.as_ref() {
+        items.retain(|item| {
+            json_string_field(item, "TunerHostId").is_some_and(|id| {
+                allowed
+                    .iter()
+                    .any(|allowed| allowed.eq_ignore_ascii_case(&id))
+            })
+        });
+    }
     if let Some(tuner_id) = tuner_id {
         items.retain(|item| {
             json_string_field(item, "TunerHostId")
@@ -33389,6 +33838,9 @@ async fn fast_name_search_items_result(
     server_id: &str,
     user_id: Option<Uuid>,
 ) -> Result<Option<Json<serde_json::Value>>, ApiError> {
+    if query.allowed_plugin_tuner_ids.is_some() {
+        return Ok(None);
+    }
     let Some(search_term) = query
         .search_term
         .as_deref()
@@ -33768,13 +34220,21 @@ async fn item_counts(
     Query(auth_query): Query<AuthQuery>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let query = parse_items_query(raw_query.as_deref());
-    let auth_user =
-        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let mut query = parse_items_query(raw_query.as_deref());
+    let (auth_user, token) =
+        require_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
     let requested_user_id = query.user_id.as_deref().map(resolve_user_id).transpose()?;
     if let Some(requested_user_id) = requested_user_id {
         ensure_user_access(&auth_user, requested_user_id)?;
     }
+    scope_items_query_for_plugin_catalogs(
+        &state.db,
+        &mut query,
+        &auth_user,
+        &token,
+        requested_user_id,
+    )
+    .await?;
     if let Some(counts) = media_catalog_counts_result(&state.db, &query, requested_user_id).await? {
         return Ok(Json(counts));
     }
@@ -33795,11 +34255,19 @@ async fn user_item_counts(
     Path(user_id): Path<String>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let query = parse_items_query(raw_query.as_deref());
-    let auth_user =
-        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let mut query = parse_items_query(raw_query.as_deref());
+    let (auth_user, token) =
+        require_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
     let requested_user_id = resolve_user_id(&user_id)?;
     ensure_user_access(&auth_user, requested_user_id)?;
+    scope_items_query_for_plugin_catalogs(
+        &state.db,
+        &mut query,
+        &auth_user,
+        &token,
+        Some(requested_user_id),
+    )
+    .await?;
     if let Some(counts) =
         media_catalog_counts_result(&state.db, &query, Some(requested_user_id)).await?
     {
@@ -33876,13 +34344,21 @@ async fn latest_items(
     Query(auth_query): Query<AuthQuery>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
-    let query = parse_items_query(raw_query.as_deref());
-    let auth_user =
-        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let mut query = parse_items_query(raw_query.as_deref());
+    let (auth_user, token) =
+        require_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
     let requested_user_id = query.user_id.as_deref().map(resolve_user_id).transpose()?;
     if let Some(requested_user_id) = requested_user_id {
         ensure_user_access(&auth_user, requested_user_id)?;
     }
+    scope_items_query_for_plugin_catalogs(
+        &state.db,
+        &mut query,
+        &auth_user,
+        &token,
+        requested_user_id,
+    )
+    .await?;
     let server_id = state.db.server_state().await?.server_id.to_string();
     if let Some(result) = live_tv_latest_items_for_parent(&state.db, &query, &server_id).await? {
         return Ok(result);
@@ -33917,9 +34393,9 @@ async fn current_user_latest_items(
     Query(auth_query): Query<AuthQuery>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
-    let query = parse_items_query(raw_query.as_deref());
-    let auth_user =
-        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let mut query = parse_items_query(raw_query.as_deref());
+    let (auth_user, token) =
+        require_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
     let requested_user_id = query
         .user_id
         .as_deref()
@@ -33927,6 +34403,14 @@ async fn current_user_latest_items(
         .transpose()?
         .unwrap_or(auth_user.id);
     ensure_user_access(&auth_user, requested_user_id)?;
+    scope_items_query_for_plugin_catalogs(
+        &state.db,
+        &mut query,
+        &auth_user,
+        &token,
+        Some(requested_user_id),
+    )
+    .await?;
     let server_id = state.db.server_state().await?.server_id.to_string();
     if let Some(result) = live_tv_latest_items_for_parent(&state.db, &query, &server_id).await? {
         return Ok(result);
@@ -33963,11 +34447,19 @@ async fn user_latest_items(
     Path(user_id): Path<String>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
-    let query = parse_items_query(raw_query.as_deref());
-    let auth_user =
-        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let mut query = parse_items_query(raw_query.as_deref());
+    let (auth_user, token) =
+        require_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
     let requested_user_id = resolve_user_id(&user_id)?;
     ensure_user_access(&auth_user, requested_user_id)?;
+    scope_items_query_for_plugin_catalogs(
+        &state.db,
+        &mut query,
+        &auth_user,
+        &token,
+        Some(requested_user_id),
+    )
+    .await?;
     let server_id = state.db.server_state().await?.server_id.to_string();
     if let Some(result) = live_tv_latest_items_for_parent(&state.db, &query, &server_id).await? {
         return Ok(result);
@@ -34258,8 +34750,8 @@ async fn movie_recommendations(
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
     let mut query = parse_items_query(raw_query.as_deref());
-    let auth_user =
-        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let (auth_user, token) =
+        require_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
     let requested_user_id = query
         .user_id
         .as_deref()
@@ -34267,6 +34759,14 @@ async fn movie_recommendations(
         .transpose()?
         .unwrap_or(auth_user.id);
     ensure_user_access(&auth_user, requested_user_id)?;
+    scope_items_query_for_plugin_catalogs(
+        &state.db,
+        &mut query,
+        &auth_user,
+        &token,
+        Some(requested_user_id),
+    )
+    .await?;
     let category_limit =
         query_string_value(raw_query.as_deref(), &["CategoryLimit", "categoryLimit"])
             .and_then(|value| value.parse::<usize>().ok())
@@ -34624,8 +35124,8 @@ async fn shows_next_up(
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let mut query = parse_items_query(raw_query.as_deref());
-    let auth_user =
-        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let (auth_user, token) =
+        require_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
     let requested_user_id = query
         .user_id
         .as_deref()
@@ -34633,6 +35133,14 @@ async fn shows_next_up(
         .transpose()?
         .unwrap_or(auth_user.id);
     ensure_user_access(&auth_user, requested_user_id)?;
+    scope_items_query_for_plugin_catalogs(
+        &state.db,
+        &mut query,
+        &auth_user,
+        &token,
+        Some(requested_user_id),
+    )
+    .await?;
     if query.include_item_types.is_empty() {
         query.include_item_types.push("Episode".to_string());
     }
@@ -34766,8 +35274,8 @@ async fn shows_upcoming(
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let mut query = parse_items_query(raw_query.as_deref());
-    let auth_user =
-        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let (auth_user, token) =
+        require_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
     let requested_user_id = query
         .user_id
         .as_deref()
@@ -34775,6 +35283,14 @@ async fn shows_upcoming(
         .transpose()?
         .unwrap_or(auth_user.id);
     ensure_user_access(&auth_user, requested_user_id)?;
+    scope_items_query_for_plugin_catalogs(
+        &state.db,
+        &mut query,
+        &auth_user,
+        &token,
+        Some(requested_user_id),
+    )
+    .await?;
     if query.include_item_types.is_empty() {
         query.include_item_types.push("Episode".to_string());
     }
@@ -34855,8 +35371,8 @@ async fn resume_items(
     Query(query): Query<AuthQuery>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let auth_user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    let items_query = parse_items_query(raw_query.as_deref());
+    let (auth_user, token) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let mut items_query = parse_items_query(raw_query.as_deref());
     let requested_user_id = items_query
         .user_id
         .as_deref()
@@ -34864,6 +35380,14 @@ async fn resume_items(
         .transpose()?
         .unwrap_or(auth_user.id);
     ensure_user_access(&auth_user, requested_user_id)?;
+    scope_items_query_for_plugin_catalogs(
+        &state.db,
+        &mut items_query,
+        &auth_user,
+        &token,
+        Some(requested_user_id),
+    )
+    .await?;
     resume_items_result(&state.db, requested_user_id, &items_query).await
 }
 
@@ -34874,10 +35398,18 @@ async fn user_resume_items(
     Path(user_id): Path<String>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let auth_user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let (auth_user, token) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
     let requested_user_id = resolve_user_id(&user_id)?;
     ensure_user_access(&auth_user, requested_user_id)?;
-    let items_query = parse_items_query(raw_query.as_deref());
+    let mut items_query = parse_items_query(raw_query.as_deref());
+    scope_items_query_for_plugin_catalogs(
+        &state.db,
+        &mut items_query,
+        &auth_user,
+        &token,
+        Some(requested_user_id),
+    )
+    .await?;
     resume_items_result(&state.db, requested_user_id, &items_query).await
 }
 
@@ -52551,13 +53083,22 @@ async fn filtered_items_for_query(
     api_key: Option<&str>,
     query: &ItemsQuery,
 ) -> Result<Vec<MediaItem>, ApiError> {
-    let auth_user = require_request_user(&state.db, headers, api_key).await?;
+    let (auth_user, token) = require_user(&state.db, headers, api_key).await?;
     let requested_user_id = query.user_id.as_deref().map(resolve_user_id).transpose()?;
     if let Some(requested_user_id) = requested_user_id {
         ensure_user_access(&auth_user, requested_user_id)?;
     }
-    let source_items = media_items_source_for_query(&state.db, query).await?;
-    filtered_media_items(source_items, query, requested_user_id, &state.db).await
+    let mut scoped_query = query.clone();
+    scope_items_query_for_plugin_catalogs(
+        &state.db,
+        &mut scoped_query,
+        &auth_user,
+        &token,
+        requested_user_id,
+    )
+    .await?;
+    let source_items = media_items_source_for_query(&state.db, &scoped_query).await?;
+    filtered_media_items(source_items, &scoped_query, requested_user_id, &state.db).await
 }
 
 async fn media_items_source_for_query(
@@ -52730,9 +53271,43 @@ async fn filtered_media_items(
     } else {
         None
     };
+    let plugin_visibility_metadata = if query.allowed_plugin_tuner_ids.is_some() {
+        Some(
+            media_metadata_by_item_id(
+                db,
+                items
+                    .iter()
+                    .filter(|item| is_plugin_vod_virtual_item(item))
+                    .map(|item| item.id)
+                    .collect(),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
 
     let mut items = items
         .into_iter()
+        .filter(|item| {
+            query
+                .allowed_plugin_tuner_ids
+                .as_ref()
+                .is_none_or(|allowed| {
+                    if !is_plugin_vod_virtual_item(item) {
+                        return true;
+                    }
+                    plugin_visibility_metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.get(&item.id))
+                        .and_then(|metadata| json_string_field(metadata, "TunerId"))
+                        .is_some_and(|tuner_id| {
+                            allowed
+                                .iter()
+                                .any(|allowed| allowed.eq_ignore_ascii_case(&tuner_id))
+                        })
+                })
+        })
         .filter(|item| ids.as_ref().is_none_or(|ids| ids.contains(&item.id)))
         .filter(|item| {
             parent_folder_ids

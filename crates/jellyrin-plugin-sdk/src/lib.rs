@@ -21,6 +21,8 @@ pub const CAPABILITY_VOD_LIBRARY_PROVIDER: &str = "VodLibraryProvider";
 /// Optional capability used to hide one provider instance's catalog from users that the plugin
 /// has not assigned. Jellyrin supplies only public provider configuration and trusted identity.
 pub const CAPABILITY_USER_CATALOG_AUTHORIZATION: &str = "UserCatalogAuthorization";
+pub const USER_CATALOG_ACTION_AUTHORIZE: &str = "AuthorizeCatalog";
+pub const USER_CATALOG_ACTION_RELEASE_DEVICE: &str = "ReleaseDevice";
 /// Permission a plugin must request in its manifest, and an administrator must grant, before
 /// Jellyrin may issue ephemeral provider-secret grants to it.
 pub const PERMISSION_PROVIDER_SECRETS: &str = "ProviderSecrets";
@@ -586,8 +588,27 @@ pub struct PluginUserAuthorizationResult {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase", deny_unknown_fields)]
 pub struct PluginUserAuthorizationRequest {
+    pub action: String,
     pub provider_config: Value,
     pub user_context: PluginUserContext,
+}
+
+impl PluginUserAuthorizationRequest {
+    pub fn authorize_catalog(provider_config: Value, user_context: PluginUserContext) -> Self {
+        Self {
+            action: USER_CATALOG_ACTION_AUTHORIZE.to_string(),
+            provider_config,
+            user_context,
+        }
+    }
+
+    pub fn release_device(provider_config: Value, user_context: PluginUserContext) -> Self {
+        Self {
+            action: USER_CATALOG_ACTION_RELEASE_DEVICE.to_string(),
+            provider_config,
+            user_context,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

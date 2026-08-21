@@ -659,6 +659,9 @@ pub struct MediaItemCatalogQuery {
     pub limit: usize,
     pub ids: Vec<Uuid>,
     pub virtual_folder_ids: Vec<Uuid>,
+    /// When present, plugin-VOD rows are visible only when their persisted tuner id is in this
+    /// set. Ordinary filesystem media is unaffected. `Some(empty)` hides all plugin-VOD rows.
+    pub allowed_plugin_tuner_ids: Option<Vec<String>>,
     pub include_item_types: Vec<String>,
     pub exclude_item_types: Vec<String>,
     pub collection_types: Vec<String>,
@@ -729,6 +732,7 @@ impl Default for MediaItemCatalogQuery {
             limit: 100,
             ids: Vec::new(),
             virtual_folder_ids: Vec::new(),
+            allowed_plugin_tuner_ids: None,
             include_item_types: Vec::new(),
             exclude_item_types: Vec::new(),
             collection_types: Vec::new(),
@@ -2534,6 +2538,21 @@ fn push_sqlite_catalog_filters(
     query: &MediaItemCatalogQuery,
 ) -> anyhow::Result<()> {
     builder.push(" WHERE item.missing_since IS NULL");
+
+    if let Some(allowed) = query.allowed_plugin_tuner_ids.as_ref() {
+        builder.push(" AND (item.path NOT LIKE 'plugin-vod://%' OR ");
+        if allowed.is_empty() {
+            builder.push("0");
+        } else {
+            builder.push("lower(coalesce(json_extract(item.metadata_json, '$.TunerId'), '')) IN (");
+            let mut separated = builder.separated(", ");
+            for value in allowed {
+                separated.push_bind(value.to_ascii_lowercase());
+            }
+            separated.push_unseparated(")");
+        }
+        builder.push(")");
+    }
 
     if !query.ids.is_empty() {
         let ids = query
@@ -19992,6 +20011,61 @@ mod tests {
             .unwrap();
         assert_eq!(empty_candidates.len(), 1);
         assert_eq!(empty_candidates[0].item.media_type, "Series");
+    }
+
+    #[tokio::test]
+    async fn sqlite_catalog_filters_plugin_vod_by_allowed_tuner_before_paging() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let item = |name: &str, tuner_id: &str| RemoteMediaItemUpsert {
+            id: Uuid::new_v4().to_string(),
+            name: name.to_string(),
+            path: format!("plugin-vod://private/{tuner_id}/{name}"),
+            media_type: "Video".to_string(),
+            collection_type: "movies".to_string(),
+            runtime_ticks: None,
+            bitrate: None,
+            width: None,
+            height: None,
+            media_streams: Vec::new(),
+            metadata: json!({
+                "Provider": "plugin:private",
+                "TunerId": tuner_id,
+                "PluginVodKind": "movie"
+            }),
+        };
+        db.replace_remote_media_library_snapshot(
+            "Private sources",
+            "movies",
+            "plugin-vod://private/catalog",
+            vec![item("Allowed", "tuner-a"), item("Denied", "tuner-b")],
+        )
+        .await
+        .unwrap();
+
+        let page = db
+            .media_item_catalog_page(&MediaItemCatalogQuery {
+                start_index: 0,
+                limit: 1,
+                allowed_plugin_tuner_ids: Some(vec!["TUNER-A".to_string()]),
+                ..MediaItemCatalogQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.total_record_count, 1);
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].item.name, "Allowed");
+
+        let hidden = db
+            .media_item_catalog_page(&MediaItemCatalogQuery {
+                start_index: 0,
+                limit: 20,
+                allowed_plugin_tuner_ids: Some(Vec::new()),
+                ..MediaItemCatalogQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(hidden.total_record_count, 0);
+        assert!(hidden.items.is_empty());
     }
 
     #[tokio::test]

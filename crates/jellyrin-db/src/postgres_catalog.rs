@@ -5865,6 +5865,24 @@ fn push_postgres_catalog_filters(
 ) {
     builder.push(" WHERE item.missing_since IS NULL");
 
+    if let Some(allowed) = query.allowed_plugin_tuner_ids.as_ref() {
+        builder.push(" AND (item.path NOT LIKE 'plugin-vod://%' OR ");
+        if allowed.is_empty() {
+            builder.push("FALSE");
+        } else {
+            builder
+                .push("lower(coalesce(item.metadata->>'TunerId', '')) = ANY(")
+                .push_bind(
+                    allowed
+                        .iter()
+                        .map(|value| value.to_ascii_lowercase())
+                        .collect::<Vec<_>>(),
+                )
+                .push(")");
+        }
+        builder.push(")");
+    }
+
     if !query.ids.is_empty() {
         builder
             .push(" AND item.id = ANY(")
