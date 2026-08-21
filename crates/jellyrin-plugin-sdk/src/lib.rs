@@ -18,6 +18,9 @@ pub const CAPABILITY_LIVE_TV_PROVIDER: &str = "LiveTvProvider";
 /// Capability implemented by plugins that import an on-demand media library (movies, series
 /// and episodes) and resolve ephemeral playback URLs for opaque catalog references.
 pub const CAPABILITY_VOD_LIBRARY_PROVIDER: &str = "VodLibraryProvider";
+/// Optional capability used to hide one provider instance's catalog from users that the plugin
+/// has not assigned. Jellyrin supplies only public provider configuration and trusted identity.
+pub const CAPABILITY_USER_CATALOG_AUTHORIZATION: &str = "UserCatalogAuthorization";
 /// Permission a plugin must request in its manifest, and an administrator must grant, before
 /// Jellyrin may issue ephemeral provider-secret grants to it.
 pub const PERMISSION_PROVIDER_SECRETS: &str = "ProviderSecrets";
@@ -578,6 +581,13 @@ pub struct PluginUserContext {
 #[serde(rename_all = "PascalCase", deny_unknown_fields)]
 pub struct PluginUserAuthorizationResult {
     pub allowed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase", deny_unknown_fields)]
+pub struct PluginUserAuthorizationRequest {
+    pub provider_config: Value,
+    pub user_context: PluginUserContext,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
