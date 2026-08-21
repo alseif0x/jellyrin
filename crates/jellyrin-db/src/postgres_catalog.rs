@@ -950,15 +950,18 @@ impl PostgresDatabase {
             .begin_with(POSTGRES_REPEATABLE_READ_ONLY_BEGIN)
             .await?;
 
-        let mut count = QueryBuilder::<Postgres>::new("SELECT COUNT(*)::bigint ");
-        push_postgres_catalog_from(&mut count, query);
-        push_postgres_catalog_filters(&mut count, query);
-        let total_record_count = count
-            .build_query_scalar::<i64>()
-            .fetch_one(&mut *transaction)
-            .await?;
-        let total_record_count =
-            usize::try_from(total_record_count).context("media catalog count exceeded usize")?;
+        let total_record_count = if query.include_total_record_count {
+            let mut count = QueryBuilder::<Postgres>::new("SELECT COUNT(*)::bigint ");
+            push_postgres_catalog_from(&mut count, query);
+            push_postgres_catalog_filters(&mut count, query);
+            let count = count
+                .build_query_scalar::<i64>()
+                .fetch_one(&mut *transaction)
+                .await?;
+            usize::try_from(count).context("media catalog count exceeded usize")?
+        } else {
+            0
+        };
 
         let effective_limit = query.limit.min(MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE);
         if effective_limit == 0 {

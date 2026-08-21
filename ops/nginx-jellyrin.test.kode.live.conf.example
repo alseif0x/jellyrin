@@ -39,6 +39,12 @@ server {
 
     access_log /var/log/nginx/jellyrin.access.log jellyrin_path_only;
     error_log /var/log/nginx/jellyrin.error.log crit;
+    gzip on;
+    gzip_vary on;
+    gzip_proxied any;
+    gzip_comp_level 5;
+    gzip_min_length 1024;
+    gzip_types application/json application/problem+json application/javascript text/css text/plain;
 
     location / {
         proxy_pass http://127.0.0.1:8096;
@@ -49,8 +55,8 @@ server {
         proxy_set_header X-Forwarded-Proto https;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
-        proxy_read_timeout 3600s;
-        proxy_send_timeout 3600s;
+        proxy_read_timeout 22500s;
+        proxy_send_timeout 22500s;
         proxy_buffering off;
     }
 }

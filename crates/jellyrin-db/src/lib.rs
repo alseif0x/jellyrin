@@ -657,6 +657,8 @@ pub enum MediaItemCatalogSearchScope {
 pub struct MediaItemCatalogQuery {
     pub start_index: usize,
     pub limit: usize,
+    /// Skip the potentially expensive exact COUNT when the client explicitly does not need it.
+    pub include_total_record_count: bool,
     pub ids: Vec<Uuid>,
     pub virtual_folder_ids: Vec<Uuid>,
     /// When present, plugin-VOD rows are visible only when their persisted tuner id is in this
@@ -730,6 +732,7 @@ impl Default for MediaItemCatalogQuery {
         Self {
             start_index: 0,
             limit: 100,
+            include_total_record_count: true,
             ids: Vec::new(),
             virtual_folder_ids: Vec::new(),
             allowed_plugin_tuner_ids: None,
@@ -8685,15 +8688,18 @@ impl SqliteDatabase {
         validate_media_item_catalog_query(query)?;
         let mut transaction = self.pool.begin().await?;
 
-        let mut count = QueryBuilder::<Sqlite>::new("SELECT COUNT(*) ");
-        push_sqlite_catalog_from(&mut count, query);
-        push_sqlite_catalog_filters(&mut count, query)?;
-        let total_record_count = count
-            .build_query_scalar::<i64>()
-            .fetch_one(&mut *transaction)
-            .await?;
-        let total_record_count =
-            usize::try_from(total_record_count).context("media catalog count exceeded usize")?;
+        let total_record_count = if query.include_total_record_count {
+            let mut count = QueryBuilder::<Sqlite>::new("SELECT COUNT(*) ");
+            push_sqlite_catalog_from(&mut count, query);
+            push_sqlite_catalog_filters(&mut count, query)?;
+            let count = count
+                .build_query_scalar::<i64>()
+                .fetch_one(&mut *transaction)
+                .await?;
+            usize::try_from(count).context("media catalog count exceeded usize")?
+        } else {
+            0
+        };
 
         let effective_limit = query.limit.min(MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE);
         if effective_limit == 0 {

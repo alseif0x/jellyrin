@@ -32942,6 +32942,9 @@ fn parse_items_query(raw_query: Option<&str>) -> ItemsQuery {
             "sortby" => set_query_scalar(&mut query.sort_by, value),
             "sortorder" => set_query_scalar(&mut query.sort_order, value),
             "fields" => set_query_scalar(&mut query.fields, value),
+            "enableimages" => query._enable_images = Some(value),
+            "enableuserdata" => query._enable_user_data = Some(value),
+            "enabletotalrecordcount" => query._enable_total_record_count = Some(value),
             "locationtypes" => query.location_types.push(value),
             "locationtype" => query.location_types.push(value),
             "excludelocationtypes" => query.exclude_location_types.push(value),
@@ -32968,6 +32971,65 @@ fn parse_query_bool(value: &str) -> Option<bool> {
         "false" => Some(false),
         _ => None,
     }
+}
+
+fn query_flag(value: &Option<String>) -> Option<bool> {
+    value.as_deref().and_then(parse_query_bool)
+}
+
+fn shape_catalog_item_for_query(
+    mut item: serde_json::Value,
+    query: &ItemsQuery,
+) -> serde_json::Value {
+    let Some(object) = item.as_object_mut() else {
+        return item;
+    };
+    if query_flag(&query._enable_images) == Some(false) {
+        for key in [
+            "ImageTags",
+            "ImageBlurHashes",
+            "BackdropImageTags",
+            "ParentBackdropImageTags",
+            "PrimaryImageAspectRatio",
+        ] {
+            object.remove(key);
+        }
+    }
+    if query_flag(&query._enable_user_data) == Some(false) {
+        object.remove("UserData");
+    }
+    let Some(fields) = query.fields.as_deref() else {
+        return item;
+    };
+    let requested = fields
+        .split(',')
+        .map(|field| field.trim().to_ascii_lowercase())
+        .filter(|field| !field.is_empty())
+        .collect::<HashSet<_>>();
+    for key in [
+        "Overview",
+        "MediaSources",
+        "MediaStreams",
+        "Path",
+        "People",
+        "Studios",
+        "Genres",
+        "Tags",
+        "Taglines",
+        "ProviderIds",
+        "DateCreated",
+        "PremiereDate",
+        "ProductionYear",
+        "OfficialRating",
+        "CommunityRating",
+        "CriticRating",
+        "PrimaryImageAspectRatio",
+    ] {
+        if !requested.contains(&key.to_ascii_lowercase()) {
+            object.remove(key);
+        }
+    }
+    item
 }
 
 fn percent_decode_query_component(value: &str) -> String {
@@ -33149,6 +33211,7 @@ fn media_catalog_query_for_items(
     Ok(Some(MediaItemCatalogQuery {
         start_index: query.start_index.unwrap_or(0),
         limit: limit.min(MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE),
+        include_total_record_count: query_flag(&query._enable_total_record_count).unwrap_or(true),
         ids: ids.unwrap_or_default(),
         allowed_plugin_tuner_ids: query.allowed_plugin_tuner_ids.clone(),
         include_item_types: query.include_item_types.clone(),
@@ -33307,7 +33370,7 @@ async fn media_catalog_items_result(
         .items
         .iter()
         .map(|entry| {
-            if compact {
+            let item = if compact {
                 compact_media_item_to_json(&entry.item, server_id, entry.playback_state.as_ref())
             } else {
                 media_item_to_json_with_playback_and_metadata(
@@ -33316,7 +33379,8 @@ async fn media_catalog_items_result(
                     entry.playback_state.as_ref(),
                     Some(&entry.metadata),
                 )
-            }
+            };
+            shape_catalog_item_for_query(item, query)
         })
         .collect();
     Ok(Some(Json(query_result_with_total(
@@ -34634,7 +34698,65 @@ async fn latest_items_candidates(
         return Ok(items);
     }
 
-    filtered_media_items(db.media_items().await?, query, user_id, db).await
+    // Never fall back to loading the entire catalogue: a standard client can issue several
+    // Latest calls concurrently and one unsupported predicate previously materialized ~1M rows,
+    // exhausting the six-connection pool. Pull a newest-first safety window from SQL and retain
+    // the legacy matcher only inside that bounded set.
+    const LATEST_FALLBACK_CANDIDATES: usize = 2_000;
+    let configuration = latest_user_configuration(db, query, user_id).await?;
+    let folders = db.virtual_folders().await?;
+    let mut folder_ids = if let Some(parent_id) = query
+        .parent_id
+        .as_deref()
+        .map(parse_jellyfin_uuid)
+        .transpose()?
+    {
+        let Some(parent) = folders.iter().find(|folder| folder.id == parent_id) else {
+            return Ok(Vec::new());
+        };
+        let mut values = vec![parent.id];
+        values.extend(
+            child_virtual_folders(parent, &folders)
+                .into_iter()
+                .map(|folder| folder.id),
+        );
+        values
+    } else {
+        folders.iter().map(|folder| folder.id).collect()
+    };
+    folder_ids.retain(|id| !configuration.excluded_folder_ids.contains(id));
+    if folder_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let page = MediaCatalogStore::media_item_catalog_page(
+        db,
+        &MediaItemCatalogQuery {
+            limit: LATEST_FALLBACK_CANDIDATES,
+            include_total_record_count: false,
+            virtual_folder_ids: folder_ids,
+            allowed_plugin_tuner_ids: query.allowed_plugin_tuner_ids.clone(),
+            user_id,
+            sort: vec![
+                (
+                    MediaItemCatalogSortField::DateLastMediaAdded,
+                    SortDirection::Descending,
+                ),
+                (
+                    MediaItemCatalogSortField::SortName,
+                    SortDirection::Descending,
+                ),
+            ],
+            ..MediaItemCatalogQuery::default()
+        },
+    )
+    .await?;
+    filtered_media_items(
+        page.items.into_iter().map(|entry| entry.item).collect(),
+        query,
+        user_id,
+        db,
+    )
+    .await
 }
 
 fn latest_items_limit(query: &ItemsQuery) -> usize {
@@ -34743,6 +34865,7 @@ async fn exact_latest_items_page(
 
     db_query.start_index = 0;
     db_query.limit = limit;
+    db_query.include_total_record_count = false;
     // Mirror `compare_media_items(right, left, [DateLastMediaAdded, SortName])`: the repository
     // appends a descending id tie-break for a descending sort, which matters here because a library
     // sync stamps thousands of rows with the same `updated_at`.
@@ -49905,8 +50028,9 @@ async fn metadata_collection_keys(
     if let Some(user_id) = query.user_id.as_deref().map(resolve_user_id).transpose()? {
         ensure_user_access(&auth_user, user_id)?;
     }
-    if metadata_facet_query_is_supported(&query)
-        && let Some(folder_ids) = metadata_facet_folder_scope(&state.db, &query).await?
+    let facet_query = metadata_facet_query_with_redundant_types_removed(&state.db, &query).await?;
+    if metadata_facet_query_is_supported(&facet_query)
+        && let Some(folder_ids) = metadata_facet_folder_scope(&state.db, &facet_query).await?
     {
         let values = MediaCatalogStore::media_item_facet_values(&state.db, facet_kind, &folder_ids)
             .await?
@@ -49942,6 +50066,60 @@ async fn metadata_collection_keys(
     Ok(Json(metadata_values_response(
         values, &server_id, item_type, &query,
     )))
+}
+
+/// Jellyfin Web repeats the folder's own media type on Genres/Studios requests. Once a request is
+/// scoped to a real homogeneous virtual folder, that predicate is redundant; retaining it forced
+/// the legacy path to materialize hundreds of thousands of items instead of using the facet table.
+async fn metadata_facet_query_with_redundant_types_removed(
+    db: &Database,
+    query: &ItemsQuery,
+) -> Result<ItemsQuery, ApiError> {
+    let Some(parent_id) = query.parent_id.as_deref() else {
+        return Ok(query.clone());
+    };
+    let Ok(parent_id) = parse_jellyfin_uuid(parent_id) else {
+        return Ok(query.clone());
+    };
+    let folders = db.virtual_folders().await?;
+    let Some(folder) = folders.iter().find(|folder| folder.id == parent_id) else {
+        return Ok(query.clone());
+    };
+    let collection_type = folder
+        .collection_type
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let compatible = |item_type: &str| match collection_type.as_str() {
+        "movies" => matches!(item_type.to_ascii_lowercase().as_str(), "movie" | "video"),
+        "tvshows" | "tvshow" | "series" => matches!(
+            item_type.to_ascii_lowercase().as_str(),
+            "series" | "season" | "episode" | "video"
+        ),
+        "music" => matches!(
+            item_type.to_ascii_lowercase().as_str(),
+            "audio" | "musicalbum" | "musicartist"
+        ),
+        _ => false,
+    };
+    if query.include_item_types.is_empty()
+        || !query
+            .include_item_types
+            .iter()
+            .all(|value| compatible(value))
+    {
+        return Ok(query.clone());
+    }
+    let mut normalized = query.clone();
+    normalized.include_item_types.clear();
+    if normalized
+        .media_types
+        .iter()
+        .all(|value| value.eq_ignore_ascii_case("Video"))
+    {
+        normalized.media_types.clear();
+    }
+    Ok(normalized)
 }
 
 fn metadata_facet_query_is_supported(query: &ItemsQuery) -> bool {
@@ -52601,38 +52779,53 @@ async fn similar_items_for_media_source(
     let source = media_item_by_id(&state.db, item_id).await?;
     let server_id = state.db.server_state().await?.server_id.to_string();
     let source_type = media_item_type(&source).to_string();
+    let source_metadata = metadata_payload_for_item(&state.db, source.id).await?;
+    let source_terms = similar_item_terms(Some(&source_metadata));
+    if source_terms.is_empty() {
+        return Ok(Json(query_result_with_total(Vec::new(), 0, 0)));
+    }
+    let requested_start_index = query.start_index.unwrap_or(0);
+    let requested_limit = query.limit.unwrap_or(20).min(100);
     let mut items_query = query.clone();
-    if items_query.include_item_types.is_empty() {
-        items_query.include_item_types.push(source_type.clone());
-    }
-    let entries = MediaCatalogStore::media_items_with_metadata_by_effective_types(
-        &state.db,
-        std::slice::from_ref(&source_type),
-    )
-    .await?;
-    let mut candidate_items = Vec::with_capacity(entries.len());
-    let mut metadata_by_item = HashMap::with_capacity(entries.len());
-    for entry in entries {
-        metadata_by_item.insert(entry.item.id, entry.metadata);
-        candidate_items.push(entry.item);
-    }
-    let mut candidates = filtered_media_items(
-        candidate_items,
-        &items_query,
-        Some(requested_user_id),
-        &state.db,
-    )
-    .await?;
-    candidates.retain(|item| item.id != source.id);
-
-    let source_terms = similar_item_terms(metadata_by_item.get(&source.id));
-    let mut scored = candidates
+    items_query.parent_id = None;
+    items_query.include_item_types = vec![source_type.clone()];
+    items_query.start_index = Some(0);
+    items_query.limit = Some(500);
+    items_query.sort_by = Some("SortName".to_string());
+    items_query.sort_order = Some("Ascending".to_string());
+    let genres = metadata_values_from_json(&source_metadata, &["Genres", "SeriesGenres"]);
+    let studios = metadata_values_from_json(&source_metadata, &["Studios", "SeriesStudios"]);
+    let tags = metadata_values_from_json(&source_metadata, &["Tags"]);
+    items_query.genre_ids = genres;
+    items_query.studio_ids = if items_query.genre_ids.is_empty() {
+        studios
+    } else {
+        Vec::new()
+    };
+    items_query.tags = if items_query.genre_ids.is_empty() && items_query.studio_ids.is_empty() {
+        tags
+    } else {
+        Vec::new()
+    };
+    let Some(mut db_query) = media_catalog_query_for_items(&items_query, Some(requested_user_id))?
+    else {
+        return Ok(Json(query_result_with_total(Vec::new(), 0, 0)));
+    };
+    db_query.virtual_folder_ids = vec![source.virtual_folder_id];
+    db_query.include_total_record_count = false;
+    let page = MediaCatalogStore::media_item_catalog_page(&state.db, &db_query).await?;
+    let mut scored = page
+        .items
         .into_iter()
-        .filter_map(|item| {
+        .filter_map(|entry| {
+            let item = entry.item;
+            if item.id == source.id {
+                return None;
+            }
             if !media_item_type(&item).eq_ignore_ascii_case(&source_type) {
                 return None;
             }
-            let terms = similar_item_terms(metadata_by_item.get(&item.id));
+            let terms = similar_item_terms(Some(&entry.metadata));
             let shared_terms = terms.intersection(&source_terms).count();
             if shared_terms == 0 {
                 return None;
@@ -52647,19 +52840,17 @@ async fn similar_items_for_media_source(
             .then_with(|| compare_media_items(left_item, right_item, &[SortField::SortName]))
     });
 
-    let start_index = items_query.start_index.unwrap_or(0);
     let total_record_count = scored.len();
-    let limit = items_query.limit.unwrap_or(20).min(100);
     let items = scored
         .into_iter()
-        .skip(start_index)
-        .take(limit)
+        .skip(requested_start_index)
+        .take(requested_limit)
         .map(|(_, item)| item)
         .collect::<Vec<_>>();
     Ok(Json(query_result_with_total(
         items_to_json(&state.db, items, &server_id, Some(requested_user_id), false).await?,
         total_record_count,
-        start_index,
+        requested_start_index,
     )))
 }
 
@@ -54405,7 +54596,7 @@ async fn tv_series_items_result(
                 summary.id.get_or_insert_with(|| series.id.clone());
                 summary
             })
-            .map(|summary| tv_series_json(server_id, summary))
+            .map(|summary| shape_catalog_item_for_query(tv_series_json(server_id, summary), query))
             .collect::<Vec<_>>();
         return Ok(Json(query_result_with_total(
             items,
@@ -60082,17 +60273,58 @@ async fn bitrate_test(
 
 async fn item_placeholder_image(
     State(state): State<AppState>,
+    Query(size): Query<ImageResizeQuery>,
     Path((item_id, image_type)): Path<(String, String)>,
 ) -> Result<axum::response::Response, ApiError> {
-    item_image_or_placeholder(&state, &item_id, &image_type, 0).await
+    item_image_or_placeholder(&state, &item_id, &image_type, 0, size.normalized()).await
 }
 
 async fn item_placeholder_image_by_index(
     State(state): State<AppState>,
+    Query(size): Query<ImageResizeQuery>,
     Path((item_id, image_type, image_index)): Path<(String, String, String)>,
 ) -> Result<axum::response::Response, ApiError> {
     let image_index = parse_image_index(&image_index)?;
-    item_image_or_placeholder(&state, &item_id, &image_type, image_index).await
+    item_image_or_placeholder(
+        &state,
+        &item_id,
+        &image_type,
+        image_index,
+        size.normalized(),
+    )
+    .await
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+struct ImageResizeQuery {
+    #[serde(alias = "MaxWidth", alias = "maxWidth")]
+    max_width: Option<u32>,
+    #[serde(alias = "MaxHeight", alias = "maxHeight")]
+    max_height: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ImageResize {
+    max_width: u32,
+    max_height: u32,
+}
+
+impl ImageResizeQuery {
+    fn normalized(self) -> Option<ImageResize> {
+        const MAX_IMAGE_EDGE: u32 = 4096;
+        let requested_width = self.max_width.filter(|value| *value > 0);
+        let requested_height = self.max_height.filter(|value| *value > 0);
+        let max_width = requested_width
+            .unwrap_or(MAX_IMAGE_EDGE)
+            .clamp(1, MAX_IMAGE_EDGE);
+        let max_height = requested_height
+            .unwrap_or(MAX_IMAGE_EDGE)
+            .clamp(1, MAX_IMAGE_EDGE);
+        (requested_width.is_some() || requested_height.is_some()).then_some(ImageResize {
+            max_width,
+            max_height,
+        })
+    }
 }
 
 type ExtendedItemImagePath = (
@@ -60109,20 +60341,26 @@ type ExtendedItemImagePath = (
 
 async fn item_placeholder_image_extended(
     State(state): State<AppState>,
+    Query(query_size): Query<ImageResizeQuery>,
     Path((
         item_id,
         image_type,
         image_index,
         _tag,
         _format,
-        _max_width,
-        _max_height,
+        max_width,
+        max_height,
         _percent_played,
         _unplayed_count,
     )): Path<ExtendedItemImagePath>,
 ) -> Result<axum::response::Response, ApiError> {
     let image_index = parse_image_index(&image_index)?;
-    item_image_or_placeholder(&state, &item_id, &image_type, image_index).await
+    let path_size = ImageResizeQuery {
+        max_width: max_width.parse().ok(),
+        max_height: max_height.parse().ok(),
+    };
+    let size = query_size.normalized().or_else(|| path_size.normalized());
+    item_image_or_placeholder(&state, &item_id, &image_type, image_index, size).await
 }
 
 async fn user_placeholder_image(
@@ -60699,6 +60937,7 @@ async fn item_image_or_placeholder(
     item_id: &str,
     image_type: &str,
     image_index: usize,
+    resize: Option<ImageResize>,
 ) -> Result<axum::response::Response, ApiError> {
     if let Some(item) = live_tv_item_for_image(&state.db, item_id).await? {
         if let Some(response) =
@@ -60716,7 +60955,7 @@ async fn item_image_or_placeholder(
     if let Some(stored) =
         find_stored_image(state, ImageOwner::Item(item_id), image_type, image_index).await?
     {
-        return stored_image_response(stored).await;
+        return stored_image_response_sized(state, stored, resize).await;
     }
     let item = match media_item_by_id(&state.db, item_id).await {
         Ok(item) => item,
@@ -60725,7 +60964,8 @@ async fn item_image_or_placeholder(
             // request for one used to fall straight through to the placeholder. Their episodes carry
             // it in metadata.
             if let Some(response) =
-                virtual_tv_item_image_response(state, item_id, image_type, image_index).await?
+                virtual_tv_item_image_response(state, item_id, image_type, image_index, resize)
+                    .await?
             {
                 return Ok(response);
             }
@@ -60737,41 +60977,35 @@ async fn item_image_or_placeholder(
     let metadata = metadata_payload_for_item(&state.db, item.id).await?;
     let metadata_image_provider = remote_image_provider_name(&metadata);
     if image_policy.allows("", &metadata_image_provider)
-        && let Some(response) =
-            remote_metadata_item_image_response(state, item_id, &metadata, image_type, image_index)
-                .await?
+        && let Some(response) = remote_metadata_item_image_response(
+            state,
+            item_id,
+            &metadata,
+            image_type,
+            image_index,
+            resize,
+            !is_plugin_vod_virtual_item(&item),
+        )
+        .await?
     {
         return Ok(response);
     }
-    if image_index == 0
-        && normalize_image_type(image_type) == "primary"
-        && let Some(target) = plugin_vod_item_metadata_target(&item, &metadata)
-    {
-        if let Err(error) = ensure_plugin_vod_metadata(state, &target).await {
-            tracing::warn!(
-                status = %error.status(),
-                "VOD artwork resolution was unavailable; using placeholder"
-            );
-        }
-        if let Some(path) =
-            find_stored_image(state, ImageOwner::Item(item_id), "Primary", 0).await?
-        {
-            return stored_image_response(path).await;
-        }
-    }
+    // Grid image requests must never wait for a credentialed provider RPC. Item detail/playback
+    // enrichment populates the cache; until then the UI receives a cheap placeholder.
     if let Some(local_image) = find_local_item_image(&item, image_type, image_index).await? {
-        return stored_image_response(local_image).await;
+        return stored_image_response_sized(state, local_image, resize).await;
     }
     // Try plugin ImageProvider as fallback
-    if let Some(plugin_image) =
-        item_image_from_plugins(&state.db, item_id, media_item_type(&item), image_type).await?
+    if !is_plugin_vod_virtual_item(&item)
+        && let Some(plugin_image) =
+            item_image_from_plugins(&state.db, item_id, media_item_type(&item), image_type).await?
     {
         return Ok(plugin_image);
     }
     if let Some(generated_image) =
         find_generated_video_item_image(state, &item, item_id, image_type, image_index).await?
     {
-        return stored_image_response(generated_image).await;
+        return stored_image_response_sized(state, generated_image, resize).await;
     }
     Ok(placeholder_png_response())
 }
@@ -61020,18 +61254,27 @@ async fn remote_metadata_item_image_response(
     metadata: &serde_json::Value,
     image_type: &str,
     image_index: usize,
+    resize: Option<ImageResize>,
+    allow_remote_fetch: bool,
 ) -> Result<Option<axum::response::Response>, ApiError> {
     if image_index != 0 {
         return Ok(None);
     }
     for image_url in metadata_remote_image_urls(metadata, image_type) {
         if let Some(path) = find_cached_live_tv_image(state, item_id, &image_url).await? {
-            return stored_image_response(path).await.map(Some);
+            return stored_image_response_sized(state, path, resize)
+                .await
+                .map(Some);
+        }
+        if !allow_remote_fetch {
+            continue;
         }
         match fetch_remote_image_payload(&image_url).await {
             Ok((bytes, _mime_type)) => {
                 let path = cache_live_tv_image(state, item_id, &image_url, &bytes).await?;
-                return stored_image_response(path).await.map(Some);
+                return stored_image_response_sized(state, path, resize)
+                    .await
+                    .map(Some);
             }
             Err(error) => {
                 tracing::warn!(
@@ -61053,6 +61296,7 @@ async fn virtual_tv_item_image_response(
     item_id: &str,
     image_type: &str,
     image_index: usize,
+    resize: Option<ImageResize>,
 ) -> Result<Option<axum::response::Response>, ApiError> {
     if image_index != 0 {
         return Ok(None);
@@ -61081,33 +61325,9 @@ async fn virtual_tv_item_image_response(
                 continue;
             }
             if let Some(path) = find_cached_live_tv_image(state, item_id, &image_url).await? {
-                return stored_image_response(path).await.map(Some);
-            }
-            match fetch_remote_image_payload(&image_url).await {
-                Ok((bytes, _mime_type)) => {
-                    let path = cache_live_tv_image(state, item_id, &image_url, &bytes).await?;
-                    return stored_image_response(path).await.map(Some);
-                }
-                Err(error) => {
-                    tracing::warn!(?error, "failed to cache remote series image candidate");
-                }
-            }
-        }
-    }
-    if normalize_image_type(image_type) == "primary" {
-        let season = item_type == "Season";
-        if let Some(target) = plugin_vod_virtual_metadata_target(&state.db, item_id, season).await?
-        {
-            if let Err(error) = ensure_plugin_vod_metadata(state, &target).await {
-                tracing::warn!(
-                    status = %error.status(),
-                    "VOD virtual artwork resolution was unavailable; using placeholder"
-                );
-            }
-            if let Some(path) =
-                find_stored_image(state, ImageOwner::Item(item_id), "Primary", 0).await?
-            {
-                return stored_image_response(path).await.map(Some);
+                return stored_image_response_sized(state, path, resize)
+                    .await
+                    .map(Some);
             }
         }
     }
@@ -61561,6 +61781,111 @@ async fn stored_image_response(path: PathBuf) -> Result<axum::response::Response
     );
     headers.insert(header::ETAG, tag.parse().unwrap());
     Ok((headers, bytes).into_response())
+}
+
+/// Return a cached, bounded JPEG derivative when Jellyfin clients request display dimensions.
+///
+/// Originals remain authoritative. Derivatives live under Jellyrin's cache (never beside a user's
+/// media), are keyed by the source path/mtime/size and requested bounds, and are generated under a
+/// single-flight lock so a grid cannot start hundreds of duplicate image decodes.
+async fn stored_image_response_sized(
+    state: &AppState,
+    path: PathBuf,
+    resize: Option<ImageResize>,
+) -> Result<axum::response::Response, ApiError> {
+    let Some(resize) = resize else {
+        return stored_image_response(path).await;
+    };
+    let metadata = tokio::fs::metadata(&path).await?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map(|value| value.as_nanos())
+        .unwrap_or_default();
+    let key = format!(
+        "{}\0{}\0{}\0{}x{}",
+        path.to_string_lossy(),
+        metadata.len(),
+        modified,
+        resize.max_width,
+        resize.max_height
+    );
+    let digest = format!("{:x}", Sha256::digest(key.as_bytes()));
+    let derivative = api_cache_root(&state.log_dir)
+        .join("metadata")
+        .join("thumbnails")
+        .join(&digest[..2])
+        .join(format!("{digest}.jpg"));
+    if tokio::fs::metadata(&derivative)
+        .await
+        .is_ok_and(|value| value.is_file() && value.len() > 0)
+    {
+        return stored_image_response(derivative).await;
+    }
+
+    let image_lock = trickplay_tile_lock(&derivative).await;
+    let _guard = image_lock.lock().await;
+    if tokio::fs::metadata(&derivative)
+        .await
+        .is_ok_and(|value| value.is_file() && value.len() > 0)
+    {
+        return stored_image_response(derivative).await;
+    }
+
+    let source = tokio::fs::read(&path).await?;
+    let encoded = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Vec<u8>>> {
+        use image::GenericImageView as _;
+
+        let mut reader =
+            image::ImageReader::new(std::io::Cursor::new(source)).with_guessed_format()?;
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(16_384);
+        limits.max_image_height = Some(16_384);
+        limits.max_alloc = Some(128 * 1024 * 1024);
+        reader.limits(limits);
+        let image = reader.decode()?;
+        let (width, height) = image.dimensions();
+        if width <= resize.max_width && height <= resize.max_height {
+            return Ok(None);
+        }
+        let thumbnail = image
+            .thumbnail(resize.max_width, resize.max_height)
+            .to_rgb8();
+        let mut output = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut output, 82)
+            .encode_image(&thumbnail)?;
+        Ok(Some(output))
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("image resize worker failed: {error}")))?;
+
+    let encoded = match encoded {
+        Ok(Some(encoded)) => encoded,
+        Ok(None) => return stored_image_response(path).await,
+        Err(error) => {
+            tracing::warn!(?error, "stored image resize failed; serving original");
+            return stored_image_response(path).await;
+        }
+    };
+    let parent = derivative
+        .parent()
+        .ok_or_else(|| ApiError::internal("thumbnail cache path has no parent"))?;
+    tokio::fs::create_dir_all(parent).await?;
+    let temporary = derivative.with_extension(format!("jpg.tmp.{}", Uuid::new_v4().simple()));
+    tokio::fs::write(&temporary, &encoded).await?;
+    match tokio::fs::rename(&temporary, &derivative).await {
+        Ok(()) => {}
+        Err(error) if tokio::fs::metadata(&derivative).await.is_ok() => {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            tracing::debug!(?error, "thumbnail was published concurrently");
+        }
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(error.into());
+        }
+    }
+    stored_image_response(derivative).await
 }
 
 pub(crate) async fn find_stored_image(
@@ -63709,6 +64034,55 @@ mod tests {
             std::path::PathBuf::from("/var/cache/jellyrin/metadata/images/items/movie-1")
         );
         assert!(!path.starts_with("/var/log"));
+    }
+
+    #[test]
+    fn image_resize_queries_are_bounded_and_catalog_flags_shape_payloads() {
+        assert_eq!(
+            super::ImageResizeQuery {
+                max_width: Some(200),
+                max_height: None,
+            }
+            .normalized(),
+            Some(super::ImageResize {
+                max_width: 200,
+                max_height: 4096,
+            })
+        );
+        assert_eq!(
+            super::ImageResizeQuery {
+                max_width: Some(99_999),
+                max_height: Some(0),
+            }
+            .normalized(),
+            Some(super::ImageResize {
+                max_width: 4096,
+                max_height: 4096,
+            })
+        );
+
+        let query = super::parse_items_query(Some(
+            "Fields=Overview&EnableImages=false&EnableUserData=false&EnableTotalRecordCount=false",
+        ));
+        let item = super::shape_catalog_item_for_query(
+            json!({
+                "Id": "item",
+                "Name": "Example",
+                "Overview": "kept",
+                "MediaSources": [{ "Path": "removed" }],
+                "ImageTags": { "Primary": "removed" },
+                "UserData": { "Played": false },
+            }),
+            &query,
+        );
+        assert_eq!(item["Overview"], "kept");
+        assert!(item.get("MediaSources").is_none());
+        assert!(item.get("ImageTags").is_none());
+        assert!(item.get("UserData").is_none());
+        assert_eq!(
+            super::query_flag(&query._enable_total_record_count),
+            Some(false)
+        );
     }
 
     #[test]
