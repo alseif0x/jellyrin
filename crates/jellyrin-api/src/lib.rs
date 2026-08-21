@@ -12087,6 +12087,25 @@ async fn authorized_live_tv_tuner_ids(
     Ok(filtered.then_some(allowed))
 }
 
+async fn ensure_plugin_catalog_item_visible(
+    db: &Database,
+    metadata: &serde_json::Value,
+    user_context: &jellyrin_plugin_sdk::PluginUserContext,
+) -> Result<(), ApiError> {
+    let Some(plugin_id) = json_string_field(metadata, "PluginProviderId") else {
+        return Ok(());
+    };
+    let Some(tuner_id) = json_string_field(metadata, "TunerId") else {
+        return Err(ApiError::not_found("Item not found"));
+    };
+    if plugin_user_may_access_tuner_catalog(db, &plugin_id, &tuner_id, user_context.clone()).await?
+    {
+        Ok(())
+    } else {
+        Err(ApiError::not_found("Item not found"))
+    }
+}
+
 async fn scope_items_query_for_plugin_catalogs(
     db: &Database,
     query: &mut ItemsQuery,
@@ -12253,6 +12272,7 @@ async fn invoke_plugin_capability_via_runtime_host_path_with_timeout(
 struct LiveTvPluginCatalogPages {
     channels: Vec<serde_json::Value>,
     categories: Vec<serde_json::Value>,
+    programs: Vec<serde_json::Value>,
     continuation_tokens: HashSet<String>,
     page_count: usize,
     accumulated_bytes: usize,
@@ -12270,6 +12290,7 @@ impl LiveTvPluginCatalogPages {
         Self {
             channels: Vec::new(),
             categories: Vec::new(),
+            programs: Vec::new(),
             continuation_tokens: HashSet::new(),
             page_count: 0,
             accumulated_bytes: 0,
@@ -12309,8 +12330,15 @@ impl LiveTvPluginCatalogPages {
                 "Live TV provider catalogue exceeded the category limit",
             ));
         }
+        let programs = live_tv_plugin_catalog_array(&value, &["Programs"], "programs")?;
+        if programs.len() > LIVE_TV_CONFIG_MAX_PROGRAMS.saturating_sub(self.programs.len()) {
+            return Err(ApiError::internal(
+                "Live TV provider catalogue exceeded the program limit",
+            ));
+        }
         self.channels.extend(channels);
         self.categories.extend(categories);
+        self.programs.extend(programs);
 
         let continuation_token = live_tv_plugin_catalog_continuation_token(&value)?;
         let has_more = match json_field_case_insensitive(&value, "HasMore") {
@@ -12349,7 +12377,8 @@ impl LiveTvPluginCatalogPages {
         CapabilityResult {
             value: serde_json::json!({
                 "Channels": self.channels,
-                "Categories": self.categories
+                "Categories": self.categories,
+                "Programs": self.programs
             }),
         }
     }
@@ -19674,6 +19703,7 @@ type LiveTvProviderProgramsFuture<'a> =
 struct LiveTvProviderImport {
     channels: Vec<serde_json::Value>,
     categories: Vec<serde_json::Value>,
+    programs: Vec<serde_json::Value>,
     channel_upserts: Vec<LiveTvChannelUpsert>,
     category_upserts: Vec<LiveTvCategoryUpsert>,
 }
@@ -19725,6 +19755,7 @@ impl LiveTvProvider for XtreamLiveTvProvider {
                 .map(|import| LiveTvProviderImport {
                     channels: import.channels,
                     categories: import.categories,
+                    programs: Vec::new(),
                     channel_upserts: Vec::new(),
                     category_upserts: Vec::new(),
                 }))
@@ -21057,10 +21088,10 @@ async fn live_tv_plugin_channel_provider_import(
             &plugin,
             capability,
             arguments,
-            runtime,
+            runtime.clone(),
             runtime_name,
             error_prefix,
-            host_path,
+            host_path.clone(),
             LIVE_TV_PROVIDER_CATALOG_TIMEOUT,
         )
         .await?
@@ -21069,10 +21100,10 @@ async fn live_tv_plugin_channel_provider_import(
             &plugin,
             capability,
             arguments,
-            runtime,
+            runtime.clone(),
             runtime_name,
             error_prefix,
-            host_path,
+            host_path.clone(),
             LIVE_TV_PROVIDER_CATALOG_TIMEOUT,
         )
         .await?
@@ -21081,6 +21112,34 @@ async fn live_tv_plugin_channel_provider_import(
         return Err(ApiError::internal(
             "Live TV plugin provider runtime is unavailable",
         ));
+    };
+    let program_result = if uses_live_tv_provider && json_string_field(payload, "EpgUrl").is_some()
+    {
+        let persisted = persisted_live_tv_tuner_configuration(db, &tuner_id).await?;
+        let request_configuration = persisted.as_ref().unwrap_or(payload);
+        let request = live_tv_plugin_provider_request(
+            db,
+            &plugin,
+            request_configuration,
+            "ImportPrograms",
+            serde_json::json!({}),
+        )
+        .await?;
+        let arguments = serde_json::to_value(request)
+            .map_err(|_| ApiError::internal("invalid Live TV provider request"))?;
+        invoke_live_tv_provider_catalog_via_runtime_host_path(
+            &plugin,
+            CAPABILITY_LIVE_TV_PROVIDER,
+            arguments,
+            runtime,
+            runtime_name,
+            error_prefix,
+            host_path,
+            LIVE_TV_PROVIDER_CATALOG_TIMEOUT,
+        )
+        .await?
+    } else {
+        None
     };
     let channels = result
         .value
@@ -21109,10 +21168,37 @@ async fn live_tv_plugin_channel_provider_import(
                 .collect()
         })
         .unwrap_or_default();
+    let mut programs: Vec<serde_json::Value> = program_result
+        .as_ref()
+        .and_then(|result| result.value.get("Programs"))
+        .and_then(serde_json::Value::as_array)
+        .map(|programs| {
+            programs
+                .iter()
+                .filter_map(safe_live_tv_plugin_program)
+                .collect()
+        })
+        .unwrap_or_default();
+    programs.retain_mut(|program| {
+        let Some(remote_channel_id) = json_string_field(program, "ChannelId") else {
+            return false;
+        };
+        let Some(channel_id) = channels.iter().find_map(|channel| {
+            json_string_field(channel, "RemoteId")
+                .is_some_and(|id| id.eq_ignore_ascii_case(&remote_channel_id))
+                .then(|| json_string_field(channel, "Id"))
+                .flatten()
+        }) else {
+            return false;
+        };
+        program["ChannelId"] = serde_json::Value::String(channel_id);
+        true
+    });
     Ok((!channels.is_empty()).then_some(LiveTvProviderImportLease {
         import: LiveTvProviderImport {
             channels,
             categories,
+            programs,
             channel_upserts: Vec::new(),
             category_upserts: Vec::new(),
         },
@@ -21120,6 +21206,51 @@ async fn live_tv_plugin_channel_provider_import(
         plugin_admission_guard: Some(admission_guard),
         plugin_provider_session_guard: Some(provider_session_guard),
     }))
+}
+
+fn safe_live_tv_plugin_program(program: &serde_json::Value) -> Option<serde_json::Value> {
+    if contains_plaintext_provider_secret(program) {
+        return None;
+    }
+    let id = safe_live_tv_plugin_string_field(program, "Id", 1_024).ok()??;
+    let name = safe_live_tv_plugin_string_field(program, "Name", 4 * 1_024).ok()??;
+    let channel_id = safe_live_tv_plugin_string_field(program, "ChannelId", 1_024).ok()??;
+    let start = safe_live_tv_plugin_string_field(program, "StartDate", 128).ok()??;
+    let end = safe_live_tv_plugin_string_field(program, "EndDate", 128).ok()??;
+    if OffsetDateTime::parse(&start, &Rfc3339).is_err()
+        || OffsetDateTime::parse(&end, &Rfc3339).is_err()
+    {
+        return None;
+    }
+    let mut safe = serde_json::json!({
+        "Id": id,
+        "Name": name,
+        "ChannelId": channel_id,
+        "StartDate": start,
+        "EndDate": end,
+    });
+    if let Ok(Some(overview)) = safe_live_tv_plugin_string_field(program, "Overview", 16 * 1_024) {
+        safe["Overview"] = serde_json::Value::String(overview);
+    }
+    if let Some(genres) = json_string_list_field(program, "Genres") {
+        safe["Genres"] = serde_json::json!(
+            genres
+                .into_iter()
+                .filter_map(|genre| safe_live_tv_plugin_text(&genre, 1_024))
+                .take(32)
+                .collect::<Vec<_>>()
+        );
+    }
+    if let Some(image_url) = json_string_field(program, "ImageUrl")
+        && reqwest::Url::parse(&image_url).is_ok_and(|url| {
+            matches!(url.scheme(), "http" | "https")
+                && url.username().is_empty()
+                && url.password().is_none()
+        })
+    {
+        safe["ImageUrl"] = serde_json::Value::String(image_url);
+    }
+    Some(safe)
 }
 
 fn safe_live_tv_plugin_category(category: &serde_json::Value) -> Option<serde_json::Value> {
@@ -21367,6 +21498,14 @@ async fn persist_live_tv_provider_import(
         .ok_or_else(|| ApiError::bad_request("Live TV tuner configuration must be an object"))?;
     object.remove("Channels");
     object.remove("Categories");
+    if import.programs.is_empty() {
+        object.remove("Programs");
+    } else {
+        object.insert(
+            "Programs".to_string(),
+            serde_json::Value::Array(import.programs.clone()),
+        );
+    }
     object.insert(
         "PersistedChannelCount".to_string(),
         serde_json::json!(channels.len()),
@@ -35655,7 +35794,8 @@ async fn item_detail(
     Query(query): Query<AuthQuery>,
     Path(item_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let (user, token) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let user_context = plugin_user_context(&user, &token);
     if item_id.eq_ignore_ascii_case("livetv") {
         return Ok(Json(live_tv_root_item_json(&state.db).await?));
     }
@@ -35698,6 +35838,7 @@ async fn item_detail(
     }
     if let Ok(mut item) = media_item_by_id(&state.db, &item_id).await {
         let mut metadata = metadata_payload_for_item(&state.db, item.id).await?;
+        ensure_plugin_catalog_item_visible(&state.db, &metadata, &user_context).await?;
         // Xtream VOD/series items import with synthetic 1-video/1-audio streams;
         // probe the remote source on-demand so the detail page can expose real
         // audio languages and subtitle tracks for selection. Cached after first probe.
@@ -35721,12 +35862,14 @@ async fn item_detail(
         return Ok(Json(channel));
     }
     if let Some(mut summary) = tv_series_summary_by_id(&state.db, &item_id, None).await? {
+        ensure_plugin_catalog_item_visible(&state.db, &summary.metadata, &user_context).await?;
         enrich_plugin_vod_virtual_metadata(&state, &item_id, false, &mut summary.metadata).await;
         return Ok(Json(tv_series_json(&server_id, summary)));
     }
     if let Some((series_name, series_id, mut summary)) =
         tv_season_summary_by_id(&state.db, &item_id, None).await?
     {
+        ensure_plugin_catalog_item_visible(&state.db, &summary.metadata, &user_context).await?;
         enrich_plugin_vod_virtual_metadata(&state, &item_id, true, &mut summary.metadata).await;
         return Ok(Json(tv_season_json(
             &server_id,
@@ -35752,8 +35895,9 @@ async fn current_user_item_detail(
     Path(item_id): Path<String>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let auth_user =
-        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let (auth_user, token) =
+        require_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let user_context = plugin_user_context(&auth_user, &token);
     let query = parse_items_query(raw_query.as_deref());
     let requested_user_id = query
         .user_id
@@ -35808,6 +35952,7 @@ async fn current_user_item_detail(
             .playback_state_for_item(requested_user_id, item.id)
             .await?;
         let mut metadata = metadata_payload_for_item(&state.db, item.id).await?;
+        ensure_plugin_catalog_item_visible(&state.db, &metadata, &user_context).await?;
         // Android, Android TV and Jellyfin Web normally read the user-scoped detail route rather
         // than `/Items/{id}`. Keep its Xtream contract identical so episode detail pages receive
         // the real embedded audio/subtitle tracks instead of the two synthetic import streams.
@@ -35833,12 +35978,14 @@ async fn current_user_item_detail(
     if let Some(mut summary) =
         tv_series_summary_by_id(&state.db, &item_id, Some(requested_user_id)).await?
     {
+        ensure_plugin_catalog_item_visible(&state.db, &summary.metadata, &user_context).await?;
         enrich_plugin_vod_virtual_metadata(&state, &item_id, false, &mut summary.metadata).await;
         return Ok(Json(tv_series_json(&server_id, summary)));
     }
     if let Some((series_name, series_id, mut summary)) =
         tv_season_summary_by_id(&state.db, &item_id, Some(requested_user_id)).await?
     {
+        ensure_plugin_catalog_item_visible(&state.db, &summary.metadata, &user_context).await?;
         enrich_plugin_vod_virtual_metadata(&state, &item_id, true, &mut summary.metadata).await;
         return Ok(Json(tv_season_json(
             &server_id,
@@ -35863,7 +36010,8 @@ async fn user_item_detail(
     Query(query): Query<AuthQuery>,
     Path((user_id, item_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let auth_user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let (auth_user, token) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let user_context = plugin_user_context(&auth_user, &token);
     let user_id = resolve_user_id(&user_id)?;
     ensure_user_access(&auth_user, user_id)?;
     if item_id.eq_ignore_ascii_case("livetv") {
@@ -35909,6 +36057,7 @@ async fn user_item_detail(
     if let Ok(mut item) = media_item_by_id(&state.db, &item_id).await {
         let playback = state.db.playback_state_for_item(user_id, item.id).await?;
         let mut metadata = metadata_payload_for_item(&state.db, item.id).await?;
+        ensure_plugin_catalog_item_visible(&state.db, &metadata, &user_context).await?;
         if is_xtream_remote_media(Some(&metadata)) {
             item = ensure_xtream_remote_media_info(&state, item, &mut metadata)
                 .await?
@@ -35929,12 +36078,14 @@ async fn user_item_detail(
         return Ok(Json(channel));
     }
     if let Some(mut summary) = tv_series_summary_by_id(&state.db, &item_id, Some(user_id)).await? {
+        ensure_plugin_catalog_item_visible(&state.db, &summary.metadata, &user_context).await?;
         enrich_plugin_vod_virtual_metadata(&state, &item_id, false, &mut summary.metadata).await;
         return Ok(Json(tv_series_json(&server_id, summary)));
     }
     if let Some((series_name, series_id, mut summary)) =
         tv_season_summary_by_id(&state.db, &item_id, Some(user_id)).await?
     {
+        ensure_plugin_catalog_item_visible(&state.db, &summary.metadata, &user_context).await?;
         enrich_plugin_vod_virtual_metadata(&state, &item_id, true, &mut summary.metadata).await;
         return Ok(Json(tv_season_json(
             &server_id,
