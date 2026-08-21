@@ -60301,26 +60301,31 @@ async fn bitrate_test(
 
 async fn item_placeholder_image(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(size): Query<ImageResizeQuery>,
     Path((item_id, image_type)): Path<(String, String)>,
 ) -> Result<axum::response::Response, ApiError> {
-    item_image_or_placeholder(&state, &item_id, &image_type, 0, size.normalized()).await
+    let response =
+        item_image_or_placeholder(&state, &item_id, &image_type, 0, size.normalized()).await?;
+    Ok(conditional_image_response(&headers, response))
 }
 
 async fn item_placeholder_image_by_index(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(size): Query<ImageResizeQuery>,
     Path((item_id, image_type, image_index)): Path<(String, String, String)>,
 ) -> Result<axum::response::Response, ApiError> {
     let image_index = parse_image_index(&image_index)?;
-    item_image_or_placeholder(
+    let response = item_image_or_placeholder(
         &state,
         &item_id,
         &image_type,
         image_index,
         size.normalized(),
     )
-    .await
+    .await?;
+    Ok(conditional_image_response(&headers, response))
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
@@ -60369,6 +60374,7 @@ type ExtendedItemImagePath = (
 
 async fn item_placeholder_image_extended(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query_size): Query<ImageResizeQuery>,
     Path((
         item_id,
@@ -60388,7 +60394,9 @@ async fn item_placeholder_image_extended(
         max_height: max_height.parse().ok(),
     };
     let size = query_size.normalized().or_else(|| path_size.normalized());
-    item_image_or_placeholder(&state, &item_id, &image_type, image_index, size).await
+    let response =
+        item_image_or_placeholder(&state, &item_id, &image_type, image_index, size).await?;
+    Ok(conditional_image_response(&headers, response))
 }
 
 async fn user_placeholder_image(
@@ -61791,6 +61799,46 @@ async fn item_image_info_from_path(
         "Size": tokio::fs::metadata(&path).await?.len(),
         "MimeType": image_format_from_extension(extension).content_type,
     }))
+}
+
+fn conditional_image_response(
+    request_headers: &HeaderMap,
+    mut response: axum::response::Response,
+) -> axum::response::Response {
+    let Some(response_etag) = response
+        .headers()
+        .get(header::ETAG)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return response;
+    };
+    let matches = request_headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|candidates| {
+            candidates.split(',').any(|candidate| {
+                let candidate = candidate.trim();
+                candidate == "*"
+                    || normalized_etag(candidate)
+                        .eq_ignore_ascii_case(normalized_etag(response_etag))
+            })
+        });
+    if !matches {
+        return response;
+    }
+    *response.status_mut() = StatusCode::NOT_MODIFIED;
+    response.headers_mut().remove(header::CONTENT_LENGTH);
+    response.headers_mut().remove(header::CONTENT_TYPE);
+    *response.body_mut() = Body::empty();
+    response
+}
+
+fn normalized_etag(value: &str) -> &str {
+    value
+        .trim()
+        .strip_prefix("W/")
+        .unwrap_or(value.trim())
+        .trim_matches('"')
 }
 
 async fn stored_image_response(path: PathBuf) -> Result<axum::response::Response, ApiError> {
@@ -63796,7 +63844,8 @@ mod tests {
     };
     use axum::{
         body::Body,
-        http::{Method, Request, StatusCode, header},
+        http::{HeaderMap, Method, Request, StatusCode, header},
+        response::IntoResponse,
     };
     use base64::{Engine as _, engine::general_purpose};
     use futures_util::{SinkExt, StreamExt};
@@ -64110,6 +64159,27 @@ mod tests {
         assert_eq!(
             super::query_flag(&query._enable_total_record_count),
             Some(false)
+        );
+
+        let response = (
+            [
+                (header::ETAG, "thumbnail-tag"),
+                (header::CONTENT_TYPE, "image/jpeg"),
+            ],
+            vec![1_u8, 2, 3],
+        )
+            .into_response();
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert(
+            header::IF_NONE_MATCH,
+            "W/\"other\", \"thumbnail-tag\"".parse().unwrap(),
+        );
+        let response = super::conditional_image_response(&request_headers, response);
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert!(response.headers().get(header::CONTENT_TYPE).is_none());
+        assert_eq!(
+            response.headers().get(header::ETAG).unwrap(),
+            "thumbnail-tag"
         );
     }
 

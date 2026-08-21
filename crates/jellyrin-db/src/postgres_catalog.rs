@@ -2902,44 +2902,67 @@ impl PostgresDatabase {
             }
             let rows = sqlx::query_as::<_, PostgresProjectedNextUpPageRow>(
                 r#"
-                WITH selected AS MATERIALIZED (
-                    SELECT DISTINCT ON (member.series_id)
-                           member.item_id, member.virtual_folder_id, member.series_id,
-                           member.item_name, member.item_path, member.season_number,
-                           member.episode_number, member.sort_name
-                    FROM media_item_tv_series_members AS member
-                    WHERE NOT EXISTS (
-                        SELECT 1
-                        FROM playback_states AS playback
-                        WHERE playback.item_id = member.item_id
-                          AND playback.user_id = $1
-                          AND playback.played
-                    )
-                    ORDER BY member.series_id, member.season_number,
-                             member.episode_number, member.sort_name, member.item_id
-                ), counted AS (
-                    SELECT count(*)::bigint AS total_record_count FROM selected
+                WITH counted AS (
+                    SELECT
+                        (SELECT count(*)::bigint
+                         FROM media_item_tv_series
+                         WHERE episode_count > 0)
+                        -
+                        (SELECT count(*)::bigint
+                         FROM (
+                             SELECT DISTINCT played_member.series_id,
+                                             played_member.virtual_folder_id
+                             FROM playback_states AS playback
+                             JOIN media_item_tv_series_members AS played_member
+                               ON played_member.item_id = playback.item_id
+                             WHERE playback.user_id = $1 AND playback.played
+                         ) AS affected
+                         WHERE NOT EXISTS (
+                             SELECT 1
+                             FROM media_item_tv_series_members AS candidate
+                             WHERE candidate.series_id = affected.series_id
+                               AND candidate.virtual_folder_id = affected.virtual_folder_id
+                               AND NOT EXISTS (
+                                   SELECT 1
+                                   FROM playback_states AS state
+                                   WHERE state.user_id = $1
+                                     AND state.item_id = candidate.item_id
+                                     AND state.played
+                               )
+                         )) AS total_record_count
                 )
                 SELECT page.item_id, page.virtual_folder_id, page.item_name, page.item_path,
                        counted.total_record_count
                 FROM counted
                 LEFT JOIN LATERAL (
-                    SELECT selected.item_id, selected.virtual_folder_id,
-                           selected.item_name, selected.item_path,
-                           series.series_name, selected.season_number,
-                           selected.episode_number, selected.sort_name
-                    FROM selected
-                    JOIN media_item_tv_series AS series
-                      ON series.virtual_folder_id = selected.virtual_folder_id
-                     AND series.series_id = selected.series_id
+                    SELECT candidate.item_id, candidate.virtual_folder_id,
+                           candidate.item_name, candidate.item_path,
+                           series.series_name, series.series_id, series.virtual_folder_id
+                    FROM media_item_tv_series AS series
+                    JOIN LATERAL (
+                        SELECT member.item_id, member.virtual_folder_id,
+                               member.item_name, member.item_path
+                        FROM media_item_tv_series_members AS member
+                        WHERE member.series_id = series.series_id
+                          AND member.virtual_folder_id = series.virtual_folder_id
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM playback_states AS playback
+                              WHERE playback.item_id = member.item_id
+                                AND playback.user_id = $1
+                                AND playback.played
+                          )
+                        ORDER BY member.season_number, member.episode_number,
+                                 member.sort_name, member.item_id
+                        LIMIT 1
+                    ) AS candidate ON true
+                    WHERE series.episode_count > 0
                     ORDER BY lower(series.series_name), series.series_name,
-                             selected.season_number, selected.episode_number,
-                             selected.sort_name, selected.item_id
+                             series.series_id, series.virtual_folder_id
                     OFFSET $2 LIMIT $3
                 ) AS page ON true
                 ORDER BY lower(page.series_name), page.series_name,
-                         page.season_number, page.episode_number,
-                         page.sort_name, page.item_id
+                         page.series_id, page.virtual_folder_id
                 "#,
             )
             .bind(user_id)
@@ -10561,6 +10584,25 @@ mod tests {
                 .await?;
             assert_eq!(without_total.total_record_count, 0);
             assert_eq!(without_total.items.len(), 1);
+            test.database
+                .upsert_playback_state(crate::UpsertPlaybackState {
+                    user_id: user.id,
+                    item_id: other_series_id,
+                    media_source_id: None,
+                    audio_stream_index: None,
+                    subtitle_stream_index: None,
+                    position_ticks: 0,
+                    is_paused: false,
+                    played: true,
+                })
+                .await?;
+            let after_completing_series = test
+                .database
+                .tv_next_up_candidate_page(user.id, 0, 10, true)
+                .await?;
+            assert_eq!(after_completing_series.total_record_count, 1);
+            assert_eq!(after_completing_series.items.len(), 1);
+            assert_eq!(after_completing_series.items[0].id, unplayed_id);
             anyhow::Ok(())
         }
         .await;
