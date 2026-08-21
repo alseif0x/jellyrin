@@ -129,6 +129,20 @@ promedia 0,407 ms y el endpoint completo 31–54 ms. El conteo exacto posterior 
 466 ms a unos 12 ms. Esos caminos dependientes del usuario no entran en Redis. La activación se
 limita a facetas compartidas, donde muchos usuarios reutilizan el mismo resultado.
 
+El rollout real se hizo con Redis 8.2.8, autenticado, limitado a loopback, `maxmemory=64 MiB`
+y cgroup de 96 MiB. Tras vaciar exclusivamente la caché efímera, la faceta de géneros de
+Películas (56 valores, respuesta de 36.676 bytes) tardó 185 ms en frío y 6–8 ms en cinco
+lecturas calientes. Redis confirmó cinco hits, dos misses del fill con recheck, cero errores y
+un único valor con TTL; `used_memory` fue aproximadamente 645 KiB. Las seis respuestas fueron
+idénticas byte a byte.
+
+La prueba fail-open detuvo deliberadamente solo Redis: la misma ruta siguió respondiendo 200
+desde PostgreSQL en 205 ms y Jellyrin permaneció activo. Tras restaurarlo y superar el bypass de
+cinco segundos, la primera lectura repobló la clave en 186 ms y la siguiente volvió a 6 ms, con
+contenido idéntico. El contenedor terminó `healthy`, sin reinicios ni OOM. Esta mejora de unas
+25–30 veces en caliente sí supera el umbral de activación para una proyección compartida por
+muchos usuarios; no justifica cachear respuestas personalizadas.
+
 Los resultados completos, incluidos imágenes, gzip e índices, están en
 [`catalog-performance.md`](catalog-performance.md).
 

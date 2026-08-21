@@ -30,7 +30,7 @@ Mediciones locales end-to-end, 20 elementos, PostgreSQL con el catálogo real:
 | --- | ---: | ---: |
 | `Latest` | 9,5 s | 14–22 ms |
 | `NextUp`, sin total exacto | 10–14 s; a veces timeout 500 | 31–54 ms |
-| `NextUp`, total exacto | 10–14 s | plan PostgreSQL ~12 ms; pendiente medida end-to-end del release |
+| `NextUp`, total exacto | 10–14 s | 36–57 ms end-to-end; plan PostgreSQL 7,7 ms |
 | Abrir una serie | no aislado | 73–83 ms |
 | Listar episodios de una serie | no aislado | 4 ms |
 | Abrir una película con enriquecimiento aún frío | no aislado | 1,62 s la primera vez |
@@ -45,6 +45,8 @@ Una carátula de prueba bajó de 4.537.535 bytes (PNG 1920×1080) a 13.889 bytes
 primera generación tardó 139 ms y la lectura cacheada 80 ms. Una respuesta JSON de 91.300 bytes se
 transfirió por nginx en 8.653 bytes con gzip. Con `Fields=PrimaryImageAspectRatio` y los tres flags
 pesados desactivados, una página de 20 películas quedó en 21.129 bytes y 10–11 ms.
+La revalidación HTTP de una miniatura de 30.859 bytes devolvió `304 Not Modified` con cuerpo de
+0 bytes al presentar su `ETag`, evitando volver a transferir o decodificar la imagen.
 
 ## Perfil PostgreSQL aplicado
 
@@ -93,6 +95,12 @@ Redis se añade de forma opcional después de corregir cardinalidad, serializaci
 inicial son las facetas públicas compartidas por biblioteca: géneros, estudios, personas,
 etiquetas y años. El diseño cache-aside usa TTL 30 s, máximo 64 KiB, timeout 20 ms, claves
 versionadas/hasheadas, single-flight y bypass automático de cinco segundos ante fallo.
+
+En el despliegue real, Géneros de Películas midió 185 ms en frío y 6–8 ms en caliente, con cinco
+hits confirmados, cero errores y unos 645 KiB usados por Redis. Con Redis detenido respondió 200
+desde PostgreSQL en 205 ms; tras recuperarlo, el ciclo repoblación→hit midió 186 ms→6 ms. Los
+payloads fueron idénticos en todas las rutas y Jellyrin no se reinició. Estos números validan el
+uso compartido para muchos usuarios sin convertir Redis en dependencia de disponibilidad.
 
 Las cachés adecuadas siguen siendo específicas y cerca del propietario:
 
