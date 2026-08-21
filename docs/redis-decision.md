@@ -1,6 +1,6 @@
 # Decisión sobre Redis para Jellyrin
 
-**Estado (2026-08-08): no integrar ni desplegar Redis.** Se conserva únicamente
+**Estado (revalidado el 2026-08-21): no integrar ni desplegar Redis.** Se conserva únicamente
 scaffolding dormido de Compose bajo profiles explícitos para reproducir el
 benchmark o reevaluar una necesidad futura; no es un componente opcional del
 despliegue vigente. En la topología objetivo
@@ -106,6 +106,18 @@ la diferencia media por lookup fue menor de una décima de milisegundo. La API,
 serialización JSON y red del proveedor dominan mucho antes. Además, la copia de
 50 MiB ocupó cerca de 68 MiB adicionales dentro de Redis; PostgreSQL y su page
 cache ya forman parte del presupuesto obligatorio.
+
+### Revalidación con el catálogo real (2026-08-21)
+
+La auditoría de Home y bibliotecas confirmó de nuevo que Redis no era el siguiente paso. `Latest`
+materializaba cerca de un millón de filas y `NextUp` enviaba 43.363 candidatos a Rust para mostrar
+20. Tras paginar en PostgreSQL y respetar `EnableTotalRecordCount`, el SQL de `NextUp` sin total
+promedia 0,407 ms y el endpoint completo 31–54 ms; con total exacto queda en 487–540 ms. Una caché
+distribuida no mejoraría materialmente esos números y sí tendría que invalidarse por catálogo,
+asignación de cuenta y progreso de cada usuario.
+
+Los resultados completos, incluidos imágenes, gzip e índices, están en
+[`catalog-performance.md`](catalog-performance.md).
 
 ## Decisión operativa
 
