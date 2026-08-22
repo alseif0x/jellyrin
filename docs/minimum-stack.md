@@ -14,7 +14,7 @@ del contenedor, no reservas permanentes de memoria o CPU.
 | Jellyfin Web | Obligatorio si se usa la interfaz web | Se construye con `ops/build-jellyfin-web.sh`; las aplicaciones nativas solo necesitan la API. |
 | Redis | Opcional | Caché fail-open para facetas públicas y conteos compartidos de bibliotecas. PostgreSQL sigue respondiendo si Redis cae. |
 | nginx u otro proxy inverso | Opcional | Solo hace falta normalmente para TLS, dominio público, límites perimetrales o integración ACME. Jellyrin puede exponerse directamente por su puerto y comprime JSON/web de forma nativa. |
-| Sidecars de plugins | Condicional | Solo para plugins cuyo manifiesto y permisos requieran un proceso auxiliar, como el egress aislado de MAGSTV. |
+| Sidecars de plugins | Condicional | Solo para plugins cuyo manifiesto y permisos requieran un proceso auxiliar. MAGSTV necesita su egress aislado con WireGuard; Stream Sources no lo necesita. |
 | DLNA override | Opcional | Necesario únicamente cuando se quiere descubrimiento SSDP/UPnP en la LAN. |
 
 PostgreSQL y Redis deben permanecer en la red privada de Compose. Para acceso directo en una LAN se
@@ -65,6 +65,20 @@ El despliegue Compose debe añadir `docker-compose.redis-cache.yml`, definir
 `cache`/`distributed-cache`. Si el overlay se fija en `COMPOSE_FILE`, también debe fijarse
 `COMPOSE_PROFILES=cache`; así los comandos Compose normales resuelven siempre la dependencia.
 Sin ese overlay, Redis puede ejecutarse pero Jellyrin no lo consume.
+
+### MAGSTV y WireGuard
+
+MAGSTV requiere el sidecar `magstv-egress` y una configuración WireGuard de salida en México. El
+despliegue debe añadir `docker-compose.magstv-egress.yml` y el override local que monta la
+configuración protegida, además de definir `MAGSTV_EGRESS_PROXY` y
+`JELLYRIN_PROVIDER_EGRESS_PROXY` para Jellyrin. Si los overlays se fijan en `COMPOSE_FILE`, deben
+mantenerse en todos los comandos Compose; omitirlos al recrear Jellyrin elimina la ruta del plugin.
+
+El sidecar valida que la salida sea IPv4 pública y del país esperado. La política es fail-closed:
+si WireGuard, la comprobación geográfica o el proxy no están disponibles, MAGSTV falla sin intentar
+una conexión directa. El fichero WireGuard y los secretos del proveedor se montan desde rutas
+protegidas y nunca se incluyen en Git, imágenes, manifests ni documentación. Este requisito es
+exclusivo de MAGSTV y no convierte nginx, Redis ni el sidecar en requisitos del núcleo de Jellyrin.
 
 ## Software y arquitecturas
 

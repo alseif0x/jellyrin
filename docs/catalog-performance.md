@@ -1,6 +1,6 @@
 # Rendimiento del catálogo
 
-## Estado medido el 2026-08-21
+## Estado medido el 2026-08-22
 
 La lentitud de Home, películas y series no procedía de una sola carencia de caché. Había trabajo
 sin límite en varias capas:
@@ -150,18 +150,20 @@ cacheada; buscarla por el id de la temporada nunca la encontraba.
 
 ## Perfil PostgreSQL aplicado
 
-El host de 24 GiB usa el perfil conservador versionado en
-`ops/postgres/performance-24gb.conf.example`:
+El host medido tiene 12 GiB y aplica desde su `.env` este perfil conservador, sin cambiar los
+valores portables del Compose ni convertirlos en requisitos mínimos:
 
-- `shared_buffers = 3GB`;
-- `effective_cache_size = 12GB`;
-- `work_mem = 12MB` por nodo de sort/hash;
-- `maintenance_work_mem = 512MB`;
+- cgroup PostgreSQL de 2 GiB, 2 CPU y `shm_size = 512 MiB`;
+- `shared_buffers = 512MB`;
+- `effective_cache_size = 1536MB`;
+- `work_mem = 8MB` por nodo de sort/hash;
+- `maintenance_work_mem = 256MB`;
 - `random_page_cost = 1.5`.
 
-El servicio usa 10 conexiones API y 3 worker. No se deben subir ambos límites sin medir memoria y
-colas: más conexiones ejecutando simultáneamente un plan malo empeoran la latencia en lugar de
-arreglarla.
+El servicio usa seis conexiones API y dos de worker. El ejemplo
+`ops/postgres/performance-24gb.conf.example` sigue disponible para un host mayor, pero no describe
+esta instalación. No se deben subir memoria, conexiones y workers a la vez sin medir memoria y
+colas: más concurrencia sobre un plan malo empeora la latencia.
 
 ## Auditoría de índices
 
@@ -205,6 +207,12 @@ payloads fueron idénticos en todas las rutas y Jellyrin no se reinició. Estos 
 uso compartido para muchos usuarios sin convertir Redis en dependencia de disponibilidad.
 En una ráfaga fría de 32 peticiones simultáneas, todas respondieron 200 con contenido idéntico y
 Redis ejecutó un solo `SET`; el single-flight convirtió el stampede potencial en un único fill.
+
+La normalización final de facetas mueve el filtrado exacto al SQL y trata `Series` como su catálogo
+de episodios. Sobre el catálogo desplegado, una consulta combinada de Movies y Series midió
+13,6 ms en frío para `/Genres` y 4,5 ms para `/Items/Filters2`; en caliente ambas quedaron alrededor
+de 5 ms. `/Genres` transfirió 5.481 bytes con gzip. Antes, esa misma combinación tardaba entre
+7,8 y 9,1 s y `/Items/Filters2` agotaba 10 s con error 500.
 
 Las cachés adecuadas siguen siendo específicas y cerca del propietario:
 
