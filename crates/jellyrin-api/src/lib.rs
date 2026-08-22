@@ -52481,7 +52481,7 @@ async fn authenticated_item_sidecars(
     match media_item_by_id(&state.db, &item_id).await {
         Ok(item) => local_sidecar_result(&state.db, &item, user.id, kind).await,
         Err(error) if error.status() == StatusCode::NOT_FOUND => {
-            if live_tv_item_exists(&state.db, &item_id).await? {
+            if virtual_or_live_tv_item_exists(&state.db, &item_id).await? {
                 Ok(empty_sidecar_result())
             } else {
                 Err(error)
@@ -52502,7 +52502,7 @@ async fn authenticated_item_sidecar_list(
     match media_item_by_id(&state.db, &item_id).await {
         Ok(item) => local_sidecar_list(&state.db, &item, user.id, kind).await,
         Err(error) if error.status() == StatusCode::NOT_FOUND => {
-            if live_tv_item_exists(&state.db, &item_id).await? {
+            if virtual_or_live_tv_item_exists(&state.db, &item_id).await? {
                 Ok(Json(Vec::new()))
             } else {
                 Err(error)
@@ -52526,7 +52526,7 @@ async fn user_item_sidecars(
     match media_item_by_id(&state.db, &item_id).await {
         Ok(item) => local_sidecar_result(&state.db, &item, user_id, kind).await,
         Err(error) if error.status() == StatusCode::NOT_FOUND => {
-            if live_tv_item_exists(&state.db, &item_id).await? {
+            if virtual_or_live_tv_item_exists(&state.db, &item_id).await? {
                 Ok(empty_sidecar_result())
             } else {
                 Err(error)
@@ -52541,6 +52541,13 @@ async fn live_tv_item_exists(db: &Database, item_id: &str) -> Result<bool, ApiEr
         return Ok(true);
     }
     Ok(live_tv_program_by_id(db, item_id).await?.is_some())
+}
+
+async fn virtual_or_live_tv_item_exists(db: &Database, item_id: &str) -> Result<bool, ApiError> {
+    if virtual_tv_item_exists(db, item_id).await? {
+        return Ok(true);
+    }
+    live_tv_item_exists(db, item_id).await
 }
 
 fn empty_sidecar_result() -> Json<serde_json::Value> {
@@ -52946,7 +52953,21 @@ async fn authenticated_item_theme_items(
         .transpose()?
         .unwrap_or(auth_user.id);
     ensure_user_access(&auth_user, requested_user_id)?;
-    let source = media_item_by_id(&state.db, &item_id).await?;
+    let source = match media_item_by_id(&state.db, &item_id).await {
+        Ok(source) => source,
+        Err(error)
+            if error.status == StatusCode::NOT_FOUND
+                && virtual_or_live_tv_item_exists(&state.db, &item_id).await? =>
+        {
+            return Ok(Json(theme_media_query_result(
+                Vec::new(),
+                0,
+                query.start_index.unwrap_or(0),
+                &item_id,
+            )));
+        }
+        Err(error) => return Err(error),
+    };
     Ok(Json(
         theme_items_result(&state.db, &source, requested_user_id, media_type, &query).await?,
     ))
@@ -56983,9 +57004,12 @@ async fn virtual_tv_item_exists(db: &Database, item_id: &str) -> Result<bool, Ap
     Ok(items.into_iter().any(|item| {
         tv_episode_info(&item).is_some_and(|info| {
             let metadata = metadata_by_item.get(&item.id);
-            tv_series_id_for_episode(&info, metadata).eq_ignore_ascii_case(item_id)
-                || tv_season_id_for_episode(&info, metadata).eq_ignore_ascii_case(item_id)
-                || tv_season_id(&info.series_name, info.season_number).eq_ignore_ascii_case(item_id)
+            jellyfin_id_matches(&tv_series_id_for_episode(&info, metadata), item_id)
+                || jellyfin_id_matches(&tv_season_id_for_episode(&info, metadata), item_id)
+                || jellyfin_id_matches(
+                    &tv_season_id(&info.series_name, info.season_number),
+                    item_id,
+                )
         })
     }))
 }
@@ -100556,6 +100580,40 @@ done
         assert_eq!(item_seasons["Items"][0]["Id"], season_id);
         assert_eq!(item_seasons["Items"][0]["Type"], "Season");
         assert_eq!(item_seasons["Items"][0]["ChildCount"], 3);
+
+        let hyphenated_series_id = parse_jellyfin_uuid(series_id)
+            .unwrap()
+            .hyphenated()
+            .to_string();
+        let hyphenated_season_id = parse_jellyfin_uuid(season_id)
+            .unwrap()
+            .hyphenated()
+            .to_string();
+        for endpoint in [
+            format!("/Items/{hyphenated_series_id}/ThemeSongs?InheritFromParent=false"),
+            format!("/Items/{hyphenated_season_id}/SpecialFeatures"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(&endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let empty: Value = serde_json::from_slice(&body).unwrap();
+            if let Some(items) = empty.as_array() {
+                assert!(items.is_empty(), "{endpoint}");
+            } else {
+                assert_eq!(empty["TotalRecordCount"], 0, "{endpoint}");
+                assert!(empty["Items"].as_array().unwrap().is_empty(), "{endpoint}");
+            }
+        }
 
         let response = app
             .clone()
