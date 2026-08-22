@@ -401,6 +401,8 @@ static PLUGIN_VOD_ARTWORK_PREFETCH_CLAIMS: OnceLock<StdMutex<HashMap<Uuid, StdIn
 static PLUGIN_VOD_ARTWORK_FILL_PENDING: OnceLock<StdMutex<HashSet<Uuid>>> = OnceLock::new();
 static INTERNAL_REMOTE_RELAYS: OnceLock<StdMutex<HashMap<String, InternalRemoteRelayEntry>>> =
     OnceLock::new();
+static RECENT_METADATA_ENTITIES: OnceLock<StdMutex<HashMap<String, MetadataEntityMatch>>> =
+    OnceLock::new();
 static CONFIGURED_PLUGIN_PACKAGES_ROOT: OnceLock<PathBuf> = OnceLock::new();
 static CONFIGURED_API_CACHE_ROOT: OnceLock<PathBuf> = OnceLock::new();
 static PLUGIN_PACKAGE_INSTALL_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
@@ -33626,6 +33628,8 @@ async fn exact_id_items_result(
         let normalized_id = id.simple().to_string();
         let value = if let Some(value) = values_by_id.remove(&normalized_id) {
             value
+        } else if let Some(entity) = recent_metadata_entity(&normalized_id) {
+            metadata_entity_match_json(server_id, &entity)
         } else if let Some(entity) = metadata_entity_by_stable_id(db, &normalized_id).await? {
             metadata_entity_match_json(server_id, &entity)
         } else {
@@ -50898,6 +50902,7 @@ fn metadata_entity_json(
     })
 }
 
+#[derive(Clone)]
 struct MetadataEntityMatch {
     name: String,
     item_type: &'static str,
@@ -51006,6 +51011,42 @@ async fn metadata_entity_by_stable_id(
         }
     }
     Ok(None)
+}
+
+const RECENT_METADATA_ENTITY_MAX_ENTRIES: usize = 32 * 1024;
+
+fn remember_metadata_people(people: &[serde_json::Value]) {
+    let cache = RECENT_METADATA_ENTITIES.get_or_init(|| StdMutex::new(HashMap::new()));
+    let Ok(mut cache) = cache.lock() else {
+        return;
+    };
+    if cache.len().saturating_add(people.len()) > RECENT_METADATA_ENTITY_MAX_ENTRIES {
+        cache.clear();
+    }
+    for person in people {
+        let Some(id) = json_string_field(person, "Id") else {
+            continue;
+        };
+        let Some(name) = json_string_field(person, "Name") else {
+            continue;
+        };
+        cache.insert(
+            id.to_ascii_lowercase(),
+            MetadataEntityMatch {
+                name,
+                item_type: "Person",
+                production_year: None,
+                metadata: Some(person.clone()),
+            },
+        );
+    }
+}
+
+fn recent_metadata_entity(entity_id: &str) -> Option<MetadataEntityMatch> {
+    RECENT_METADATA_ENTITIES
+        .get()
+        .and_then(|cache| cache.lock().ok())
+        .and_then(|cache| cache.get(&entity_id.to_ascii_lowercase()).cloned())
 }
 
 fn metadata_entity_provider_ids(metadata: &serde_json::Value) -> Option<serde_json::Value> {
@@ -55503,6 +55544,7 @@ fn metadata_people_items_from_json(
         };
         collect_metadata_people(value, &mut people, &mut seen);
     }
+    remember_metadata_people(&people);
     people
 }
 
@@ -99055,6 +99097,10 @@ done
         // are projected metadata facets, not media rows; this request must stay bounded in SQL
         // and still return the synthetic entity rather than scanning the complete catalogue.
         let person_id = stable_entity_id("Person", "Catalog Person");
+        let cached_person = super::recent_metadata_entity(&person_id)
+            .expect("rendering the catalogue page should retain its synthetic person entity");
+        assert_eq!(cached_person.name, "Catalog Person");
+        assert_eq!(cached_person.item_type, "Person");
         let response = app
             .clone()
             .oneshot(
