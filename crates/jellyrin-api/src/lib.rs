@@ -52584,7 +52584,7 @@ async fn authenticated_item_theme_media(
             if error.status == StatusCode::NOT_FOUND
                 && virtual_tv_item_exists(&state.db, &item_id).await? =>
         {
-            return Ok(Json(empty_theme_media_result()));
+            return Ok(Json(empty_theme_media_result(&item_id)));
         }
         Err(error) => return Err(error),
     };
@@ -52601,12 +52601,23 @@ async fn authenticated_item_theme_media(
     })))
 }
 
-fn empty_theme_media_result() -> serde_json::Value {
+fn empty_theme_media_result(owner_id: &str) -> serde_json::Value {
     serde_json::json!({
-        "ThemeVideosResult": query_result(Vec::new()),
-        "ThemeSongsResult": query_result(Vec::new()),
-        "SoundtrackSongsResult": query_result(Vec::new())
+        "ThemeVideosResult": theme_media_query_result(Vec::new(), 0, 0, owner_id),
+        "ThemeSongsResult": theme_media_query_result(Vec::new(), 0, 0, owner_id),
+        "SoundtrackSongsResult": theme_media_query_result(Vec::new(), 0, 0, owner_id)
     })
+}
+
+fn theme_media_query_result(
+    items: Vec<serde_json::Value>,
+    total_record_count: usize,
+    start_index: usize,
+    owner_id: &str,
+) -> serde_json::Value {
+    let mut result = query_result_with_total(items, total_record_count, start_index);
+    result["OwnerId"] = serde_json::Value::String(owner_id.to_string());
+    result
 }
 
 async fn authenticated_item_theme_songs(
@@ -52669,7 +52680,7 @@ async fn theme_items_result(
         .collect::<Vec<_>>();
     theme_items.sort_by(|left, right| compare_media_items(left, right, &[SortField::SortName]));
     let total_record_count = theme_items.len();
-    Ok(query_result_with_total(
+    Ok(theme_media_query_result(
         items_to_json(
             db,
             paged_media_items(theme_items, query),
@@ -52680,6 +52691,7 @@ async fn theme_items_result(
         .await?,
         total_record_count,
         query.start_index.unwrap_or(0),
+        &source.id.simple().to_string(),
     ))
 }
 
@@ -52703,7 +52715,12 @@ async fn soundtrack_items_result(
     }
     let source_terms = soundtrack_match_terms(metadata_by_item.get(&source.id));
     if source_terms.is_empty() {
-        return Ok(query_result(Vec::new()));
+        return Ok(theme_media_query_result(
+            Vec::new(),
+            0,
+            0,
+            &source.id.simple().to_string(),
+        ));
     }
 
     let mut scored = audio_items
@@ -52729,10 +52746,11 @@ async fn soundtrack_items_result(
         .take(query.limit.unwrap_or(usize::MAX))
         .collect::<Vec<_>>();
     let server_id = db.server_state().await?.server_id.to_string();
-    Ok(query_result_with_total(
+    Ok(theme_media_query_result(
         items_to_json(db, items, &server_id, Some(user_id), false).await?,
         total_record_count,
         query.start_index.unwrap_or(0),
+        &source.id.simple().to_string(),
     ))
 }
 
@@ -93317,6 +93335,9 @@ done
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let theme_media: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(theme_media["ThemeSongsResult"]["OwnerId"], item_id);
+        assert_eq!(theme_media["ThemeVideosResult"]["OwnerId"], item_id);
+        assert_eq!(theme_media["SoundtrackSongsResult"]["OwnerId"], item_id);
         assert_eq!(theme_media["ThemeSongsResult"]["TotalRecordCount"], 2);
         assert_eq!(theme_media["ThemeSongsResult"]["Items"][0]["Name"], "theme");
         assert_eq!(
@@ -93421,6 +93442,7 @@ done
             let body = response.into_body().collect().await.unwrap().to_bytes();
             let theme_items: Value = serde_json::from_slice(&body).unwrap();
             let expected_total = if media_type == "Audio" { 2 } else { 1 };
+            assert_eq!(theme_items["OwnerId"], item_id);
             assert_eq!(theme_items["TotalRecordCount"], expected_total);
             assert_eq!(theme_items["Items"][0]["Name"], "theme");
             assert_eq!(theme_items["Items"][0]["MediaType"], media_type);
