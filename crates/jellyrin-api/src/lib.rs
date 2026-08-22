@@ -39933,12 +39933,29 @@ async fn playback_info_response(
         );
         media_source.insert("SupportsTranscoding".to_string(), serde_json::json!(false));
         if decision.delivery == DeliveryMode::DirectProxy {
+            let direct_stream_url = remote_direct_stream_url(&item, &token.access_token);
             media_source.insert(
                 "DirectStreamUrl".to_string(),
-                serde_json::json!(remote_direct_stream_url(&item, &token.access_token)),
+                serde_json::json!(direct_stream_url),
             );
+            // Jellyfin Android TV 0.19.x implements DirectStream by reading the legacy
+            // TranscodingUrl field even when SupportsTranscoding is false. Keep the opaque local
+            // proxy in both URL slots: it is still a byte-for-byte direct stream, never an
+            // upstream or signed provider URL.
+            media_source.insert(
+                "TranscodingUrl".to_string(),
+                serde_json::json!(direct_stream_url),
+            );
+            if let Some(container) = media_item_container(&item) {
+                media_source.insert(
+                    "TranscodingContainer".to_string(),
+                    serde_json::json!(container),
+                );
+            }
         } else {
             media_source.remove("DirectStreamUrl");
+            media_source.remove("TranscodingUrl");
+            media_source.remove("TranscodingContainer");
         }
         apply_playback_stream_selection(media_source, &options);
         if selected_text_subtitle_can_use_external(&item, &options) {
@@ -108379,6 +108396,8 @@ done
         assert!(direct_stream_url.starts_with(&format!("/Videos/{item_id}/stream.mkv?")));
         assert!(!direct_stream_url.contains("user/pass"));
         assert!(!direct_stream_url.contains(&upstream_address.to_string()));
+        assert_eq!(media_source["TranscodingUrl"], direct_stream_url);
+        assert_eq!(media_source["TranscodingContainer"], "mkv");
         assert!(test_db.transcode_sessions().await.unwrap().is_empty());
 
         let response = app
