@@ -109,6 +109,7 @@ pub fn is_tv_extra_media_item(item: &MediaItem) -> bool {
 /// Public Jellyfin item type derived from the neutral persisted media fields.
 pub fn effective_media_item_type(item: &MediaItem) -> &'static str {
     match (item.media_type.as_str(), item.collection_type.as_deref()) {
+        ("Series", _) => "Series",
         ("Video", Some("movies")) => "Movie",
         ("Video", Some("musicvideos" | "musicvideo")) => "MusicVideo",
         ("Video", Some("tvshows" | "tvshow" | "series")) if is_tv_extra_media_item(item) => "Video",
@@ -1217,6 +1218,10 @@ mod tests {
         let episode = item("/media/Show/Season 01/episode.mkv");
         assert!(!is_tv_extra_media_item(&episode));
         assert_eq!(effective_media_item_type(&episode), "Episode");
+
+        let mut persisted_series = item("plugin-vod://catalog/series");
+        persisted_series.media_type = "Series".to_string();
+        assert_eq!(effective_media_item_type(&persisted_series), "Series");
     }
 
     #[test]

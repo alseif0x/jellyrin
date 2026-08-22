@@ -57435,6 +57435,15 @@ fn media_item_to_json_with_playback_and_metadata(
         object.insert("LocationType".to_string(), serde_json::json!("Remote"));
         object.insert("CanDownload".to_string(), serde_json::json!(false));
     }
+    if item_type == "Series"
+        && let Some(object) = value.as_object_mut()
+    {
+        object.insert("IsFolder".to_string(), serde_json::json!(true));
+        object.insert("MediaType".to_string(), serde_json::json!("Video"));
+        object.insert("CanDownload".to_string(), serde_json::json!(false));
+        object.remove("MediaSources");
+        object.remove("MediaStreams");
+    }
     apply_media_item_metadata(&mut value, metadata, item, server_id);
     value
 }
@@ -61570,79 +61579,50 @@ async fn precache_single_live_tv_logo(
 }
 
 fn live_tv_generated_image_response(
-    item: &serde_json::Value,
+    _item: &serde_json::Value,
     item_id: &str,
     image_url: &str,
 ) -> axum::response::Response {
-    let name = json_string_field(item, "Name").unwrap_or_else(|| item_id.to_string());
-    let label = live_tv_generated_image_label(&name);
     let hash = live_tv_image_tag(item_id, image_url);
-    let bg = &hash[..6.min(hash.len())];
-    let fg = if u8::from_str_radix(&bg[..2], 16).unwrap_or(0) > 170 {
-        "111827"
-    } else {
-        "ffffff"
+    let color = |offset: usize| {
+        64_u8.saturating_add(
+            u8::from_str_radix(hash.get(offset..offset + 2).unwrap_or("00"), 16).unwrap_or(0) % 160,
+        )
     };
-    let svg = format!(
-        r##"<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
-<rect width="512" height="512" rx="56" fill="#{bg}"/>
-<text x="256" y="244" text-anchor="middle" dominant-baseline="middle" font-family="Arial, Helvetica, sans-serif" font-size="116" font-weight="700" fill="#{fg}">{}</text>
-<text x="256" y="338" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="34" font-weight="600" fill="#{fg}" opacity="0.9">{}</text>
-</svg>"##,
-        escape_xml_text(&label),
-        escape_xml_text(&live_tv_generated_image_caption(&name)),
-    );
+    let base = image::Rgba([color(0), color(2), color(4), 255]);
+    let stripe = image::Rgba([
+        base[0].saturating_add(24),
+        base[1].saturating_add(24),
+        base[2].saturating_add(24),
+        255,
+    ]);
+    let mut bitmap = image::RgbaImage::from_pixel(512, 512, base);
+    for y in 0..512_u32 {
+        for x in 0..512_u32 {
+            if ((x + y) / 48) % 2 == 0 {
+                bitmap.put_pixel(x, y, stripe);
+            }
+        }
+    }
+    // A simple raster play mark remains legible after Android TV center-crops the square tile.
+    for x in 0..140_u32 {
+        let half_height = 70_u32.saturating_sub(x / 2);
+        for y in (256 - half_height)..=(256 + half_height) {
+            bitmap.put_pixel(196 + x, y, image::Rgba([255, 255, 255, 230]));
+        }
+    }
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(bitmap)
+        .write_to(&mut png, image::ImageFormat::Png)
+        .expect("generated Android TV artwork must encode as PNG");
     let mut headers = HeaderMap::new();
-    headers.insert(
-        header::CONTENT_TYPE,
-        "image/svg+xml; charset=utf-8".parse().unwrap(),
-    );
+    headers.insert(header::CONTENT_TYPE, "image/png".parse().unwrap());
     headers.insert(
         header::CACHE_CONTROL,
         "public, max-age=3600".parse().unwrap(),
     );
     headers.insert(header::ETAG, hash.parse().unwrap());
-    (headers, svg.into_bytes()).into_response()
-}
-
-fn live_tv_generated_image_label(name: &str) -> String {
-    let words = name
-        .split(|character: char| !character.is_alphanumeric())
-        .filter(|word| !word.is_empty())
-        .collect::<Vec<_>>();
-    let label = words
-        .iter()
-        .filter_map(|word| word.chars().next())
-        .take(3)
-        .collect::<String>();
-    if label.is_empty() {
-        "TV".to_string()
-    } else {
-        label.to_ascii_uppercase()
-    }
-}
-
-fn live_tv_generated_image_caption(name: &str) -> String {
-    let trimmed = name.trim();
-    let caption = if trimmed.chars().count() > 18 {
-        trimmed.chars().take(17).collect::<String>() + "..."
-    } else {
-        trimmed.to_string()
-    };
-    if caption.is_empty() {
-        "Live TV".to_string()
-    } else {
-        caption
-    }
-}
-
-fn escape_xml_text(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+    (headers, png.into_inner()).into_response()
 }
 
 async fn live_tv_item_image_response(
@@ -96278,10 +96258,10 @@ done
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response.headers().get(header::CONTENT_TYPE).unwrap(),
-            "image/svg+xml; charset=utf-8"
+            "image/png"
         );
         let body = response.into_body().collect().await.unwrap().to_bytes();
-        assert!(String::from_utf8_lossy(&body).contains("Movies"));
+        assert!(body.starts_with(&[137, 80, 78, 71]));
 
         let response = app
             .clone()
@@ -99847,6 +99827,7 @@ done
             vec![persisted_series.id]
         );
         assert!(persisted_series_mapping.allowed_plugin_tuner_ids.is_none());
+        let persisted_series_id = persisted_series.id.simple().to_string();
 
         let direct_query = super::parse_items_query(Some(&format!(
             "ParentId={}&IncludeItemTypes=Movie&Limit=10&Recursive=false",
@@ -99992,6 +99973,27 @@ done
         });
         let parent_id = parent.id.simple();
         let user_id = user.id.simple();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items/Latest?ParentId={persisted_series_id}&Fields=Overview&Fields=CanDelete&ImageTypeLimit=1&Limit=25&GroupItems=true"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let latest: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(latest.as_array().map(Vec::len), Some(1));
+        assert_eq!(latest[0]["Type"], "Series");
+        assert_eq!(latest[0]["IsFolder"], true);
+        assert_eq!(latest[0]["MediaType"], "Video");
+
         let response = app
             .clone()
             .oneshot(
