@@ -15,9 +15,10 @@ sin límite en varias capas:
   `Fields`;
 - JSON viajaba sin compresión en nginx.
 
-Los cambios `6892c97`, `7d6a26c` y `c2f276e` acotan esos caminos. PostgreSQL pagina el catálogo,
-las miniaturas tienen derivados JPEG cacheados y single-flight, y nginx comprime JSON. La entrega
-de carátulas se corrigió después; su estado vigente está en la sección siguiente. `NextUp`
+Los cambios de catálogo de esta rama acotan esos caminos. PostgreSQL pagina el catálogo,
+las miniaturas tienen derivados JPEG cacheados y single-flight, y Jellyrin comprime las respuestas
+cuando el cliente lo negocia (nginx sigue siendo opcional). La entrega de carátulas se corrigió
+después; su estado vigente está en la sección siguiente. `NextUp`
 mantiene dos contratos:
 
 - con `EnableTotalRecordCount=false`, recorre la proyección de series en orden y hace búsquedas
@@ -148,6 +149,24 @@ Una temporada tampoco tiene arte propio. Jellyfin dibuja el póster de la serie 
 la imagen de temporada cae al ancla de la serie, que es donde el proveedor dejó la carátula
 cacheada; buscarla por el id de la temporada nunca la encontraba.
 
+### Compatibilidad verificada con Android TV
+
+Jellyfin Android TV 0.19.10 no renderiza los placeholders SVG que sí admite un navegador. Las
+carpetas sin carátula propia devuelven ahora un PNG raster de 512×512, con `ETag` y caché pública;
+las imágenes reales del proveedor conservan sus derivados JPEG. Así la pantalla Home no depende de
+que el cliente implemente SVG.
+
+Wholphin 1.0.6 deserializa `BaseItemKind` de forma estricta. Los anclajes de serie persistidos por
+un plugin tenían `media_type=Series`, pero la proyección pública los convertía en `Type=BaseItem` y
+la aplicación descartaba la fila completa de “Agregado recientemente”. La proyección conserva
+ahora `Type=Series`, `MediaType=Video` e `IsFolder=true`, y omite fuentes reproducibles en el propio
+anclaje. La prueba de integración reproduce la consulta exacta de Wholphin a `/Items/Latest`.
+
+En el catálogo desplegado, la estantería de series con orden por puntuación pasó de un timeout/500
+tras unos 10,4 s a 200 en 1,29 s en frío y 0,60–0,64 s en caliente. `NextUp` devolvió 20 elementos
+en 78 ms y una página Latest de películas MAGSTV, ocho elementos en 48 ms. Estas mediciones son
+end-to-end; no deben sustituir medidas en el host y catálogo de cada instalación.
+
 ## Perfil PostgreSQL aplicado
 
 El host medido tiene 12 GiB y aplica desde su `.env` este perfil conservador, sin cambiar los
@@ -180,6 +199,10 @@ No hace falta añadir otro índice general después de estos cambios:
   pequeña y sus secuenciales son una decisión correcta del planner, no evidencia de índice ausente.
 - las páginas por folder/collection y orden por nombre/fecha ya tienen índices parciales dedicados;
   las facetas tienen índices por valor, stable id y clave primaria.
+- `idx_media_items_visible_folder_series_rating` cubre estanterías `Series` por carpeta y
+  puntuación sin ordenar el catálogo completo;
+- `idx_media_items_visible_folder_tv_premiere` cubre navegación TV por carpeta y estreno;
+- `idx_playback_states_user_played_date` acota las consultas de progreso y reproducidos por usuario.
 
 Se encontraron dos índices de `media_item_facet_aliases` con 0 filas pero 225.034.240 bytes de
 bloat histórico. `REINDEX TABLE CONCURRENTLY` seguido de `VACUUM (ANALYZE)` los redujo a 16.384
