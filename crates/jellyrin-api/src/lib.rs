@@ -40136,7 +40136,7 @@ async fn playback_info_response(
             media_source.remove("TranscodingContainer");
         }
         apply_playback_stream_selection(media_source, &options);
-        if selected_text_subtitle_can_use_external(&item, &options) {
+        if text_subtitle_profile_supports_external(&item, &options) {
             apply_direct_external_text_subtitle_contract(
                 media_source,
                 &token.access_token,
@@ -43077,13 +43077,32 @@ fn selected_text_subtitle_can_use_external(
                 .and_then(serde_json::Value::as_str)
                 .is_some_and(is_text_subtitle_codec)
     });
-    selected_is_text
-        && options.subtitle_profiles.as_ref().is_some_and(|profiles| {
-            profiles.iter().any(|profile| {
-                profile.method.as_deref() == Some("external")
-                    && matches!(profile.format.as_deref(), Some("vtt" | "webvtt"))
-            })
+    selected_is_text && text_subtitle_profile_supports_external(item, options)
+}
+
+/// External text tracks have to be described on the initial PlaybackInfo response as well as
+/// after a stream is selected. Android TV builds its Media3 subtitle sources only once; if the
+/// initial response has no DeliveryUrl it later tries to select an absent track and drops it
+/// without issuing a second PlaybackInfo request.
+fn text_subtitle_profile_supports_external(
+    item: &MediaItem,
+    options: &PlaybackInfoOptions,
+) -> bool {
+    media_item_streams(item).iter().any(|stream| {
+        stream
+            .get("Type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|stream_type| stream_type.eq_ignore_ascii_case("Subtitle"))
+            && stream
+                .get("Codec")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(is_text_subtitle_codec)
+    }) && options.subtitle_profiles.as_ref().is_some_and(|profiles| {
+        profiles.iter().any(|profile| {
+            profile.method.as_deref() == Some("external")
+                && matches!(profile.format.as_deref(), Some("vtt" | "webvtt"))
         })
+    })
 }
 
 fn selected_text_subtitle_prefers_hls(options: &PlaybackInfoOptions) -> bool {
@@ -109566,6 +109585,31 @@ done
             FfmpegMode::Enabled,
         );
         assert_eq!(native_decision.delivery, DeliveryMode::DirectProxy);
+        assert!(super::text_subtitle_profile_supports_external(
+            &item, &native
+        ));
+        assert!(!super::selected_text_subtitle_can_use_external(
+            &item, &native
+        ));
+        let mut initial_native_source = json!({ "MediaStreams": item.media_streams.clone() });
+        if super::text_subtitle_profile_supports_external(&item, &native) {
+            super::apply_direct_external_text_subtitle_contract(
+                initial_native_source.as_object_mut().unwrap(),
+                "secret-token",
+                "movie-id",
+                "play-session",
+                true,
+            );
+        }
+        assert_eq!(
+            initial_native_source["MediaStreams"][3]["SupportsExternalStream"],
+            true
+        );
+        assert!(
+            initial_native_source["MediaStreams"][3]["DeliveryUrl"]
+                .as_str()
+                .is_some_and(|url| url.contains("/Subtitles/3/Stream.vtt?"))
+        );
 
         let mut known_incompatible = item.clone();
         known_incompatible.media_streams[0]["Codec"] = json!("vp9");
