@@ -50356,10 +50356,29 @@ async fn metadata_collection_keys(
     let query = parse_items_query(raw_query.as_deref());
     let auth_user =
         require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
-    if let Some(user_id) = query.user_id.as_deref().map(resolve_user_id).transpose()? {
+    let requested_user_id = query.user_id.as_deref().map(resolve_user_id).transpose()?;
+    if let Some(user_id) = requested_user_id {
         ensure_user_access(&auth_user, user_id)?;
     }
     let facet_query = metadata_facet_query_with_redundant_types_removed(&state.db, &query).await?;
+    if facet_kind == MediaItemFacetKind::Genre
+        && !facet_query.include_item_types.is_empty()
+        && let Some(values) = media_catalog_filter_values_result(
+            &state.db,
+            &facet_query,
+            requested_user_id,
+            MediaItemQueryFilterSelection::GENRES_ONLY,
+        )
+        .await?
+    {
+        let server_id = state.db.server_state().await?.server_id.to_string();
+        return Ok(Json(metadata_values_response(
+            values.genres,
+            &server_id,
+            item_type,
+            &query,
+        )));
+    }
     let effective_item_types = metadata_facet_effective_item_types(&facet_query);
     let mut supported_facet_query = facet_query.clone();
     supported_facet_query.include_item_types.clear();

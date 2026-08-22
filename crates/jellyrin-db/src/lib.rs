@@ -290,6 +290,8 @@ impl MediaItemQueryFilterSelection {
     pub const FILTERS2: Self =
         Self(Self::AUDIO_LANGUAGES | Self::GENRES | Self::SUBTITLE_LANGUAGES | Self::TAGS);
 
+    pub const GENRES_ONLY: Self = Self(Self::GENRES);
+
     pub const ALL: Self = Self(Self::ITEMS_FILTERS.0 | Self::FILTERS2.0);
 
     pub(crate) const fn includes_scalars(self) -> bool {

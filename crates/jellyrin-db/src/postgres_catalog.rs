@@ -1271,7 +1271,7 @@ impl PostgresDatabase {
     ) -> anyhow::Result<Option<MediaItemQueryFilterValues>> {
         let covered = sqlx::query_scalar::<_, bool>(
             r#"
-            SELECT count(*) = cardinality($1::uuid[])
+            SELECT count(*) = cardinality($1::uuid[]) * cardinality($3::text[])
                AND COALESCE(bool_and(
                        coverage.projection_version = $2
                        AND coverage.source_revision = revision.source_revision
@@ -1281,12 +1281,12 @@ impl PostgresDatabase {
             JOIN media_item_query_filter_summary_revisions AS revision
               ON revision.virtual_folder_id = coverage.virtual_folder_id
             WHERE coverage.virtual_folder_id = ANY($1)
-              AND coverage.effective_item_type = $3
+              AND coverage.effective_item_type = ANY($3)
             "#,
         )
         .bind(folder_ids)
         .bind(MEDIA_ITEM_QUERY_FILTER_SUMMARY_VERSION)
-        .bind(&effective_item_types[0])
+        .bind(effective_item_types)
         .fetch_one(&mut *connection)
         .await?;
         if !covered {
@@ -6040,7 +6040,7 @@ fn postgres_query_filter_summary_scope(
     let mut effective_item_types = normalized_catalog_values(&query.include_item_types);
     effective_item_types.sort_unstable();
     effective_item_types.dedup();
-    if effective_item_types.len() != 1
+    if effective_item_types.is_empty()
         || effective_item_types
             .iter()
             .any(|item_type| item_type != "movie" && item_type != "episode")
@@ -7677,6 +7677,20 @@ mod tests {
         push_postgres_catalog_from(&mut builder, &query);
         push_postgres_catalog_filters(&mut builder, &query);
         assert!(builder.sql().as_str().contains("AND (FALSE)"));
+    }
+
+    #[test]
+    fn postgres_query_filter_summary_accepts_combined_movie_and_episode_domains() {
+        let folder_id = Uuid::new_v4();
+        let query = MediaItemCatalogQuery {
+            virtual_folder_ids: vec![folder_id],
+            include_item_types: vec!["Episode".to_string(), "Movie".to_string()],
+            ..MediaItemCatalogQuery::default()
+        };
+        let (folder_ids, item_types) = postgres_query_filter_summary_scope(&query)
+            .expect("movie and episode must share the exact summary path");
+        assert_eq!(folder_ids, vec![folder_id]);
+        assert_eq!(item_types, vec!["episode", "movie"]);
     }
 
     #[tokio::test]
