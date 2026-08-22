@@ -871,6 +871,34 @@ impl PostgresDatabase {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    /// Bounded source for the trailer endpoints.
+    ///
+    /// `/Trailers` used to materialise the whole catalogue in Rust to find the few items carrying
+    /// a `RemoteTrailers` array, which exceeded the statement timeout on a real library. The key
+    /// test runs in PostgreSQL instead; the caller still applies the exact URL-shape filter, so a
+    /// generous predicate here cannot admit a trailer the API would not have produced anyway.
+    pub async fn media_items_with_remote_trailers(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MediaItem>> {
+        let rows = sqlx::query_as::<_, PostgresMediaItemRow>(
+            r#"
+            SELECT id, virtual_folder_id, name, path, media_type, collection_type,
+                   file_size, runtime_ticks, bitrate, width, height, media_streams,
+                   created_at, updated_at
+            FROM media_items
+            WHERE missing_since IS NULL
+              AND (metadata @? '$."RemoteTrailers"' OR metadata @? '$."Trailers"')
+            ORDER BY lower(name), name
+            LIMIT $1
+            "#,
+        )
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
     pub async fn media_items_by_name_search(
         &self,
         search_term: &str,
@@ -3528,6 +3556,11 @@ impl PostgresDatabase {
             query.push(")");
         }
         query.push(" ORDER BY facet.item_id");
+        if let Some(limit) = query_spec.limit {
+            query
+                .push(" LIMIT ")
+                .push_bind(i64::try_from(limit).unwrap_or(i64::MAX));
+        }
         Ok(query
             .build_query_scalar::<Uuid>()
             .fetch_all(&self.pool)

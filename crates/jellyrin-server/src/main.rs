@@ -13,10 +13,10 @@ use jellyrin_api::{
     configure_plugin_packages_root, configure_shared_catalog_cache, ensure_builtin_xtream_plugin,
     initialize_transcode_config, last_system_lifecycle_command, publish_system_lifecycle_command,
     reconcile_live_tv_recordings_on_startup, reconcile_transcode_sessions_on_startup, router,
-    shutdown_runtime_resources, spawn_dlna_ssdp_service, spawn_file_watcher_with_consumer,
-    spawn_periodic_live_tv_timer_scheduler, spawn_periodic_transcode_cleanup,
-    spawn_periodic_xtream_media_sync_scheduler, subscribe_system_lifecycle_commands,
-    validate_ffmpeg_runtime,
+    shutdown_runtime_resources, spawn_artwork_cache_maintenance, spawn_dlna_ssdp_service,
+    spawn_file_watcher_with_consumer, spawn_periodic_live_tv_timer_scheduler,
+    spawn_periodic_transcode_cleanup, spawn_periodic_xtream_media_sync_scheduler,
+    subscribe_system_lifecycle_commands, validate_ffmpeg_runtime,
 };
 use jellyrin_db::{Database, DatabaseConfig, DatabaseDriver, DatabaseManager, ProviderSecretVault};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
@@ -278,6 +278,9 @@ async fn main() -> anyhow::Result<()> {
     configure_api_cache_root(&args.cache_dir).context("failed to configure API cache storage")?;
     configure_plugin_packages_root(&args.data_dir)
         .context("failed to configure plugin package storage")?;
+    // Artwork is cached on demand as people browse, so it needs both a one-off compaction of
+    // entries stored before the size bound existed and an ongoing disk budget.
+    spawn_artwork_cache_maintenance(args.cache_dir.clone());
     initialize_transcode_config();
     validate_ffmpeg_runtime()
         .await

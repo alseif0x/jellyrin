@@ -89,6 +89,9 @@ pub struct MediaItemFacetCandidateQuery {
     pub normalized_values: Vec<String>,
     pub entity_ids: Vec<String>,
     pub virtual_folder_ids: Vec<Uuid>,
+    /// Caps the candidate page for callers that only need a bounded sample, such as picking one
+    /// representative item for a by-name image. `None` keeps the full selection used by filters.
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

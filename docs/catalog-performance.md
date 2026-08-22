@@ -15,9 +15,10 @@ sin límite en varias capas:
   `Fields`;
 - JSON viajaba sin compresión en nginx.
 
-Los cambios `6892c97`, `7d6a26c` y `c2f276e` acotan esos caminos. PostgreSQL pagina el catálogo, las rejillas
-usan únicamente imágenes ya cacheadas o placeholder, las miniaturas tienen derivados JPEG
-cacheados y single-flight, y nginx comprime JSON. `NextUp` mantiene dos contratos:
+Los cambios `6892c97`, `7d6a26c` y `c2f276e` acotan esos caminos. PostgreSQL pagina el catálogo,
+las miniaturas tienen derivados JPEG cacheados y single-flight, y nginx comprime JSON. La entrega
+de carátulas se corrigió después; su estado vigente está en la sección siguiente. `NextUp`
+mantiene dos contratos:
 
 - con `EnableTotalRecordCount=false`, recorre la proyección de series en orden y hace búsquedas
   laterales acotadas hasta llenar la página;
@@ -47,6 +48,105 @@ transfirió por nginx en 8.653 bytes con gzip. Con `Fields=PrimaryImageAspectRat
 pesados desactivados, una página de 20 películas quedó en 21.129 bytes y 10–11 ms.
 La revalidación HTTP de una miniatura de 30.859 bytes devolvió `304 Not Modified` con cuerpo de
 0 bytes al presentar su `ETag`, evitando volver a transferir o decodificar la imagen.
+
+## Entrega de carátulas
+
+### Estado medido el 2026-08-21
+
+Las rejillas no mostraban carátulas por tres causas independientes, todas confirmadas contra el
+catálogo real y contra el cliente web desplegado.
+
+**El cliente pide un tamaño que el servidor no entendía.** Jellyfin Web construye las tarjetas con
+`fillWidth`/`fillHeight`; `ImageResizeQuery` solo aceptaba `maxWidth`/`maxHeight`, así que
+`normalized()` devolvía `None` y se servía el original. Una página de 60 tiles transfería
+89,1 MB. Sobre HTTPS y con seis conexiones por host, el navegador entregaba unas 50-55 tarjetas
+antes de volverse inusable; no era un límite del servidor, era ancho de banda.
+
+**El navegador no puede poblar la caché.** El bundle construye `Images/Primary?tag=…` y no incluye
+`api_key` en ninguna de sus rutas de imagen, así que un `<img>` llega sin credencial. La hidratación
+exigía usuario autenticado y devolvía placeholder, de modo que el navegador solo veía lo ya
+descargado por reproducciones o fichas abiertas. Abrir ese hueco no es aceptable: una petición
+anónima podría dirigir llamadas credencializadas al proveedor. El enriquecimiento lo dispara ahora
+el listado autenticado, que es el único punto donde se conocen a la vez el usuario y los items que
+va a pintar.
+
+**Una carrera hacía que las carátulas pareciesen aleatorias.** El `<img>` de cada tarjeta llega una
+sola vez y devolvía lo que hubiera en caché en ese instante, mientras el relleno seguía en curso.
+Las tarjetas cuyo relleno había terminado mostraban arte y el resto quedaba en placeholder para
+siempre, porque el cliente no reintenta. Una petición de imagen espera ahora a un relleno ya
+encolado; una sin relleno en curso sigue respondiendo al instante.
+
+Medido en navegador real con sesión autenticada, rejilla de `Mags Movies`:
+
+| Métrica | Antes | Después |
+| --- | ---: | ---: |
+| Página de 60 tiles | 89,1 MB | 1,07 MB (100 tiles) |
+| Tarjetas con carátula | aleatorias | 100 de 100 |
+| Placeholders | mayoría | 0 |
+| Media por tile | 1.520 KB | 24 KB |
+
+### Tamaño en disco
+
+El proveedor no entrega URL de imagen en el catálogo: los items importados solo llevan un
+`ProviderReference` opaco, y la carátula exige una RPC credencializada por item de unos 3 s. Lo
+descargado se guardaba tal cual, 353 KiB de media y hasta 4,8 MiB, lo que proyectaba unos 316 GiB
+para las 975.677 filas de este catálogo sobre un volumen con 69 GiB libres.
+
+El arte se acota ahora a 900 px de lado largo antes de tocar disco. `thumbnail()` es un filtro de
+caja que suaviza de más en reducciones grandes, así que el redimensionado usa Lanczos3 y calidad
+JPEG 90: la tarjeta se ve mejor que antes, no peor, porque el destino es el mismo y el remuestreo
+es superior. Lo guardado no es lo que descarga el cliente; de esa entrada sale el derivado de
+tarjeta de unos 24 KB.
+
+Medido sobre la carátula más grande del catálogo, un PNG de 4.819.482 bytes:
+
+| Lado largo | Bytes | Factor |
+| --- | ---: | ---: |
+| 640 | 149.859 | 32,2x |
+| 720 | 186.645 | 25,8x |
+| 900 | 285.191 | 16,9x |
+| 1080 | 396.029 | 12,2x |
+
+Una pasada de compactación al arrancar reescribe las entradas anteriores al límite. Solo decodifica
+por encima de 128 KiB, así que una segunda pasada es un recorrido de solo `stat`. En el despliegue
+real: `scanned=2530 rewritten=490 failed=0`, 822 MiB a 63,7 MiB en las reescritas y el directorio
+completo de 871,9 MiB a 113,3 MiB.
+
+### Presupuesto de disco
+
+La caché crece con lo que se navega, no con el tamaño del catálogo, y `JELLYRIN_ARTWORK_CACHE_MAX_BYTES`
+es su techo duro; por defecto 8 GiB, unas 180.000 entradas al tamaño medido. La evición es por
+`atime` y baja al 90 % del techo. El filesystem monta `relatime`, así que servir una entrada
+refresca su marca sin que Jellyrin escriba nada: se retira la menos usada, no la más antigua.
+Cada entrada es regenerable y se vuelve a pedir al proveedor cuando alguien abra ese item.
+
+`images/users` e `images/branding` quedan fuera de compactación y evición: son originales del
+operador, no una caché. Una pasada que supere 500.000 entradas rastreadas recupera de lo que sí
+rastreó y se marca `truncated` en el log, en vez de aparentar que la caché está dentro del
+presupuesto.
+
+## Contratos de serie corregidos
+
+Dos errores de la ficha de serie salieron al verificar lo anterior.
+
+`tv_episode_info` deducía temporada y episodio parseando nombre y ruta del fichero. Eso es correcto
+para ficheros escaneados, pero un catálogo importado trae `plugin-vod://<id>` como ruta y un nombre
+sin patrón `S01E02`, así que toda temporada quedaba vacía y los episodios colapsaban en un único
+"Season Unknown". El número correcto ya estaba en la metadata como `ParentIndexNumber` y en la
+proyección `media_item_tv_series_members`. La metadata manda ahora y el parseo de ruta queda como
+respaldo.
+
+`LibrarySeriesId` se ignoraba en `/LiveTv/Programs`. La ficha de una serie consulta ese endpoint y
+desoculta "Upcoming on TV" cuando la respuesta no está vacía; como la guía está vacía, Jellyrin
+caía a listar canales como programas y la sección aparecía con canales sin relación. Una serie se
+identifica en la guía por `ExternalSeriesId`: la importada de un proveedor on-demand no tiene
+ninguno, así que no puede tener emisiones y la respuesta correcta es vacía. Verificado con el id
+real y con uno inexistente, ambos a 0 items, mientras la consulta sin `LibrarySeriesId` sigue
+devolviendo la guía real.
+
+Una temporada tampoco tiene arte propio. Jellyfin dibuja el póster de la serie cuando falta, así que
+la imagen de temporada cae al ancla de la serie, que es donde el proveedor dejó la carátula
+cacheada; buscarla por el id de la temporada nunca la encontraba.
 
 ## Perfil PostgreSQL aplicado
 

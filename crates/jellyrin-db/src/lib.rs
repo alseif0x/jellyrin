@@ -8668,6 +8668,31 @@ impl SqliteDatabase {
         rows.into_iter().map(TryInto::try_into).collect()
     }
 
+    /// Bounded source for the trailer endpoints. See the PostgreSQL adapter for the rationale.
+    pub async fn media_items_with_remote_trailers(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MediaItem>> {
+        let rows = sqlx::query_as::<_, MediaItemRow>(
+            r#"
+            SELECT id, virtual_folder_id, name, path, media_type, collection_type,
+                   file_size, runtime_ticks, bitrate, width, height, media_streams_json,
+                   created_at, updated_at
+            FROM media_items
+            WHERE missing_since IS NULL
+              AND (json_extract(metadata_json, '$.RemoteTrailers') IS NOT NULL
+                   OR json_extract(metadata_json, '$.Trailers') IS NOT NULL)
+            ORDER BY name COLLATE NOCASE
+            LIMIT ?1
+            "#,
+        )
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
     pub async fn media_items_by_name_search(
         &self,
         search_term: &str,
@@ -10756,6 +10781,11 @@ impl SqliteDatabase {
             query.push(")");
         }
         query.push(" ORDER BY facet.item_id");
+        if let Some(limit) = query_spec.limit {
+            query
+                .push(" LIMIT ")
+                .push_bind(i64::try_from(limit).unwrap_or(i64::MAX));
+        }
         query
             .build_query_scalar::<String>()
             .fetch_all(&self.pool)

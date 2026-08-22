@@ -143,8 +143,8 @@ use jellyrin_db::{
     LiveTvChannelUpsert, LiveTvStreamProbeOutcome, LiveTvStreamProbeUpsert, LiveTvTunerUpsert,
     MEDIA_ITEM_CATALOG_MAX_FACET_SELECTORS, MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE, MediaCatalogStore,
     MediaItemCatalogCounts, MediaItemCatalogEntry, MediaItemCatalogQuery,
-    MediaItemCatalogSearchScope, MediaItemCatalogSortField, MediaItemFacetKind,
-    MediaItemFavoriteFilter, MediaItemMetadata, MediaItemQueryFilterSelection,
+    MediaItemCatalogSearchScope, MediaItemCatalogSortField, MediaItemFacetCandidateQuery,
+    MediaItemFacetKind, MediaItemFavoriteFilter, MediaItemMetadata, MediaItemQueryFilterSelection,
     MediaItemQueryFilterValues, MediaList, MediaListItem, MediaListUserPermission,
     NamedConfigurationPayload, PLUGIN_VOD_MEDIA_RUNTIME_PROBE_FIELD,
     PROVIDER_SECRET_REFERENCE_FIELD, PluginRuntimeInstanceUpsert, ProviderSecretReference,
@@ -218,7 +218,63 @@ const SYNCPLAY_DRIFT_THRESHOLD_TICKS: i64 = 5_000_000;
 const IMAGE_UPLOAD_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 const REMOTE_IMAGE_CLIENT_CACHE_MAX_ENTRIES: usize = 64;
 const REMOTE_IMAGE_CLIENT_CACHE_TTL: StdDuration = StdDuration::from_secs(10 * 60);
+/// Candidate cap for the trailer endpoints. Trailers are derived from item metadata rather than a
+/// projection, so the SQL predicate narrows the source and this bounds what reaches Rust.
+const REMOTE_TRAILER_SOURCE_MAX_ITEMS: usize = MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE;
+/// Long-edge bound applied to provider artwork before it is cached on disk. Storing the provider's
+/// originals verbatim projected to roughly 316 GiB for this catalogue. 900px keeps the detail-page
+/// poster sharp on a HiDPI client while still being a small fraction of a multi-megabyte original;
+/// grid cards request far smaller derivatives from this same entry.
+const PROVIDER_ARTWORK_STORED_MAX_EDGE: u32 = 900;
+/// JPEG quality for stored artwork and derivatives. High enough that downscaled posters keep clean
+/// text and gradients; the remaining size comes from the dimension bound rather than the quantiser.
+const STORED_ARTWORK_JPEG_QUALITY: u8 = 90;
+/// Only cached artwork above this size is re-encoded, so a repeat compaction pass is a stat-only
+/// walk over an already-bounded cache.
+const ARTWORK_COMPACTION_MIN_BYTES: u64 = 128 * 1024;
+/// Disk budget for on-demand artwork. At the measured ~45 KiB per bounded entry this holds roughly
+/// 180,000 posters, far more than a library's browsed working set, while leaving the volume room
+/// for transcodes and the database. Override with `JELLYRIN_ARTWORK_CACHE_MAX_BYTES`.
+const DEFAULT_ARTWORK_CACHE_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// Ceiling on entries held in memory during one eviction pass. A pass that hits this reclaims from
+/// what it tracked and reports itself as truncated rather than silently appearing complete.
+const ARTWORK_CACHE_MAX_TRACKED_ENTRIES: usize = 500_000;
+/// How often the artwork cache is measured against its budget.
+const ARTWORK_CACHE_QUOTA_INTERVAL: StdDuration = StdDuration::from_secs(15 * 60);
+/// Provider artwork scopes eligible for compaction. User and branding uploads are excluded: those
+/// are operator-supplied originals, not a regenerable provider cache.
+const ARTWORK_COMPACTION_SCOPES: [&str; 2] = ["items", "livetv"];
+/// Bounded candidate page used to pick one representative item for a by-name image. A popular
+/// genre matches a large share of the catalogue, so only the first candidates are probed on disk.
+const NAMED_ENTITY_IMAGE_CANDIDATE_LIMIT: usize = 64;
+/// Facet families a by-name image may be resolved from, in the order the previous metadata scan
+/// inspected them: genres, music genres, artists, album artists, people and studios.
+const NAMED_ENTITY_IMAGE_FACET_KINDS: [MediaItemFacetKind; 6] = [
+    MediaItemFacetKind::Genre,
+    MediaItemFacetKind::MusicGenre,
+    MediaItemFacetKind::MusicArtist,
+    MediaItemFacetKind::MusicAlbumArtist,
+    MediaItemFacetKind::Person,
+    MediaItemFacetKind::Studio,
+];
 const PLUGIN_VOD_GRID_IMAGE_MAX_IN_FLIGHT: usize = 8;
+/// Concurrency for listing-driven artwork warming. Each fill is one credentialed provider call of
+/// roughly three seconds, so this sets how fast a freshly browsed page becomes complete while
+/// leaving provider and CPU headroom for playback.
+const PLUGIN_VOD_ARTWORK_PREFETCH_MAX_IN_FLIGHT: usize = 12;
+/// Upper bound on how many items a single listing may queue, so an unusually large page cannot fan
+/// out beyond one screen's worth of provider work.
+const PLUGIN_VOD_ARTWORK_PREFETCH_MAX_PER_PAGE: usize = 120;
+/// How long an image request will wait for a fill the listing already queued. A browser waits far
+/// longer than this for an image, and one page of queued fills completes well inside it.
+const PLUGIN_VOD_ARTWORK_FILL_MAX_WAIT: StdDuration = StdDuration::from_secs(45);
+/// Poll step while waiting. Coarse enough to be free, fine enough to be invisible.
+const PLUGIN_VOD_ARTWORK_FILL_POLL_INTERVAL: StdDuration = StdDuration::from_millis(200);
+/// Bound on remembered claims. Reached only by a long browsing session; the oldest are dropped.
+const PLUGIN_VOD_ARTWORK_PREFETCH_MAX_CLAIMS: usize = 8_192;
+/// How long a claim suppresses re-queueing the same item. Long enough that scrolling back over a
+/// page does not repeat work, short enough that a transient provider failure is retried.
+const PLUGIN_VOD_ARTWORK_PREFETCH_CLAIM_TTL: StdDuration = StdDuration::from_secs(10 * 60);
 const PLUGIN_VOD_GRID_IMAGE_WAIT_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 const ISO_639_2_DATA: &str = include_str!("localization/iso6392.txt");
 const COUNTRIES_DATA: &str = include_str!("localization/countries.json");
@@ -339,6 +395,10 @@ static SYNCPLAY_GROUPS: OnceLock<Mutex<HashMap<String, SyncPlayGroup>>> = OnceLo
 static AUTH_FAILURES: OnceLock<Mutex<AuthFailureRegistry>> = OnceLock::new();
 static REMOTE_IMAGE_HTTP_CLIENTS: OnceLock<Mutex<RemoteImageClientCache>> = OnceLock::new();
 static PLUGIN_VOD_GRID_IMAGE_ADMISSION: OnceLock<Arc<Semaphore>> = OnceLock::new();
+static PLUGIN_VOD_ARTWORK_PREFETCH_ADMISSION: OnceLock<Arc<Semaphore>> = OnceLock::new();
+static PLUGIN_VOD_ARTWORK_PREFETCH_CLAIMS: OnceLock<StdMutex<HashMap<Uuid, StdInstant>>> =
+    OnceLock::new();
+static PLUGIN_VOD_ARTWORK_FILL_PENDING: OnceLock<StdMutex<HashSet<Uuid>>> = OnceLock::new();
 static INTERNAL_REMOTE_RELAYS: OnceLock<StdMutex<HashMap<String, InternalRemoteRelayEntry>>> =
     OnceLock::new();
 static CONFIGURED_PLUGIN_PACKAGES_ROOT: OnceLock<PathBuf> = OnceLock::new();
@@ -24483,14 +24543,18 @@ async fn live_tv_programs(
         live_tv_category_filter_values(query.genre_ids.as_deref(), query.tags.as_deref());
     // Resolve genre-hash / name selectors to real category ids (same as channels).
     let category_ids = resolve_live_tv_category_ids(&state.db, &requested).await?;
+    let series_scope = live_tv_series_scope(&state.db, query.library_series_id.as_deref()).await?;
     live_tv_program_result(
         &state.db,
         &channel_ids,
         &category_ids,
         query.start_index,
         query.limit,
-        query.filters,
-        allowed_tuners.as_deref(),
+        LiveTvProgramScope {
+            filters: query.filters,
+            allowed_tuner_ids: allowed_tuners.as_deref(),
+            series: &series_scope,
+        },
     )
     .await
 }
@@ -24500,9 +24564,23 @@ struct ParsedLiveTvProgramsQuery {
     channel_ids: Vec<String>,
     genre_ids: Option<String>,
     tags: Option<String>,
+    library_series_id: Option<String>,
     start_index: Option<usize>,
     limit: Option<usize>,
     filters: LiveTvProgramFilters,
+}
+
+/// Scope requested by Jellyfin's `LibrarySeriesId`, which asks for the upcoming broadcasts of one
+/// library series. Ignoring it made the series detail page show unrelated channels under
+/// "Upcoming on TV", because the client only reveals that section when the response is non-empty.
+enum LiveTvSeriesScope {
+    /// No `LibrarySeriesId` was requested.
+    Unscoped,
+    /// A series was requested that has no electronic-programme-guide identity, so no broadcast can
+    /// belong to it. An imported on-demand series is always this case.
+    NoBroadcasts,
+    /// Retain only programmes belonging to this guide series identity.
+    ExternalSeriesId(String),
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -24544,6 +24622,7 @@ fn parse_live_tv_programs_query(raw_query: Option<&str>) -> ParsedLiveTvPrograms
             "channelids" | "channelid" => query.channel_ids.extend(comma_delimited_values(&value)),
             "genreids" | "genreid" => set_query_scalar(&mut query.genre_ids, value),
             "tags" | "tag" => set_query_scalar(&mut query.tags, value),
+            "libraryseriesid" => set_query_scalar(&mut query.library_series_id, value),
             "startindex" => query.start_index = value.parse().ok(),
             "limit" => query.limit = value.parse().ok(),
             "isairing" => query.filters.is_airing = parse_bool_query_value(&value),
@@ -24585,16 +24664,52 @@ async fn live_tv_programs_post(
     let start_index = live_tv_u64_field(&payload, "StartIndex").map(|value| value as usize);
     let limit = live_tv_u64_field(&payload, "Limit").map(|value| value as usize);
     let filters = live_tv_program_filters_from_body(&payload);
+    let series_scope = live_tv_series_scope(
+        &state.db,
+        json_string_field(&payload, "LibrarySeriesId").as_deref(),
+    )
+    .await?;
     live_tv_program_result(
         &state.db,
         &channel_ids,
         &category_ids,
         start_index,
         limit,
-        filters,
-        allowed_tuners.as_deref(),
+        LiveTvProgramScope {
+            filters,
+            allowed_tuner_ids: allowed_tuners.as_deref(),
+            series: &series_scope,
+        },
     )
     .await
+}
+
+/// Resolves Jellyfin's `LibrarySeriesId` into the scope its upcoming-broadcast section expects.
+///
+/// A guide series is identified by `ExternalSeriesId`. A library series that has none — every
+/// series imported from an on-demand provider — can have no upcoming broadcast, so the correct
+/// answer is an empty page, which is what keeps the client's section hidden.
+async fn live_tv_series_scope(
+    db: &Database,
+    library_series_id: Option<&str>,
+) -> Result<LiveTvSeriesScope, ApiError> {
+    let Some(library_series_id) = library_series_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("null"))
+    else {
+        return Ok(LiveTvSeriesScope::Unscoped);
+    };
+    let Ok(series_uuid) = parse_jellyfin_uuid(library_series_id) else {
+        return Ok(LiveTvSeriesScope::NoBroadcasts);
+    };
+    let metadata = metadata_payload_for_item(db, series_uuid).await?;
+    let external_series_id = first_metadata_value_from_json(&metadata, &["ExternalSeriesId"])
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    Ok(match external_series_id {
+        Some(external_series_id) => LiveTvSeriesScope::ExternalSeriesId(external_series_id),
+        None => LiveTvSeriesScope::NoBroadcasts,
+    })
 }
 
 fn live_tv_program_filters_from_body(payload: &serde_json::Value) -> LiveTvProgramFilters {
@@ -24733,21 +24848,43 @@ fn looks_like_live_tv_program_id(item_id: &str) -> bool {
         || item_id.starts_with("fallback-program-")
 }
 
+/// Everything that narrows a programme page beyond channel, category and paging.
+struct LiveTvProgramScope<'a> {
+    filters: LiveTvProgramFilters,
+    allowed_tuner_ids: Option<&'a [String]>,
+    series: &'a LiveTvSeriesScope,
+}
+
 async fn live_tv_program_result(
     db: &Database,
     channel_ids: &[String],
     category_ids: &[String],
     start_index: Option<usize>,
     limit: Option<usize>,
-    filters: LiveTvProgramFilters,
-    allowed_tuner_ids: Option<&[String]>,
+    scope: LiveTvProgramScope<'_>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let LiveTvProgramScope {
+        filters,
+        allowed_tuner_ids,
+        series: series_scope,
+    } = scope;
+    if matches!(series_scope, LiveTvSeriesScope::NoBroadcasts) {
+        return Ok(Json(query_result_with_total(Vec::new(), 0, 0)));
+    }
     let config = db
         .named_configuration("livetv")
         .await?
         .unwrap_or_else(default_live_tv_configuration);
     let server_id = db.server_state().await?.server_id.to_string();
     let mut programs = live_tv_program_items(&config, &server_id);
+    if let LiveTvSeriesScope::ExternalSeriesId(series_id) = series_scope {
+        programs.retain(|program| {
+            ["ExternalSeriesId", "SeriesId"].iter().any(|key| {
+                json_string_field(program, key)
+                    .is_some_and(|value| value.eq_ignore_ascii_case(series_id))
+            })
+        });
+    }
     if let Some(allowed) = allowed_tuner_ids {
         programs.retain(|program| {
             json_string_field(program, "TunerHostId").is_some_and(|id| {
@@ -27073,6 +27210,7 @@ async fn ensure_plugin_vod_metadata(
         };
         // Validate and fetch before touching the cache. A read-only/misconfigured cache is a
         // recoverable presentation failure at the caller and must never expose the source URL.
+        let bytes = bounded_provider_artwork_bytes(bytes).await;
         if let Err(error) = store_image_bytes(
             state,
             ImageOwner::Item(&target.owner_id),
@@ -33702,16 +33840,19 @@ async fn items_result(
         mixed_series_episode_search_items_result(&state.db, &query, &server_id, requested_user_id)
             .await?
     {
+        queue_plugin_vod_artwork_prefetch_from_page(&state, &result.0);
         return Ok(result);
     }
     if let Some(result) =
         media_catalog_items_result(&state.db, &query, &server_id, requested_user_id).await?
     {
+        queue_plugin_vod_artwork_prefetch_from_page(&state, &result.0);
         return Ok(result);
     }
     if let Some(result) =
         fast_name_search_items_result(&state.db, &query, &server_id, requested_user_id).await?
     {
+        queue_plugin_vod_artwork_prefetch_from_page(&state, &result.0);
         return Ok(result);
     }
     if query_requests_only_item_type(&query, "Series") && query.allowed_plugin_tuner_ids.is_none() {
@@ -33754,9 +33895,14 @@ async fn items_result(
         )));
     }
     let total_record_count = filtered_items.len();
+    let page = paged_media_items(filtered_items, &query);
+    queue_plugin_vod_artwork_prefetch_ids(
+        &state,
+        &page.iter().map(|item| item.id).collect::<Vec<_>>(),
+    );
     let items = items_to_json(
         &state.db,
-        paged_media_items(filtered_items, &query),
+        page,
         &server_id,
         requested_user_id,
         should_use_compact_items_result(&query),
@@ -33817,6 +33963,7 @@ async fn user_items_result(
     if let Some(result) =
         media_catalog_items_result(&state.db, &query, &server_id, Some(requested_user_id)).await?
     {
+        queue_plugin_vod_artwork_prefetch_from_page(&state, &result.0);
         return Ok(result);
     }
     if let Some(result) = mixed_series_episode_search_items_result(
@@ -33827,12 +33974,14 @@ async fn user_items_result(
     )
     .await?
     {
+        queue_plugin_vod_artwork_prefetch_from_page(&state, &result.0);
         return Ok(result);
     }
     if let Some(result) =
         fast_name_search_items_result(&state.db, &query, &server_id, Some(requested_user_id))
             .await?
     {
+        queue_plugin_vod_artwork_prefetch_from_page(&state, &result.0);
         return Ok(result);
     }
     if query_requests_only_item_type(&query, "Series") && query.allowed_plugin_tuner_ids.is_none() {
@@ -33876,9 +34025,14 @@ async fn user_items_result(
         )));
     }
     let total_record_count = filtered_items.len();
+    let page = paged_media_items(filtered_items, &query);
+    queue_plugin_vod_artwork_prefetch_ids(
+        &state,
+        &page.iter().map(|item| item.id).collect::<Vec<_>>(),
+    );
     let items = items_to_json(
         &state.db,
-        paged_media_items(filtered_items, &query),
+        page,
         &server_id,
         Some(requested_user_id),
         should_use_compact_items_result(&query),
@@ -34293,10 +34447,10 @@ async fn parent_virtual_items(
     let mut series_by_name = BTreeMap::<String, TvSeriesSummary>::new();
     let mut seasons_by_series = BTreeMap::<String, BTreeMap<Option<i32>, TvSeasonSummary>>::new();
     for episode in &episodes {
-        let Some(info) = tv_episode_info(episode) else {
+        let metadata = metadata_by_item.get(&episode.id);
+        let Some(info) = tv_episode_info_with_metadata(episode, metadata) else {
             continue;
         };
-        let metadata = metadata_by_item.get(&episode.id);
         let playback = playback_by_item.get(&episode.id);
         let series = series_by_name
             .entry(info.series_name.clone())
@@ -49407,7 +49561,9 @@ async fn series_seasons(
             .collect::<HashMap<_, _>>();
     let mut seasons = BTreeMap::<Option<i32>, TvSeasonSummary>::new();
     for episode in &episodes {
-        let season_number = tv_episode_info(episode).and_then(|info| info.season_number);
+        let season_number =
+            tv_episode_info_with_metadata(episode, metadata_by_item.get(&episode.id))
+                .and_then(|info| info.season_number);
         let playback = playback_by_item.get(&episode.id);
         let entry = seasons
             .entry(season_number)
@@ -49849,11 +50005,17 @@ async fn remote_trailers(
     scope_query.limit = None;
     scope_query.sort_by = None;
     scope_query.sort_order = None;
-    let scoped_items = filtered_items_for_query(
+    let scoped_items = filtered_items_for_query_from_source(
         &state,
         &headers,
         auth_query.api_key.as_deref(),
         &scope_query,
+        Some(
+            state
+                .db
+                .media_items_with_remote_trailers(REMOTE_TRAILER_SOURCE_MAX_ITEMS)
+                .await?,
+        ),
     )
     .await?;
     let item_by_id = scoped_items
@@ -52682,7 +52844,10 @@ async fn authenticated_similar_trailer_items(
     scope_query.sort_by = None;
     scope_query.sort_order = None;
     let scoped_items = filtered_media_items(
-        state.db.media_items().await?,
+        state
+            .db
+            .media_items_with_remote_trailers(REMOTE_TRAILER_SOURCE_MAX_ITEMS)
+            .await?,
         &scope_query,
         Some(requested_user_id),
         &state.db,
@@ -52692,9 +52857,10 @@ async fn authenticated_similar_trailer_items(
         .iter()
         .map(|item| (item.id, item))
         .collect::<HashMap<_, _>>();
+    let item_ids = item_by_id.keys().copied().collect::<HashSet<_>>();
     let server_id = state.db.server_state().await?.server_id.to_string();
     let mut trailers = Vec::new();
-    for metadata in state.db.media_item_metadata().await? {
+    for metadata in state.db.media_item_metadata_by_item_ids(&item_ids).await? {
         let Some(item) = item_by_id.get(&metadata.item_id) else {
             continue;
         };
@@ -53473,6 +53639,20 @@ async fn filtered_items_for_query(
     api_key: Option<&str>,
     query: &ItemsQuery,
 ) -> Result<Vec<MediaItem>, ApiError> {
+    filtered_items_for_query_from_source(state, headers, api_key, query, None).await
+}
+
+/// Same authorization and filtering as [`filtered_items_for_query`], but lets a caller supply an
+/// already-narrowed candidate set. Plugin-catalog visibility is still enforced by
+/// [`filtered_media_items`] over whatever source it receives, so overriding the source cannot
+/// widen what a user is allowed to see.
+async fn filtered_items_for_query_from_source(
+    state: &AppState,
+    headers: &HeaderMap,
+    api_key: Option<&str>,
+    query: &ItemsQuery,
+    source_items: Option<Vec<MediaItem>>,
+) -> Result<Vec<MediaItem>, ApiError> {
     let (auth_user, token) = require_user(&state.db, headers, api_key).await?;
     let requested_user_id = query.user_id.as_deref().map(resolve_user_id).transpose()?;
     if let Some(requested_user_id) = requested_user_id {
@@ -53487,7 +53667,10 @@ async fn filtered_items_for_query(
         requested_user_id,
     )
     .await?;
-    let source_items = media_items_source_for_query(&state.db, &scoped_query).await?;
+    let source_items = match source_items {
+        Some(source_items) => source_items,
+        None => media_items_source_for_query(&state.db, &scoped_query).await?,
+    };
     filtered_media_items(source_items, &scoped_query, requested_user_id, &state.db).await
 }
 
@@ -59579,6 +59762,49 @@ fn tv_episode_info(item: &MediaItem) -> Option<TvEpisodeInfo> {
     })
 }
 
+/// Same as [`tv_episode_info`], but trusts explicit numbering from the item's metadata first.
+///
+/// Path parsing is the right fallback for scanned files, whose season and episode live in the
+/// filename. It cannot work for an imported catalogue: those items carry an opaque path such as
+/// `plugin-vod://<id>` and a display name with no `S01E02` pattern, so every episode parsed as
+/// season `None` and collapsed into one "Season Unknown" folder even though the metadata already
+/// held the correct `ParentIndexNumber`.
+fn tv_episode_info_with_metadata(
+    item: &MediaItem,
+    metadata: Option<&serde_json::Value>,
+) -> Option<TvEpisodeInfo> {
+    let mut info = tv_episode_info(item)?;
+    let Some(metadata) = metadata else {
+        return Some(info);
+    };
+    if let Some(season_number) = metadata_i32_field(metadata, &["ParentIndexNumber"]) {
+        info.season_number = Some(season_number);
+    }
+    if let Some(episode_number) = metadata_i32_field(metadata, &["IndexNumber"]) {
+        info.episode_number = Some(episode_number);
+    }
+    Some(info)
+}
+
+/// Reads a bounded integer from metadata, accepting the string form some importers persist.
+fn metadata_i32_field(metadata: &serde_json::Value, keys: &[&str]) -> Option<i32> {
+    for key in keys {
+        let Some(value) = json_field_case_insensitive(metadata, key) else {
+            continue;
+        };
+        if let Some(number) = value.as_i64() {
+            return i32::try_from(number).ok();
+        }
+        if let Some(parsed) = value
+            .as_str()
+            .and_then(|value| value.trim().parse::<i32>().ok())
+        {
+            return Some(parsed);
+        }
+    }
+    None
+}
+
 fn plugin_vod_series_anchor_info(
     item: &MediaItem,
     metadata: &serde_json::Value,
@@ -60376,6 +60602,14 @@ struct ImageResizeQuery {
     max_width: Option<u32>,
     #[serde(alias = "MaxHeight", alias = "maxHeight")]
     max_height: Option<u32>,
+    /// Jellyfin clients request card artwork with `fillWidth`/`fillHeight`. Jellyrin bounds the
+    /// cached derivative by those dimensions rather than cropping to them: the card already uses
+    /// `object-fit` for the final framing, and without honouring them at all every grid tile
+    /// downloads the full-size original.
+    #[serde(alias = "FillWidth", alias = "fillWidth")]
+    fill_width: Option<u32>,
+    #[serde(alias = "FillHeight", alias = "fillHeight")]
+    fill_height: Option<u32>,
     #[serde(alias = "api_key", alias = "ApiKey", alias = "apiKey")]
     api_key: Option<String>,
 }
@@ -60389,8 +60623,9 @@ struct ImageResize {
 impl ImageResizeQuery {
     fn normalized(&self) -> Option<ImageResize> {
         const MAX_IMAGE_EDGE: u32 = 4096;
-        let requested_width = self.max_width.filter(|value| *value > 0);
-        let requested_height = self.max_height.filter(|value| *value > 0);
+        let positive = |value: Option<u32>| value.filter(|value| *value > 0);
+        let requested_width = positive(self.max_width).or_else(|| positive(self.fill_width));
+        let requested_height = positive(self.max_height).or_else(|| positive(self.fill_height));
         let max_width = requested_width
             .unwrap_or(MAX_IMAGE_EDGE)
             .clamp(1, MAX_IMAGE_EDGE);
@@ -60437,7 +60672,7 @@ async fn item_placeholder_image_extended(
     let path_size = ImageResizeQuery {
         max_width: max_width.parse().ok(),
         max_height: max_height.parse().ok(),
-        api_key: None,
+        ..ImageResizeQuery::default()
     };
     let size = query_size.normalized().or_else(|| path_size.normalized());
     let response = item_image_or_placeholder(
@@ -61032,6 +61267,182 @@ fn plugin_vod_grid_image_admission() -> Arc<Semaphore> {
     )
 }
 
+fn plugin_vod_artwork_prefetch_admission() -> Arc<Semaphore> {
+    Arc::clone(
+        PLUGIN_VOD_ARTWORK_PREFETCH_ADMISSION
+            .get_or_init(|| Arc::new(Semaphore::new(PLUGIN_VOD_ARTWORK_PREFETCH_MAX_IN_FLIGHT))),
+    )
+}
+
+/// Warms artwork for a page an authenticated client just received.
+///
+/// Browser `<img>` requests carry no credential — Jellyfin Web builds image URLs without a token —
+/// so the image route can never start a credentialed provider call for them, and must not: an
+/// anonymous request that could drive provider traffic is an abuse vector. The authenticated
+/// listing that produced the page is therefore the only correct trigger, and it is also the most
+/// precise one, because it knows exactly which items the client is about to render.
+///
+/// Nothing here is speculative beyond that page. Enrichment is deduplicated across concurrent and
+/// repeated listings, bounded in flight, and capped per page, so revisiting a library does not
+/// re-queue work and one large page cannot fan out unbounded provider calls.
+fn queue_plugin_vod_artwork_prefetch_from_page(state: &AppState, page: &serde_json::Value) {
+    let Some(items) = page.get("Items").and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    let item_ids = items
+        .iter()
+        .filter_map(|item| item.get("Id").and_then(serde_json::Value::as_str))
+        .filter_map(|id| parse_jellyfin_uuid(id).ok())
+        .collect::<Vec<_>>();
+    queue_plugin_vod_artwork_prefetch_ids(state, &item_ids);
+}
+
+fn queue_plugin_vod_artwork_prefetch_ids(state: &AppState, item_ids: &[Uuid]) {
+    let mut queued = 0usize;
+    for item_id in item_ids.iter().copied() {
+        if queued >= PLUGIN_VOD_ARTWORK_PREFETCH_MAX_PER_PAGE {
+            break;
+        }
+        if !claim_plugin_vod_artwork_prefetch(item_id) {
+            continue;
+        }
+        queued += 1;
+        let state = state.clone();
+        // Marked pending before the task is spawned, so an image request arriving in between waits
+        // for the fill instead of racing it to the cache and losing. Losing that race is what made
+        // artwork look random: whichever tiles happened to be filled when their single `<img>`
+        // request was served showed art, and the browser never asks again.
+        let pending = PluginVodArtworkFillGuard::register(item_id);
+        tokio::spawn(async move {
+            let _pending = pending;
+            let permit = plugin_vod_artwork_prefetch_admission()
+                .acquire_owned()
+                .await;
+            if permit.is_err() {
+                return;
+            }
+            if let Err(error) = prefetch_one_plugin_vod_artwork(&state, item_id).await {
+                tracing::debug!(
+                    status = %error.status(),
+                    "listing artwork prefetch was unavailable"
+                );
+            }
+        });
+    }
+}
+
+/// Marks one item as having a fill in flight for as long as it is held, including on panic.
+struct PluginVodArtworkFillGuard(Uuid);
+
+impl PluginVodArtworkFillGuard {
+    fn register(item_id: Uuid) -> Self {
+        if let Ok(mut pending) = plugin_vod_artwork_fill_pending().lock() {
+            pending.insert(item_id);
+        }
+        Self(item_id)
+    }
+}
+
+impl Drop for PluginVodArtworkFillGuard {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = plugin_vod_artwork_fill_pending().lock() {
+            pending.remove(&self.0);
+        }
+    }
+}
+
+fn plugin_vod_artwork_fill_pending() -> &'static StdMutex<HashSet<Uuid>> {
+    PLUGIN_VOD_ARTWORK_FILL_PENDING.get_or_init(|| StdMutex::new(HashSet::new()))
+}
+
+fn plugin_vod_artwork_fill_is_pending(item_id: Uuid) -> bool {
+    plugin_vod_artwork_fill_pending()
+        .lock()
+        .map(|pending| pending.contains(&item_id))
+        .unwrap_or(false)
+}
+
+/// Waits for a fill that an authenticated listing already queued for this item.
+///
+/// Browser `<img>` requests carry no credential, so they can never *start* provider work — but
+/// making them wait for work already authorised removes the race that made artwork appear at
+/// random. The wait is bounded, ends as soon as the fill finishes or gives up, and returns nothing
+/// for an item with no fill in flight, so an anonymous request for an unqueued item still answers
+/// immediately with the placeholder.
+async fn await_pending_plugin_vod_artwork(
+    state: &AppState,
+    item_id: Uuid,
+    owner_id: &str,
+    image_type: &str,
+    image_index: usize,
+) -> Result<Option<PathBuf>, ApiError> {
+    if !plugin_vod_artwork_fill_is_pending(item_id) {
+        return Ok(None);
+    }
+    let deadline = StdInstant::now() + PLUGIN_VOD_ARTWORK_FILL_MAX_WAIT;
+    loop {
+        tokio::time::sleep(PLUGIN_VOD_ARTWORK_FILL_POLL_INTERVAL).await;
+        if let Some(path) =
+            find_stored_image(state, ImageOwner::Item(owner_id), image_type, image_index).await?
+        {
+            return Ok(Some(path));
+        }
+        if !plugin_vod_artwork_fill_is_pending(item_id) || StdInstant::now() >= deadline {
+            return Ok(None);
+        }
+    }
+}
+
+/// Resolves one item's artwork, skipping anything that is not a provider-backed VOD item.
+/// `ensure_plugin_vod_metadata` already short-circuits on a fresh marker, so an item enriched by an
+/// earlier visit costs one metadata read rather than a provider call.
+async fn prefetch_one_plugin_vod_artwork(state: &AppState, item_id: Uuid) -> Result<(), ApiError> {
+    let Some(item) = state
+        .db
+        .media_item_by_id_visible(item_id)
+        .await
+        .map_err(ApiError::from)?
+    else {
+        return Ok(());
+    };
+    let metadata = metadata_payload_for_item(&state.db, item_id).await?;
+    let Some(target) = plugin_vod_item_metadata_target(&item, &metadata) else {
+        return Ok(());
+    };
+    ensure_plugin_vod_metadata(state, &target).await.map(|_| ())
+}
+
+/// Returns true when this call is the one responsible for enriching `item_id`.
+///
+/// The claim expires so a later failure can be retried, and the registry is bounded: at the cap the
+/// oldest claims are dropped rather than letting a long browsing session grow memory without limit.
+fn claim_plugin_vod_artwork_prefetch(item_id: Uuid) -> bool {
+    let registry = PLUGIN_VOD_ARTWORK_PREFETCH_CLAIMS.get_or_init(|| StdMutex::new(HashMap::new()));
+    let Ok(mut claims) = registry.lock() else {
+        return false;
+    };
+    let now = StdInstant::now();
+    claims.retain(|_, claimed_at: &mut StdInstant| {
+        now.duration_since(*claimed_at) < PLUGIN_VOD_ARTWORK_PREFETCH_CLAIM_TTL
+    });
+    if claims.contains_key(&item_id) {
+        return false;
+    }
+    if claims.len() >= PLUGIN_VOD_ARTWORK_PREFETCH_MAX_CLAIMS {
+        let oldest = claims
+            .iter()
+            .min_by_key(|(_, claimed_at)| **claimed_at)
+            .map(|(id, _)| *id);
+        if let Some(oldest) = oldest {
+            claims.remove(&oldest);
+        } else {
+            return false;
+        }
+    }
+    claims.insert(item_id, now);
+    true
+}
+
 /// Progressively fills an authenticated plugin-VOD grid without letting one page fan out an
 /// unbounded number of credentialed provider calls. The provider JIT lane remains serial; this
 /// outer admission bound caps queued HTTP work. Running the fill in a detached Tokio task means a
@@ -61152,8 +61563,18 @@ async fn item_image_or_placeholder(
     {
         return stored_image_response_sized(state, path, resize).await;
     }
-    // Unauthenticated, saturated or failed grid requests receive a cheap placeholder. A bounded
-    // authenticated fill may still be completing in the background after its HTTP wait expires.
+    // A listing may already have queued this item's fill. Waiting for that authorised work is what
+    // makes a freshly opened page complete: the browser requests each image exactly once, so
+    // answering with a placeholder while the fill is still running loses the artwork until a reload.
+    if image_index == 0
+        && normalize_image_type(image_type).eq_ignore_ascii_case("primary")
+        && let Some(path) =
+            await_pending_plugin_vod_artwork(state, item.id, item_id, image_type, image_index)
+                .await?
+    {
+        return stored_image_response_sized(state, path, resize).await;
+    }
+    // Requests for an item with no fill in flight receive a cheap placeholder immediately.
     if let Some(local_image) = find_local_item_image(&item, image_type, image_index).await? {
         return stored_image_response_sized(state, local_image, resize).await;
     }
@@ -61500,6 +61921,29 @@ async fn virtual_tv_item_image_response(
             }
         }
     }
+    // A season has no artwork of its own. Jellyfin renders the series poster on a season that has
+    // none, so fall back to the series anchor's stored image instead of leaving a blank card. The
+    // anchor is where the provider artwork was cached, which is why looking it up by the season's
+    // own id above cannot find it.
+    for item in &snapshot.items {
+        let Some(series_id) = snapshot
+            .metadata_by_item
+            .get(&item.id)
+            .and_then(|metadata| canonical_metadata_uuid_from_json(metadata, &["SeriesId"]))
+        else {
+            continue;
+        };
+        if series_id.eq_ignore_ascii_case(item_id) {
+            continue;
+        }
+        if let Some(path) =
+            find_stored_image(state, ImageOwner::Item(&series_id), image_type, 0).await?
+        {
+            return stored_image_response_sized(state, path, resize)
+                .await
+                .map(Some);
+        }
+    }
     Ok(None)
 }
 
@@ -61637,49 +62081,33 @@ async fn find_named_entity_representative_image(
     {
         return Ok(Some(path));
     }
-    for metadata in state.db.media_item_metadata().await? {
-        if !metadata_payload_contains_entity_name(&metadata.payload, needle) {
-            continue;
-        }
-        let owner_id = metadata.item_id.simple().to_string();
-        if let Some(path) =
-            find_stored_image(state, ImageOwner::Item(&owner_id), image_type, image_index).await?
-        {
-            return Ok(Some(path));
+    // Resolve the representative through the indexed facet projection. Scanning every metadata
+    // payload here materialised the whole catalogue — over 1 GiB of JSONB on a real library — and
+    // exceeded the statement timeout, so genre, studio and person artwork answered 500 instead of
+    // an image. These kinds are exactly the families the payload scan inspected, and querying one
+    // at a time keeps `facet_kind` bound so the value index applies instead of a full index scan.
+    for kind in NAMED_ENTITY_IMAGE_FACET_KINDS {
+        let candidates = MediaCatalogStore::media_item_ids_for_facets(
+            &state.db,
+            &MediaItemFacetCandidateQuery {
+                kind: Some(kind),
+                normalized_values: vec![needle.to_string()],
+                limit: Some(NAMED_ENTITY_IMAGE_CANDIDATE_LIMIT),
+                ..MediaItemFacetCandidateQuery::default()
+            },
+        )
+        .await?;
+        for item_id in candidates {
+            let owner_id = item_id.simple().to_string();
+            if let Some(path) =
+                find_stored_image(state, ImageOwner::Item(&owner_id), image_type, image_index)
+                    .await?
+            {
+                return Ok(Some(path));
+            }
         }
     }
     Ok(None)
-}
-
-fn metadata_payload_contains_entity_name(metadata: &serde_json::Value, needle: &str) -> bool {
-    [
-        "Genres",
-        "MusicGenres",
-        "Artists",
-        "AlbumArtists",
-        "People",
-        "Studios",
-    ]
-    .iter()
-    .any(|key| {
-        json_field_case_insensitive(metadata, key)
-            .is_some_and(|value| metadata_value_contains_name(value, needle))
-    })
-}
-
-fn metadata_value_contains_name(value: &serde_json::Value, needle: &str) -> bool {
-    match value {
-        serde_json::Value::Array(values) => values
-            .iter()
-            .any(|value| metadata_value_contains_name(value, needle)),
-        serde_json::Value::String(value) => value.eq_ignore_ascii_case(needle),
-        serde_json::Value::Object(object) => object
-            .get("Name")
-            .or_else(|| object.get("name"))
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|value| value.eq_ignore_ascii_case(needle)),
-        _ => false,
-    }
 }
 
 async fn store_uploaded_image(
@@ -61992,6 +62420,313 @@ async fn stored_image_response(path: PathBuf) -> Result<axum::response::Response
     Ok((headers, bytes).into_response())
 }
 
+/// Decode `source` and re-encode it as a JPEG that fits inside `bound`, preserving aspect ratio.
+///
+/// Returns `Ok(None)` when the image already fits, so callers can keep the original bytes instead
+/// of paying a lossy re-encode for nothing. Decode limits are deliberately explicit: provider
+/// artwork is untrusted input and a decompression bomb must not exhaust the process.
+fn encode_bounded_jpeg(source: Vec<u8>, bound: ImageResize) -> anyhow::Result<Option<Vec<u8>>> {
+    use image::GenericImageView as _;
+
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(source)).with_guessed_format()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(16_384);
+    limits.max_image_height = Some(16_384);
+    limits.max_alloc = Some(128 * 1024 * 1024);
+    reader.limits(limits);
+    let image = reader.decode()?;
+    let (width, height) = image.dimensions();
+    if width <= bound.max_width && height <= bound.max_height {
+        return Ok(None);
+    }
+    // `thumbnail` is a fast box filter and visibly softens a large downscale. Lanczos3 is the
+    // right resampler for the ratios here (a 1920px poster to 900px or less) and costs only CPU
+    // on a path that runs once per artwork, not per request.
+    let resized = image
+        .resize(
+            bound.max_width,
+            bound.max_height,
+            image::imageops::FilterType::Lanczos3,
+        )
+        .to_rgb8();
+    let mut output = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut output, STORED_ARTWORK_JPEG_QUALITY)
+        .encode_image(&resized)?;
+    Ok(Some(output))
+}
+
+/// Bounds provider artwork before it becomes a durable cache entry.
+///
+/// The provider returns display-quality originals — measured up to 2.3 MiB each — and storing them
+/// verbatim projected to roughly 316 GiB across this catalogue. A poster-sized JPEG serves every
+/// Jellyfin surface (grid cards bound themselves far below this, and the detail page renders well
+/// under it), so the original is downscaled once at fetch time rather than kept on disk. A decode
+/// failure keeps the provider bytes: artwork that cannot be re-encoded is still better than none.
+async fn bounded_provider_artwork_bytes(bytes: Vec<u8>) -> Vec<u8> {
+    let bound = ImageResize {
+        max_width: PROVIDER_ARTWORK_STORED_MAX_EDGE,
+        max_height: PROVIDER_ARTWORK_STORED_MAX_EDGE,
+    };
+    let original_len = bytes.len();
+    let fallback = bytes.clone();
+    match tokio::task::spawn_blocking(move || encode_bounded_jpeg(bytes, bound)).await {
+        Ok(Ok(Some(encoded))) if encoded.len() < original_len => encoded,
+        Ok(Ok(_)) => fallback,
+        Ok(Err(error)) => {
+            tracing::warn!(
+                ?error,
+                "provider artwork could not be bounded; storing as received"
+            );
+            fallback
+        }
+        Err(error) => {
+            tracing::warn!(?error, "provider artwork resize worker failed");
+            fallback
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ArtworkCompactionReport {
+    pub scanned: u64,
+    pub rewritten: u64,
+    pub failed: u64,
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+}
+
+/// Re-encodes provider artwork that predates the store-time bound.
+///
+/// Entries fetched before that bound existed hold the provider's original — measured at 353 KiB on
+/// average and up to 4.8 MiB, mostly PNG, which is the worst possible container for photographic
+/// posters. Only files above [`ARTWORK_COMPACTION_MIN_BYTES`] are decoded, so a second pass over an
+/// already-compacted cache is a stat-only walk and this stays cheap to run on every boot.
+///
+/// The cache is regenerable: a failure leaves the original in place and the item simply keeps its
+/// larger artwork. User and branding uploads are out of scope because those are operator-supplied
+/// originals rather than a provider cache.
+pub async fn compact_oversized_artwork_cache(cache_dir: &FsPath) -> ArtworkCompactionReport {
+    let bound = ImageResize {
+        max_width: PROVIDER_ARTWORK_STORED_MAX_EDGE,
+        max_height: PROVIDER_ARTWORK_STORED_MAX_EDGE,
+    };
+    let images_root = cache_dir.join("metadata").join("images");
+    let mut report = ArtworkCompactionReport::default();
+    for scope in ARTWORK_COMPACTION_SCOPES {
+        let mut pending = vec![images_root.join(scope)];
+        // Provider artwork nests one owner directory deep; the explicit stack keeps the walk
+        // iterative and refuses to descend a symlinked directory out of the cache.
+        while let Some(directory) = pending.pop() {
+            let Ok(mut entries) = tokio::fs::read_dir(&directory).await else {
+                continue;
+            };
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                let Ok(file_type) = entry.file_type().await else {
+                    continue;
+                };
+                if file_type.is_symlink() {
+                    continue;
+                }
+                if file_type.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if !file_type.is_file() {
+                    continue;
+                }
+                let Ok(metadata) = entry.metadata().await else {
+                    continue;
+                };
+                report.scanned += 1;
+                let original_len = metadata.len();
+                if original_len < ARTWORK_COMPACTION_MIN_BYTES {
+                    continue;
+                }
+                match compact_one_artwork_file(&path, original_len, bound).await {
+                    Ok(Some(new_len)) => {
+                        report.rewritten += 1;
+                        report.bytes_before += original_len;
+                        report.bytes_after += new_len;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        report.failed += 1;
+                        tracing::warn!(?error, "could not compact cached artwork");
+                    }
+                }
+            }
+        }
+    }
+    report
+}
+
+/// Runs artwork cache maintenance for the process lifetime.
+///
+/// Compaction runs once at startup because it only has legacy oversized entries to fix; the quota
+/// then runs on an interval because the cache grows as people browse. Startup is never blocked on
+/// either: the cache is regenerable, so nothing here is on a critical path.
+pub fn spawn_artwork_cache_maintenance(cache_dir: PathBuf) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let report = compact_oversized_artwork_cache(&cache_dir).await;
+        if report.rewritten > 0 || report.failed > 0 {
+            tracing::info!(
+                scanned = report.scanned,
+                rewritten = report.rewritten,
+                failed = report.failed,
+                bytes_before = report.bytes_before,
+                bytes_after = report.bytes_after,
+                "compacted oversized cached artwork"
+            );
+        }
+        loop {
+            let report = enforce_artwork_cache_quota(&cache_dir).await;
+            if report.evicted > 0 || report.truncated {
+                tracing::info!(
+                    scanned = report.scanned,
+                    total_bytes = report.total_bytes,
+                    evicted = report.evicted,
+                    reclaimed_bytes = report.reclaimed_bytes,
+                    truncated = report.truncated,
+                    "evicted least recently used artwork to stay inside the cache budget"
+                );
+            }
+            tokio::time::sleep(ARTWORK_CACHE_QUOTA_INTERVAL).await;
+        }
+    })
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ArtworkCacheEvictionReport {
+    pub scanned: u64,
+    pub total_bytes: u64,
+    pub evicted: u64,
+    pub reclaimed_bytes: u64,
+    pub truncated: bool,
+}
+
+/// Keeps the artwork cache inside its disk budget by dropping the least recently used entries.
+///
+/// Artwork is populated on demand as people browse, so the cache grows with real use rather than
+/// with catalogue size. This is the hard ceiling on that growth. Eviction is by access time — the
+/// filesystem is mounted `relatime`, so serving an entry refreshes it without Jellyrin writing
+/// anything — and drops to a low-water mark so the walk does not run on every tick.
+///
+/// Every entry is regenerable: an evicted poster is fetched again the next time someone opens that
+/// item. Only the provider artwork scopes and the derivative cache are eligible; user and branding
+/// uploads are operator-supplied originals and are never evicted.
+pub async fn enforce_artwork_cache_quota(cache_dir: &FsPath) -> ArtworkCacheEvictionReport {
+    let quota = artwork_cache_quota_bytes();
+    let metadata_root = cache_dir.join("metadata");
+    let mut roots = ARTWORK_COMPACTION_SCOPES
+        .iter()
+        .map(|scope| metadata_root.join("images").join(scope))
+        .collect::<Vec<_>>();
+    roots.push(metadata_root.join("thumbnails"));
+
+    let mut report = ArtworkCacheEvictionReport::default();
+    let mut entries = Vec::new();
+    for root in roots {
+        let mut pending = vec![root];
+        while let Some(directory) = pending.pop() {
+            let Ok(mut dir) = tokio::fs::read_dir(&directory).await else {
+                continue;
+            };
+            while let Ok(Some(entry)) = dir.next_entry().await {
+                let Ok(file_type) = entry.file_type().await else {
+                    continue;
+                };
+                if file_type.is_symlink() {
+                    continue;
+                }
+                if file_type.is_dir() {
+                    pending.push(entry.path());
+                    continue;
+                }
+                if !file_type.is_file() {
+                    continue;
+                }
+                let Ok(metadata) = entry.metadata().await else {
+                    continue;
+                };
+                report.scanned += 1;
+                report.total_bytes += metadata.len();
+                if entries.len() >= ARTWORK_CACHE_MAX_TRACKED_ENTRIES {
+                    // Refuse to grow this list without bound. The pass still reclaims from what it
+                    // did track, and the flag makes the incomplete sweep visible rather than
+                    // letting it look like the cache is inside budget.
+                    report.truncated = true;
+                    continue;
+                }
+                let accessed = metadata
+                    .accessed()
+                    .or_else(|_| metadata.modified())
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
+                entries.push((accessed, metadata.len(), entry.path()));
+            }
+        }
+    }
+    if report.total_bytes <= quota {
+        return report;
+    }
+
+    let low_water = quota / 10 * 9;
+    entries.sort_by_key(|(accessed, _, _)| *accessed);
+    let mut remaining = report.total_bytes;
+    for (_, len, path) in entries {
+        if remaining <= low_water {
+            break;
+        }
+        if tokio::fs::remove_file(&path).await.is_ok() {
+            remaining = remaining.saturating_sub(len);
+            report.evicted += 1;
+            report.reclaimed_bytes += len;
+        }
+    }
+    report
+}
+
+fn artwork_cache_quota_bytes() -> u64 {
+    static QUOTA: OnceLock<u64> = OnceLock::new();
+    *QUOTA.get_or_init(|| {
+        std::env::var("JELLYRIN_ARTWORK_CACHE_MAX_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value >= 256 * 1024 * 1024)
+            .unwrap_or(DEFAULT_ARTWORK_CACHE_MAX_BYTES)
+    })
+}
+
+/// Rewrites one oversized entry as a bounded JPEG, returning its new size when it was replaced.
+async fn compact_one_artwork_file(
+    path: &FsPath,
+    original_len: u64,
+    bound: ImageResize,
+) -> anyhow::Result<Option<u64>> {
+    let source = tokio::fs::read(path).await?;
+    let encoded = tokio::task::spawn_blocking(move || encode_bounded_jpeg(source, bound)).await??;
+    let Some(encoded) = encoded else {
+        return Ok(None);
+    };
+    let encoded_len = encoded.len() as u64;
+    if encoded_len >= original_len {
+        return Ok(None);
+    }
+    let target = path.with_extension("jpg");
+    let temporary = target.with_extension(format!("jpg.tmp.{}", Uuid::new_v4().simple()));
+    tokio::fs::write(&temporary, &encoded).await?;
+    if let Err(error) = tokio::fs::rename(&temporary, &target).await {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return Err(error.into());
+    }
+    // `IMAGE_FORMATS` resolves PNG before JPEG, so removing the superseded original is the step
+    // that publishes the smaller entry. Until it lands the previous artwork stays servable.
+    if path != target {
+        tokio::fs::remove_file(path).await?;
+    }
+    Ok(Some(encoded_len))
+}
+
 /// Return a cached, bounded JPEG derivative when Jellyfin clients request display dimensions.
 ///
 /// Originals remain authoritative. Derivatives live under Jellyrin's cache (never beside a user's
@@ -62043,31 +62778,9 @@ async fn stored_image_response_sized(
     }
 
     let source = tokio::fs::read(&path).await?;
-    let encoded = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Vec<u8>>> {
-        use image::GenericImageView as _;
-
-        let mut reader =
-            image::ImageReader::new(std::io::Cursor::new(source)).with_guessed_format()?;
-        let mut limits = image::Limits::default();
-        limits.max_image_width = Some(16_384);
-        limits.max_image_height = Some(16_384);
-        limits.max_alloc = Some(128 * 1024 * 1024);
-        reader.limits(limits);
-        let image = reader.decode()?;
-        let (width, height) = image.dimensions();
-        if width <= resize.max_width && height <= resize.max_height {
-            return Ok(None);
-        }
-        let thumbnail = image
-            .thumbnail(resize.max_width, resize.max_height)
-            .to_rgb8();
-        let mut output = Vec::new();
-        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut output, 82)
-            .encode_image(&thumbnail)?;
-        Ok(Some(output))
-    })
-    .await
-    .map_err(|error| ApiError::internal(format!("image resize worker failed: {error}")))?;
+    let encoded = tokio::task::spawn_blocking(move || encode_bounded_jpeg(source, resize))
+        .await
+        .map_err(|error| ApiError::internal(format!("image resize worker failed: {error}")))?;
 
     let encoded = match encoded {
         Ok(Some(encoded)) => encoded,
@@ -64246,13 +64959,89 @@ mod tests {
         assert!(!path.starts_with("/var/log"));
     }
 
+    #[tokio::test]
+    async fn artwork_cache_quota_evicts_least_recently_used_and_spares_user_uploads() {
+        let cache = tempfile::tempdir().expect("temp cache");
+        let images = cache.path().join("metadata").join("images");
+        let items = images.join("items").join("owner");
+        let users = images.join("users").join("owner");
+        for directory in [&items, &users] {
+            tokio::fs::create_dir_all(directory).await.expect("mkdir");
+        }
+        // One byte over the smallest quota the parser accepts, split across three entries.
+        let payload = vec![0_u8; 128 * 1024 * 1024];
+        for name in ["primary_0.jpg", "primary_1.jpg", "primary_2.jpg"] {
+            tokio::fs::write(items.join(name), &payload)
+                .await
+                .expect("write artwork");
+        }
+        tokio::fs::write(users.join("primary_0.jpg"), &payload)
+            .await
+            .expect("write upload");
+        // Make one entry unambiguously the oldest so eviction order is deterministic.
+        let oldest = items.join("primary_0.jpg");
+        let stale = std::fs::File::options()
+            .write(true)
+            .open(&oldest)
+            .expect("open oldest");
+        let long_ago = std::time::SystemTime::UNIX_EPOCH + StdDuration::from_secs(1);
+        stale
+            .set_times(std::fs::FileTimes::new().set_accessed(long_ago))
+            .expect("set access time");
+
+        unsafe { std::env::set_var("JELLYRIN_ARTWORK_CACHE_MAX_BYTES", "268435456") };
+        let report = super::enforce_artwork_cache_quota(cache.path()).await;
+
+        assert!(
+            report.evicted >= 1,
+            "an over-budget cache must reclaim space"
+        );
+        assert!(!report.truncated);
+        assert!(
+            !oldest.exists(),
+            "the least recently used entry must be evicted first"
+        );
+        assert!(
+            users.join("primary_0.jpg").exists(),
+            "operator uploads are not a regenerable cache and must survive"
+        );
+    }
+
+    /// Prints size/quality trade-offs for one real cached poster. Set JELLYRIN_ARTWORK_SAMPLE to a
+    /// file path and run with `--ignored --nocapture` to compare bounds before changing them.
+    #[test]
+    #[ignore = "requires a local artwork sample"]
+    fn artwork_bounds_report_size_for_a_real_poster() {
+        let Ok(sample) = std::env::var("JELLYRIN_ARTWORK_SAMPLE") else {
+            return;
+        };
+        let source = std::fs::read(&sample).expect("sample artwork must be readable");
+        println!("original: {} bytes", source.len());
+        for edge in [640_u32, 720, 900, 1080] {
+            let encoded = super::encode_bounded_jpeg(
+                source.clone(),
+                super::ImageResize {
+                    max_width: edge,
+                    max_height: edge,
+                },
+            )
+            .expect("bounded encode must succeed")
+            .expect("a large poster must be downscaled");
+            println!(
+                "edge {edge:>4}: {:>8} bytes  ({:.1}x smaller)",
+                encoded.len(),
+                source.len() as f64 / encoded.len() as f64
+            );
+        }
+    }
+
     #[test]
     fn image_resize_queries_are_bounded_and_catalog_flags_shape_payloads() {
         assert_eq!(
             super::ImageResizeQuery {
                 max_width: Some(200),
                 max_height: None,
-                api_key: None,
+                ..super::ImageResizeQuery::default()
             }
             .normalized(),
             Some(super::ImageResize {
@@ -64264,7 +65053,7 @@ mod tests {
             super::ImageResizeQuery {
                 max_width: Some(99_999),
                 max_height: Some(0),
-                api_key: None,
+                ..super::ImageResizeQuery::default()
             }
             .normalized(),
             Some(super::ImageResize {
@@ -64272,6 +65061,36 @@ mod tests {
                 max_height: 4096,
             })
         );
+
+        // Jellyfin Web requests grid cards with fillWidth/fillHeight. Ignoring them served the
+        // full-size original for every tile, so they must bound the derivative too.
+        assert_eq!(
+            super::ImageResizeQuery {
+                fill_width: Some(316),
+                fill_height: Some(474),
+                ..super::ImageResizeQuery::default()
+            }
+            .normalized(),
+            Some(super::ImageResize {
+                max_width: 316,
+                max_height: 474,
+            })
+        );
+        // An explicit max bound stays authoritative when a client sends both families.
+        assert_eq!(
+            super::ImageResizeQuery {
+                max_width: Some(200),
+                fill_width: Some(316),
+                fill_height: Some(474),
+                ..super::ImageResizeQuery::default()
+            }
+            .normalized(),
+            Some(super::ImageResize {
+                max_width: 200,
+                max_height: 474,
+            })
+        );
+        assert_eq!(super::ImageResizeQuery::default().normalized(), None);
 
         let query = super::parse_items_query(Some(
             "Fields=Overview&EnableImages=false&EnableUserData=false&EnableTotalRecordCount=false",
