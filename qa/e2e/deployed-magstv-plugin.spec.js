@@ -226,6 +226,20 @@ test.describe('MAGSTV episode candidate sampling contract', () => {
   });
 });
 
+test.describe('MAGSTV live TV candidate sampling contract', () => {
+  test('spreads candidates across the catalogue instead of only probing its first group', () => {
+    const items = Array.from({ length: 21 }, (_, index) => ({ Id: `channel-${index}` }));
+
+    expect(sampleLiveTvCandidates(items, 5).map((item) => item.Id)).toEqual([
+      'channel-0',
+      'channel-5',
+      'channel-10',
+      'channel-15',
+      'channel-20',
+    ]);
+  });
+});
+
 async function loadAdministratorAuthentication(request) {
   const token = await loadAdministratorToken();
   if (token) {
@@ -430,7 +444,7 @@ async function catalogueSnapshot(request, auth) {
     request.get(itemsPath(auth.User.Id, views.series.Id, 'Series'), { headers, timeout: 60_000 }),
     request.get(itemsPath(auth.User.Id, views.series.Id, 'Episode'), { headers, timeout: 60_000 }),
     request.get(
-      `/LiveTv/Channels?UserId=${encodeURIComponent(auth.User.Id)}&ParentId=${encodeURIComponent(views.liveTv.Id)}&StartIndex=0&Limit=5`,
+      `/LiveTv/Channels?UserId=${encodeURIComponent(auth.User.Id)}&ParentId=${encodeURIComponent(views.liveTv.Id)}&StartIndex=0&Limit=2000`,
       { headers, timeout: 60_000 },
     ),
   ]);
@@ -448,15 +462,29 @@ async function catalogueSnapshot(request, auth) {
     episodesResponse.json(),
     channelsResponse.json(),
   ]);
+  const normalizedChannels = normalizePage(channels);
   const normalized = {
     views,
     movies: normalizePage(movies),
     series: normalizePage(series),
     episodes: normalizePage(episodes),
-    channels: normalizePage(channels),
+    channels: {
+      total: normalizedChannels.total,
+      items: sampleLiveTvCandidates(normalizedChannels.items, catalogueCandidateLimit),
+    },
   };
   expect(normalized.channels.items.every((item) => item.TunerHostId === TUNER_ID)).toBe(true);
   return normalized;
+}
+
+function sampleLiveTvCandidates(items, limit) {
+  if (!Array.isArray(items) || !items.length || limit <= 0) return [];
+  if (items.length <= limit) return items;
+  if (limit === 1) return [items[0]];
+  const lastIndex = items.length - 1;
+  return Array.from({ length: limit }, (_, index) => (
+    items[Math.round((index * lastIndex) / (limit - 1))]
+  ));
 }
 
 function itemsPath(userId, parentId, itemType) {
