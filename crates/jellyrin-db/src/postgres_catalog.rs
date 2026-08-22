@@ -2970,36 +2970,54 @@ impl PostgresDatabase {
             }
             let rows = sqlx::query_as::<_, PostgresProjectedNextUpPageRow>(
                 r#"
-                WITH counted AS (
-                    SELECT
-                        (SELECT count(*)::bigint
-                         FROM media_item_tv_series
-                         WHERE episode_count > 0
-                           AND ($2::uuid IS NULL OR virtual_folder_id = $2))
-                        -
-                        (SELECT count(*)::bigint
-                         FROM (
-                             SELECT DISTINCT played_member.series_id,
-                                             played_member.virtual_folder_id
-                             FROM playback_states AS playback
-                             JOIN media_item_tv_series_members AS played_member
-                               ON played_member.item_id = playback.item_id
-                             WHERE playback.user_id = $1 AND playback.played
-                               AND ($2::uuid IS NULL OR played_member.virtual_folder_id = $2)
-                         ) AS affected
-                         WHERE NOT EXISTS (
-                             SELECT 1
-                             FROM media_item_tv_series_members AS candidate
-                             WHERE candidate.series_id = affected.series_id
-                               AND candidate.virtual_folder_id = affected.virtual_folder_id
-                               AND NOT EXISTS (
-                                   SELECT 1
-                                   FROM playback_states AS state
-                                   WHERE state.user_id = $1
-                                     AND state.item_id = candidate.item_id
-                                     AND state.played
-                               )
-                         )) AS total_record_count
+                WITH affected AS MATERIALIZED (
+                    SELECT DISTINCT played_member.series_id,
+                                    played_member.virtual_folder_id
+                    FROM playback_states AS playback
+                    JOIN media_item_tv_series_members AS played_member
+                      ON played_member.item_id = playback.item_id
+                    WHERE playback.user_id = $1 AND playback.played
+                      AND ($2::uuid IS NULL OR played_member.virtual_folder_id = $2)
+                ),
+                completed AS MATERIALIZED (
+                    SELECT affected.series_id, affected.virtual_folder_id
+                    FROM affected
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                        FROM media_item_tv_series_members AS candidate
+                        WHERE candidate.series_id = affected.series_id
+                          AND candidate.virtual_folder_id = affected.virtual_folder_id
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM playback_states AS state
+                              WHERE state.user_id = $1
+                                AND state.item_id = candidate.item_id
+                                AND state.played
+                          )
+                    )
+                ),
+                eligible_series AS MATERIALIZED (
+                    SELECT series.virtual_folder_id, series.series_id, series.series_name
+                    FROM media_item_tv_series AS series
+                    WHERE series.episode_count > 0
+                      AND ($2::uuid IS NULL OR series.virtual_folder_id = $2)
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM completed
+                          WHERE completed.series_id = series.series_id
+                            AND completed.virtual_folder_id = series.virtual_folder_id
+                      )
+                ),
+                counted AS (
+                    SELECT count(*)::bigint AS total_record_count
+                    FROM eligible_series
+                ),
+                selected_series AS (
+                    SELECT virtual_folder_id, series_id, series_name
+                    FROM eligible_series
+                    ORDER BY lower(series_name), series_name,
+                             series_id, virtual_folder_id
+                    OFFSET $3 LIMIT $4
                 )
                 SELECT page.item_id, page.virtual_folder_id, page.item_name, page.item_path,
                        counted.total_record_count
@@ -3008,7 +3026,7 @@ impl PostgresDatabase {
                     SELECT candidate.item_id, candidate.virtual_folder_id,
                            candidate.item_name, candidate.item_path,
                            series.series_name, series.series_id
-                    FROM media_item_tv_series AS series
+                    FROM selected_series AS series
                     JOIN LATERAL (
                         SELECT member.item_id, member.virtual_folder_id,
                                member.item_name, member.item_path
@@ -3026,11 +3044,8 @@ impl PostgresDatabase {
                                  member.sort_name, member.item_id
                         LIMIT 1
                     ) AS candidate ON true
-                    WHERE series.episode_count > 0
-                      AND ($2::uuid IS NULL OR series.virtual_folder_id = $2)
                     ORDER BY lower(series.series_name), series.series_name,
                              series.series_id, series.virtual_folder_id
-                    OFFSET $3 LIMIT $4
                 ) AS page ON true
                 ORDER BY lower(page.series_name), page.series_name,
                          page.series_id, page.virtual_folder_id

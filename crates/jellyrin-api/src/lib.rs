@@ -39369,6 +39369,7 @@ struct PlaybackInfoOptions {
     transcoding_profiles: Option<Vec<TranscodingProfileMatcher>>,
     subtitle_profiles: Option<Vec<SubtitleProfileMatcher>>,
     hls_subtitles_as_embedded: bool,
+    plugin_vod_selection_hls: bool,
     codec_profiles: Vec<CodecProfileMatcher>,
 }
 
@@ -39611,6 +39612,7 @@ impl Default for PlaybackInfoOptions {
             transcoding_profiles: None,
             subtitle_profiles: None,
             hls_subtitles_as_embedded: false,
+            plugin_vod_selection_hls: false,
             codec_profiles: Vec::new(),
         }
     }
@@ -40137,6 +40139,7 @@ async fn playback_info_response(
     let metadata = metadata.as_ref();
     normalize_completed_remote_resume_position(&item, metadata, &mut options);
     apply_android_remote_subtitle_hls_policy(&item, metadata, &token.client, &mut options);
+    apply_plugin_vod_stream_selection_hls_policy(&item, metadata, &token.client, &mut options);
     let item_json = media_item_to_json_with_playback_and_metadata(
         &item,
         &server_id,
@@ -40333,6 +40336,55 @@ fn apply_android_remote_subtitle_hls_policy(
     // method. The renditions are already part of our HLS master manifest, so expose them as
     // embedded tracks to make every rendition selectable without creating a second sidecar input.
     options.hls_subtitles_as_embedded = true;
+}
+
+/// A TV client that can decode the source video directly can keep that codec while HLS narrows a
+/// plugin-VOD stream to the selected audio/subtitle tracks. Device profiles commonly list only
+/// H264 in their transcoding profile even when their direct profile accepts HEVC; extending the
+/// HLS profile here avoids needlessly re-encoding video merely to switch audio.
+fn apply_plugin_vod_stream_selection_hls_policy(
+    item: &MediaItem,
+    metadata: Option<&serde_json::Value>,
+    client: &str,
+    options: &mut PlaybackInfoOptions,
+) {
+    if !is_plugin_vod_remote_media(metadata)
+        || !plugin_vod_has_nondefault_stream_selection(item, options)
+        || !plugin_vod_tv_client_requires_selected_hls(client)
+    {
+        return;
+    }
+    options.plugin_vod_selection_hls = true;
+    if !playback_profile_video_codec_compatible(item, options) {
+        return;
+    }
+    let Some(codec) = media_item_stream_codec(item, "Video") else {
+        return;
+    };
+    let Some(profiles) = options.transcoding_profiles.as_mut() else {
+        return;
+    };
+    for profile in profiles.iter_mut().filter(|profile| {
+        profile
+            .protocols
+            .iter()
+            .any(|protocol| protocol.eq_ignore_ascii_case("hls"))
+    }) {
+        if !profile
+            .video_codecs
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(&codec))
+        {
+            profile.video_codecs.push(codec.clone());
+        }
+    }
+}
+
+fn plugin_vod_tv_client_requires_selected_hls(client: &str) -> bool {
+    let client = client.trim().to_ascii_lowercase();
+    client == "wholphin"
+        || client == "jellyfin android tv"
+        || client.starts_with("jellyfin+android+tv+")
 }
 
 fn live_tv_playback_info_response(
@@ -43861,6 +43913,10 @@ fn playback_delivery_decision_with_ffmpeg_mode(
 ) -> TranscodeDecision {
     let plugin_vod_remote = is_plugin_vod_remote_media(metadata);
     let is_remote = is_xtream_remote_media(metadata) || plugin_vod_remote;
+    let plugin_vod_stream_selection_requires_hls = options.plugin_vod_selection_hls
+        && ffmpeg_mode != FfmpegMode::Disabled
+        && plugin_vod_remote
+        && plugin_vod_has_nondefault_stream_selection(item, options);
     // Plugin-VOD sources use the same compatibility decision as other remote media. A native
     // client whose profile accepts MPEG-TS may keep the cheap direct proxy. Browsers normally do
     // not advertise TS direct play, so they fall through to the existing HLS remux/transcode
@@ -43899,6 +43955,7 @@ fn playback_delivery_decision_with_ffmpeg_mode(
         && direct_compatible
         && !selected_audio_needs_transcode
         && !selected_subtitle_requires_processing
+        && !plugin_vod_stream_selection_requires_hls
     {
         return TranscodeDecision {
             delivery: if is_remote {
@@ -43975,7 +44032,8 @@ fn playback_delivery_decision_with_ffmpeg_mode(
         }
         let video = if item.media_type != "Video" {
             HlsStreamMode::Drop
-        } else if hls_video_stream_copy_supported(item)
+        } else if (plugin_vod_stream_selection_requires_hls
+            || hls_video_stream_copy_supported(item))
             && profile_video_codec_compatible
             && video_codec_conditions_compatible
             && !max_streaming_bitrate_exceeded
@@ -44030,6 +44088,25 @@ fn playback_delivery_decision_with_ffmpeg_mode(
         reasons: vec!["NoCompatibleStream"],
         output: PlaybackOutputConstraints::default(),
     }
+}
+
+/// Native TV clients restart `PlaybackInfo` when a user changes tracks, but their DirectStream
+/// players are allowed to ignore Jellyfin's default stream indices and choose the first MPEG-TS
+/// track again. Route only a non-default plugin-VOD choice through the existing HLS pipeline: its
+/// FFmpeg input maps the requested audio index, while text subtitles remain authenticated HLS
+/// renditions resolved just in time. Ordinary/default playback keeps the zero-CPU direct proxy.
+fn plugin_vod_has_nondefault_stream_selection(
+    item: &MediaItem,
+    options: &PlaybackInfoOptions,
+) -> bool {
+    let streams = media_item_streams(item);
+    let nondefault_audio = options.audio_stream_index.is_some_and(|selected| {
+        default_audio_stream_index(&streams).is_some_and(|default| selected != default)
+    });
+    let selected_subtitle = options
+        .subtitle_stream_index
+        .is_some_and(|selected| selected >= 0);
+    nondefault_audio || selected_subtitle
 }
 
 fn selected_audio_stream_needs_transcode(item: &MediaItem, options: &PlaybackInfoOptions) -> bool {
@@ -110119,6 +110196,56 @@ done
         assert!(!super::selected_text_subtitle_can_use_external(
             &item, &native
         ));
+
+        let mut selected_native_item = item.clone();
+        selected_native_item.media_streams[0]["Codec"] = json!("hevc");
+        let mut selected_native = playback_info_options_from_body(&json!({
+            "EnableDirectPlay": true,
+            "EnableDirectStream": true,
+            "EnableTranscoding": true,
+            "AudioStreamIndex": 2,
+            "SubtitleStreamIndex": 3,
+            "DeviceProfile": {
+                "Name": "Native TV stream selection",
+                "DirectPlayProfiles": [{
+                    "Container": "ts,mpegts",
+                    "Type": "Video",
+                    "VideoCodec": "h264,hevc,mpeg2video",
+                    "AudioCodec": "aac,mp2,mp3,ac3,eac3"
+                }],
+                "TranscodingProfiles": [{
+                    "Container": "ts",
+                    "Type": "Video",
+                    "VideoCodec": "h264",
+                    "AudioCodec": "aac",
+                    "Protocol": "hls",
+                    "Context": "Streaming"
+                }],
+                "SubtitleProfiles": [
+                    { "Format": "webvtt", "Method": "Hls" },
+                    { "Format": "webvtt", "Method": "External" }
+                ]
+            }
+        }));
+        super::apply_plugin_vod_stream_selection_hls_policy(
+            &selected_native_item,
+            Some(&metadata),
+            "Wholphin",
+            &mut selected_native,
+        );
+        let selected_native_decision = playback_delivery_decision_with_ffmpeg_mode(
+            &selected_native_item,
+            Some(&metadata),
+            &selected_native,
+            FfmpegMode::Enabled,
+        );
+        assert_eq!(
+            selected_native_decision.delivery,
+            DeliveryMode::HlsTranscode
+        );
+        assert_eq!(selected_native_decision.video, HlsStreamMode::Copy);
+        assert_eq!(selected_native_decision.audio, HlsStreamMode::Encode);
+
         let mut initial_native_source = json!({ "MediaStreams": item.media_streams.clone() });
         if super::text_subtitle_profile_supports_external(&item, &native) {
             super::apply_direct_external_text_subtitle_contract(
