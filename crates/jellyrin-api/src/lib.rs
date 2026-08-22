@@ -33549,6 +33549,81 @@ async fn media_catalog_items_result(
     ))))
 }
 
+/// Resolve a plain `Ids=` lookup without materializing the complete media catalogue.
+///
+/// Jellyfin clients use this shape to hydrate the people attached to a detail page. Those people
+/// are metadata facets rather than rows in `media_items`, so the ordinary SQL catalogue page is
+/// not sufficient by itself. Keep the gate deliberately narrow, fetch real media rows in one
+/// bounded query, and resolve only the missing stable metadata entity ids.
+async fn exact_id_items_result(
+    db: &Database,
+    query: &ItemsQuery,
+    server_id: &str,
+    user_id: Option<Uuid>,
+) -> Result<Option<Json<serde_json::Value>>, ApiError> {
+    let Some(raw_ids) = query.ids.as_deref() else {
+        return Ok(None);
+    };
+
+    let mut unsupported = query.clone();
+    unsupported.user_id = None;
+    unsupported.ids = None;
+    unsupported.fields = None;
+    unsupported._image_type_limit = None;
+    unsupported._enable_images = None;
+    unsupported._enable_user_data = None;
+    unsupported._collapse_box_set_items = None;
+    unsupported._image_types = None;
+    unsupported._enable_image_types = None;
+    unsupported._enable_total_record_count = None;
+    unsupported.allowed_plugin_tuner_ids = None;
+    if unsupported != ItemsQuery::default() {
+        return Ok(None);
+    }
+
+    let ids = parse_uuid_list(raw_ids)?;
+    if ids.is_empty() {
+        return Ok(None);
+    }
+    if ids.len() > MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE {
+        return Err(ApiError::bad_request(format!(
+            "Ids accepts at most {MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE} values"
+        )));
+    }
+
+    let media_items =
+        filtered_media_items(db.media_items_by_ids(&ids).await?, query, user_id, db).await?;
+    let media_values = items_to_json(db, media_items, server_id, user_id, false).await?;
+    let mut values_by_id = media_values
+        .into_iter()
+        .filter_map(|value| {
+            let id = value.get("Id")?.as_str()?.to_ascii_lowercase();
+            Some((id, value))
+        })
+        .collect::<HashMap<_, _>>();
+
+    let mut items = Vec::with_capacity(ids.len());
+    for id in ids {
+        let normalized_id = id.simple().to_string();
+        let value = if let Some(value) = values_by_id.remove(&normalized_id) {
+            value
+        } else if let Some(entity) = metadata_entity_by_stable_id(db, &normalized_id).await? {
+            metadata_entity_match_json(server_id, &entity)
+        } else {
+            // Series, seasons, channels and other synthetic ids retain their existing handlers.
+            return Ok(None);
+        };
+        items.push(shape_catalog_item_for_query(value, query));
+    }
+
+    let total = if query_flag(&query._enable_total_record_count).unwrap_or(true) {
+        items.len()
+    } else {
+        0
+    };
+    Ok(Some(Json(query_result_with_total(items, total, 0))))
+}
+
 /// Serve Jellyfin Web/Android's library search without loading every episode into memory.
 ///
 /// The clients request synthetic `Series` and persisted `Episode` items together. A homogeneous
@@ -33841,6 +33916,11 @@ async fn items_result(
             .await?
     {
         queue_plugin_vod_artwork_prefetch_from_page(&state, &result.0);
+        return Ok(result);
+    }
+    if let Some(result) =
+        exact_id_items_result(&state.db, &query, &server_id, requested_user_id).await?
+    {
         return Ok(result);
     }
     if let Some(result) =
@@ -98640,7 +98720,10 @@ done
                         json!({ "Type": "Video", "Index": 0, "Codec": "h264" }),
                         json!({ "Type": "Subtitle", "Index": 1, "Language": "spa" }),
                     ],
-                    metadata: json!({ "Overview": "Beta overview" }),
+                    metadata: json!({
+                        "Overview": "Beta overview",
+                        "People": [{ "Name": "Catalog Person", "Role": "Tester" }]
+                    }),
                 },
             ],
         )
@@ -98922,6 +99005,29 @@ done
         assert_eq!(fallback["Items"].as_array().unwrap().len(), 1);
         assert_eq!(fallback["Items"][0]["Id"], beta_id);
         assert_eq!(fallback["Items"][0]["UserData"]["Played"], true);
+
+        // Wholphin hydrates a detail page's people with an exact Ids lookup and no Limit. People
+        // are projected metadata facets, not media rows; this request must stay bounded in SQL
+        // and still return the synthetic entity rather than scanning the complete catalogue.
+        let person_id = stable_entity_id("Person", "Catalog Person");
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items?Ids={person_id}"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let exact_ids: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(exact_ids["TotalRecordCount"], 1);
+        assert_eq!(exact_ids["Items"][0]["Id"], person_id);
+        assert_eq!(exact_ids["Items"][0]["Name"], "Catalog Person");
+        assert_eq!(exact_ids["Items"][0]["Type"], "Person");
 
         let response = app
             .oneshot(
