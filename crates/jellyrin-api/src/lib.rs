@@ -60598,8 +60598,8 @@ async fn tv_episode_catalog_snapshot_for_season(
 }
 
 /// The scoped snapshot for an id that may name either a series or a season, falling back to the
-/// full
-/// catalogue only when neither persisted id resolves.
+/// episodes without a canonical series id when neither persisted id resolves. Those are the only
+/// rows that can belong to a name-derived synthetic series.
 async fn tv_episode_catalog_snapshot_scoped_to_series(
     db: &Database,
     series_id: &str,
@@ -60610,7 +60610,7 @@ async fn tv_episode_catalog_snapshot_scoped_to_series(
     if let Some(snapshot) = tv_episode_catalog_snapshot_for_season(db, series_id).await? {
         return Ok(snapshot);
     }
-    tv_episode_catalog_snapshot(db).await
+    tv_episode_catalog_snapshot_without_canonical_series_id(db).await
 }
 
 fn tv_season_parent_from_snapshot(
@@ -101323,6 +101323,33 @@ done
         assert_eq!(seasons["Items"][0]["ChildCount"], 2);
         assert_eq!(seasons["Items"][0]["UserData"]["UnplayedItemCount"], 1);
         assert_eq!(seasons["Items"][0]["Overview"], "Inline metadata");
+
+        // Wholphin loads a series' seasons through the generic Items endpoint. Synthetic series
+        // ids must use the bounded no-canonical-SeriesId fallback instead of scanning all TV rows.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items?StartIndex=0&Limit=20&Recursive=false&ParentId={series_id}&Fields=PrimaryImageAspectRatio&Fields=CanDelete&IncludeItemTypes=Season&SortBy=IndexNumber&EnableUserData=true&EnableTotalRecordCount=true&EnableImages=true"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let wholphin_seasons: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(wholphin_seasons["TotalRecordCount"], 1);
+        assert_eq!(wholphin_seasons["Items"][0]["Type"], "Season");
+        assert_eq!(wholphin_seasons["Items"][0]["ChildCount"], 2);
+        assert_eq!(
+            wholphin_seasons["Items"][0]["UserData"]["ItemId"],
+            wholphin_seasons["Items"][0]["Id"]
+        );
 
         let response = app
             .oneshot(
