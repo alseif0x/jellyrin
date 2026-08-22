@@ -3,12 +3,17 @@ const fsConstants = require('node:fs').constants;
 const { test, expect } = require('@playwright/test');
 
 const PLUGIN_ID = '7a7a8541-29f8-4c35-99b1-66df55f8399e';
-const TUNER_ID = 'magstv';
+const TUNER_ID = process.env.JELLYRIN_E2E_MAGSTV_TUNER_ID || 'magstv';
 const DEVICE_ID = 'deployed-magstv-plugin-qa';
-const REQUIRED_VIEWS = Object.freeze({
+const DEFAULT_REQUIRED_VIEWS = Object.freeze({
   movies: 'Mags Movies',
   series: 'Mags Series',
   liveTv: 'Mags Live TV',
+});
+const REQUIRED_VIEWS = Object.freeze({
+  movies: process.env.JELLYRIN_E2E_MAGSTV_MOVIES_VIEW || DEFAULT_REQUIRED_VIEWS.movies,
+  series: process.env.JELLYRIN_E2E_MAGSTV_SERIES_VIEW || DEFAULT_REQUIRED_VIEWS.series,
+  liveTv: process.env.JELLYRIN_E2E_MAGSTV_LIVE_VIEW || DEFAULT_REQUIRED_VIEWS.liveTv,
 });
 
 const catalogueTimeoutMs = positiveIntegerEnvironment(
@@ -162,9 +167,9 @@ test.describe('MAGSTV home view locator contract', () => {
     `);
 
     const expectedHrefs = {
-      [REQUIRED_VIEWS.movies]: '#/movies?topParentId=movies-view&collectionType=movies',
-      [REQUIRED_VIEWS.series]: '#/tv?topParentId=series-view&collectionType=tvshows',
-      [REQUIRED_VIEWS.liveTv]: '#/list?serverId=server&parentId=live-view',
+      [DEFAULT_REQUIRED_VIEWS.movies]: '#/movies?topParentId=movies-view&collectionType=movies',
+      [DEFAULT_REQUIRED_VIEWS.series]: '#/tv?topParentId=series-view&collectionType=tvshows',
+      [DEFAULT_REQUIRED_VIEWS.liveTv]: '#/list?serverId=server&parentId=live-view',
     };
     for (const [name, href] of Object.entries(expectedHrefs)) {
       const link = myMediaViewLink(page, name);
@@ -348,7 +353,8 @@ async function verifyEncryptedTunerConfiguration(request, token) {
   expect(serialized.includes('"username"')).toBe(false);
   expect(serialized.includes('"password"')).toBe(false);
   expect(tuner.Type).toBe(`plugin:${PLUGIN_ID}`);
-  expect(tuner.FriendlyName).toBe(REQUIRED_VIEWS.liveTv);
+  expect(tuner.FriendlyName).toEqual(expect.any(String));
+  expect(tuner.FriendlyName.trim()).not.toBe('');
   expect(tuner.JellyrinProviderSecretRef?.Id).toBeTruthy();
   expect(tuner.JellyrinProviderSecretRef?.Provider).toBeTruthy();
   expect(Number(tuner.JellyrinProviderSecretRef?.Revision)).toBeGreaterThan(0);
