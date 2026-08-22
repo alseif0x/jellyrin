@@ -1,10 +1,10 @@
 # Decisión sobre Redis para Jellyrin
 
-**Estado (revalidado el 2026-08-21): Redis es un caché opcional y fail-open para
-facetas públicas compartidas del catálogo.** La decisión cambió al confirmar que
-la instalación servirá a muchos usuarios y que géneros, estudios, personas,
-etiquetas y años repiten exactamente la misma proyección por biblioteca. No se
-ha convertido Redis en fuente de verdad ni en requisito de disponibilidad.
+**Estado (revalidado el 2026-08-22): Redis es un caché opcional y fail-open para
+proyecciones públicas compartidas del catálogo.** La decisión cambió al confirmar que
+la instalación servirá a muchos usuarios y que facetas y conteos por biblioteca repiten
+exactamente la misma proyección. No se ha convertido Redis en fuente de verdad ni en requisito de
+disponibilidad.
 
 PostgreSQL sigue resolviendo usuarios, permisos, asignación de cuenta de plugin,
 progreso, favoritos, sesiones, límites de dispositivos y todo dato de playback.
@@ -18,9 +18,11 @@ systemd, `JELLYRIN_REDIS_URL_FILE`. Compose conserva el profile explícito
 `cache`/`distributed-cache`, sin puerto publicado, autenticado, sin AOF/RDB y
 con `allkeys-lru`.
 
-El consumidor está deliberadamente acotado:
+Los consumidores están deliberadamente acotados:
 
 - solo guarda vectores de nombres públicos de facetas;
+- guarda también el pequeño mapa compartido `biblioteca -> número de items`, con el mismo TTL y
+  fallback, para evitar recorrer cerca de un millón de entradas en cada carga de `/Users/*/Views`;
 - la clave incluye namespace versionado, tipo de faceta y SHA-256 del conjunto
   ordenado de bibliotecas; no expone UUID en claro;
 - cada valor tiene un máximo de 64 KiB y TTL configurable de 5–300 s (30 s por
@@ -38,6 +40,7 @@ El consumidor está deliberadamente acotado:
 | Usuarios, tokens, sesiones de dispositivo, progreso y listas | PostgreSQL | Deben seguir siendo durables; Redis no será fuente primaria. |
 | Quick Connect y sesiones activas/transcode | PostgreSQL, con expiración o reconciliación | El estado se necesita después de un reinicio; no moverlo a una caché sin persistencia. |
 | Facetas públicas del catálogo | PostgreSQL + Redis cache-aside opcional | Compartibles entre usuarios; TTL corto, valor acotado y fallback transparente. |
+| Conteos públicos por biblioteca | PostgreSQL + Redis cache-aside opcional | Compartidos por Home/Views; PostgreSQL los recompone tras un miss y Redis nunca es autoritativo. |
 | Catálogo de paquetes | Tabla materializada `package_catalog_cache` | Ya evita consultar repositorios externos en lectura; no duplicarlo en Redis. |
 | Exclusión de sync de catálogo, configuración de plugins y emisión de token | Advisory locks/row locks PostgreSQL | Son suficientes para una o varias instancias y se liberan con transacción o conexión. |
 | Cupos FFmpeg y de probes | Semáforos en el proceso propietario | Redis no puede poseer un proceso hijo ni devolver un permiso RAII. |

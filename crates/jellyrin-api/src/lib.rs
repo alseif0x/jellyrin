@@ -198,6 +198,7 @@ use tokio::sync::{Mutex, RwLock, Semaphore, broadcast, oneshot, watch};
 use tokio_util::io::ReaderStream;
 use tower_http::{
     LatencyUnit,
+    compression::CompressionLayer,
     services::ServeDir,
     trace::{DefaultOnRequest, DefaultOnResponse, TraceLayer},
 };
@@ -4568,6 +4569,10 @@ pub fn router(state: AppState) -> Router {
                         .latency_unit(LatencyUnit::Millis),
                 ),
         )
+        // Compress ordinary JSON/web responses even when Jellyrin is exposed directly without an
+        // optional reverse proxy. tower-http's predicate leaves already encoded and multimedia
+        // bodies alone, so stream payloads are not recompressed.
+        .layer(CompressionLayer::new())
         .with_state(state)
 }
 
@@ -32395,7 +32400,7 @@ async fn user_views_result(
     }
     let folders = state.db.virtual_folders().await?;
     let server_id = state.db.server_state().await?.server_id.to_string();
-    let item_counts = state.db.media_item_counts_by_virtual_folder().await?;
+    let item_counts = catalog_cache::cached_media_item_counts_by_virtual_folder(&state.db).await?;
     let allowed = authorized_live_tv_tuner_ids(
         &state.db,
         &jellyrin_plugin_sdk::PluginUserContext {
@@ -32429,7 +32434,7 @@ async fn user_views_result_legacy(
     ensure_user_access(&auth_user, requested_user_id)?;
     let folders = state.db.virtual_folders().await?;
     let server_id = state.db.server_state().await?.server_id.to_string();
-    let item_counts = state.db.media_item_counts_by_virtual_folder().await?;
+    let item_counts = catalog_cache::cached_media_item_counts_by_virtual_folder(&state.db).await?;
     let allowed = authorized_live_tv_tuner_ids(
         &state.db,
         &jellyrin_plugin_sdk::PluginUserContext {
@@ -54982,6 +54987,7 @@ async fn tv_series_items_result(
                     .limit
                     .unwrap_or(25)
                     .min(MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE),
+                query_flag(&query._enable_total_record_count).unwrap_or(true),
                 TvSeriesCatalogNameFilter {
                     search_term: query.search_term.clone(),
                     starts_with: query.name_starts_with.clone(),
@@ -64947,6 +64953,34 @@ mod tests {
     use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn direct_http_json_responses_are_gzip_compressed() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/System/Info/Public")
+                    .header(header::ACCEPT_ENCODING, "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_ENCODING).unwrap(),
+            "gzip"
+        );
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(bytes.starts_with(&[0x1f, 0x8b]));
+    }
 
     #[tokio::test]
     async fn live_tv_guide_info_exposes_a_parseable_ordered_utc_window() {

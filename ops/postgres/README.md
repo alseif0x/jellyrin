@@ -36,9 +36,10 @@ not rotate roles in an existing cluster. For an existing volume, back it up and 
 explicitly as an administrator; recreate the volume only when its contents are known to be
 disposable.
 
-Redis is an optional cache scaffold and is not part of durable storage. The current single-node
-decision is to leave it stopped; `docs/redis-decision.md` records the benchmark and activation
-thresholds. Start it only after the application has a measured use for it:
+Redis is an optional cache and is not part of durable storage. Small installations should leave it
+stopped; large shared catalogues may enable it for the measured facet and folder-count
+projections. `docs/redis-decision.md` records the benchmark, fail-open contract and activation
+thresholds:
 
 ```bash
 docker compose --profile distributed-cache up -d

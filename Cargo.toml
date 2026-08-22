@@ -46,7 +46,7 @@ time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"
 tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "signal", "fs", "net", "process", "io-util", "io-std", "sync", "time"] }
 tokio-tungstenite = "0.29"
 tokio-util = { version = "0.7", features = ["io"] }
-tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
+tower-http = { version = "0.6", features = ["compression-gzip", "cors", "fs", "trace"] }
 tower = "0.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }

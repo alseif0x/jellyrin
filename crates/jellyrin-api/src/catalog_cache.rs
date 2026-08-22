@@ -9,13 +9,14 @@ use std::{
 
 use jellyrin_db::{MediaCatalogStore, MediaItemFacetKind};
 use redis::aio::ConnectionManager;
+use serde::{Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::Database;
 
-const CACHE_NAMESPACE: &str = "jellyrin:catalog:v1";
+const CACHE_NAMESPACE: &str = "jellyrin:catalog:v2";
 const MAX_CACHE_VALUE_BYTES: usize = 64 * 1024;
 const MAX_SINGLE_FLIGHT_KEYS: usize = 128;
 const STARTUP_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -32,8 +33,8 @@ struct SharedCatalogCache {
     bypass_until_epoch_millis: AtomicU64,
 }
 
-enum CacheLookup {
-    Hit(Vec<String>),
+enum CacheLookup<T> {
+    Hit(T),
     Miss,
     Unavailable,
 }
@@ -56,7 +57,10 @@ impl SharedCatalogCache {
         })
     }
 
-    async fn get(&self, key: &str) -> CacheLookup {
+    async fn get<T>(&self, key: &str) -> CacheLookup<T>
+    where
+        T: DeserializeOwned,
+    {
         if self.bypass_until_epoch_millis.load(Ordering::Relaxed) > epoch_millis() {
             return CacheLookup::Unavailable;
         }
@@ -84,7 +88,10 @@ impl SharedCatalogCache {
             .unwrap_or(CacheLookup::Miss)
     }
 
-    async fn put(&self, key: &str, values: &[String]) {
+    async fn put<T>(&self, key: &str, values: &T)
+    where
+        T: Serialize + ?Sized,
+    {
         let Ok(payload) = serde_json::to_vec(values) else {
             return;
         };
@@ -160,7 +167,7 @@ pub(crate) async fn cached_media_item_facet_display_values(
         return database_facet_display_values(db, kind, virtual_folder_ids).await;
     };
     let key = facet_cache_key(kind, virtual_folder_ids);
-    match cache.get(&key).await {
+    match cache.get::<Vec<String>>(&key).await {
         CacheLookup::Hit(values) => return Ok(values),
         CacheLookup::Unavailable => {
             return database_facet_display_values(db, kind, virtual_folder_ids).await;
@@ -172,7 +179,7 @@ pub(crate) async fn cached_media_item_facet_display_values(
     // PostgreSQL projection across every concurrent Home/catalogue request.
     let fill_lock = cache.fill_lock(&key).await;
     let _fill_guard = fill_lock.lock().await;
-    match cache.get(&key).await {
+    match cache.get::<Vec<String>>(&key).await {
         CacheLookup::Hit(values) => return Ok(values),
         CacheLookup::Unavailable => {
             return database_facet_display_values(db, kind, virtual_folder_ids).await;
@@ -182,6 +189,36 @@ pub(crate) async fn cached_media_item_facet_display_values(
     let values = database_facet_display_values(db, kind, virtual_folder_ids).await?;
     cache.put(&key, &values).await;
     Ok(values)
+}
+
+/// Returns the small, public folder-count projection used by every Home/Views request.
+///
+/// Counting the complete visible catalogue takes roughly one index entry per media item. The
+/// result contains only folder identifiers and counts, is shared by every user, and remains
+/// authoritative in PostgreSQL; Redis merely bounds how often the aggregate is recomputed.
+pub(crate) async fn cached_media_item_counts_by_virtual_folder(
+    db: &Database,
+) -> anyhow::Result<HashMap<Uuid, usize>> {
+    let Some(cache) = SHARED_CATALOG_CACHE.get() else {
+        return db.media_item_counts_by_virtual_folder().await;
+    };
+    let key = folder_counts_cache_key();
+    match cache.get::<HashMap<Uuid, usize>>(&key).await {
+        CacheLookup::Hit(counts) => return Ok(counts),
+        CacheLookup::Unavailable => return db.media_item_counts_by_virtual_folder().await,
+        CacheLookup::Miss => {}
+    }
+
+    let fill_lock = cache.fill_lock(&key).await;
+    let _fill_guard = fill_lock.lock().await;
+    match cache.get::<HashMap<Uuid, usize>>(&key).await {
+        CacheLookup::Hit(counts) => return Ok(counts),
+        CacheLookup::Unavailable => return db.media_item_counts_by_virtual_folder().await,
+        CacheLookup::Miss => {}
+    }
+    let counts = db.media_item_counts_by_virtual_folder().await?;
+    cache.put(&key, &counts).await;
+    Ok(counts)
 }
 
 fn epoch_millis() -> u64 {
@@ -222,6 +259,10 @@ fn facet_cache_key(kind: MediaItemFacetKind, virtual_folder_ids: &[Uuid]) -> Str
     )
 }
 
+fn folder_counts_cache_key() -> String {
+    format!("{CACHE_NAMESPACE}:folder-counts")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,6 +284,13 @@ mod tests {
         assert!(!genre.contains(&second.to_string()));
     }
 
+    #[test]
+    fn folder_count_key_is_versioned_and_contains_no_folder_identifier() {
+        let key = folder_counts_cache_key();
+        assert!(key.starts_with(CACHE_NAMESPACE));
+        assert_eq!(key, "jellyrin:catalog:v2:folder-counts");
+    }
+
     #[tokio::test]
     async fn redis_cache_round_trip_is_optional_bounded_and_unicode_safe() {
         let Ok(redis_url) = std::env::var("JELLYRIN_TEST_REDIS_URL") else {
@@ -256,10 +304,13 @@ mod tests {
         .await
         .expect("test Redis must be reachable");
         let key = format!("{CACHE_NAMESPACE}:test:{}", Uuid::new_v4());
-        assert!(matches!(cache.get(&key).await, CacheLookup::Miss));
+        assert!(matches!(
+            cache.get::<Vec<String>>(&key).await,
+            CacheLookup::Miss
+        ));
         let expected = vec!["Drama".to_string(), "Ciencia ficción".to_string()];
         cache.put(&key, &expected).await;
-        let CacheLookup::Hit(actual) = cache.get(&key).await else {
+        let CacheLookup::Hit(actual) = cache.get::<Vec<String>>(&key).await else {
             panic!("Redis cache did not return the populated value");
         };
         assert_eq!(actual, expected);

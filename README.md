@@ -4,8 +4,9 @@ Jellyrin is a Rust port of Jellyfin server behavior. The current milestone is a
 compatibility-first backend that can serve the existing Jellyfin web client and
 then grow feature-by-feature against golden behavior from upstream Jellyfin.
 
-The current PostgreSQL, Redis no-go, and FFmpeg rollout plan lives in
-[`docs/transcode-optimization-plan.md`](docs/transcode-optimization-plan.md).
+El stack obligatorio, los componentes opcionales y los perfiles de recursos están en
+[`docs/minimum-stack.md`](docs/minimum-stack.md). Las decisiones de PostgreSQL, Redis y FFmpeg se
+detallan en [`docs/transcode-optimization-plan.md`](docs/transcode-optimization-plan.md).
 
 ## Development
 
@@ -52,8 +53,8 @@ Release artifacts live under `ops/` plus the root Docker files:
 - `docker-compose.yml` is the complete entrypoint: it starts private PostgreSQL,
   applies migrations with a DDL-only credential, then starts Jellyrin with the
   restricted runtime credential. The published HTTP port binds to host loopback
-  by default. Redis profiles remain dormant scaffolding for benchmarks or a
-  future reevaluation; the application has no Redis consumer.
+  by default. Redis remains optional and fail-open; when its profile is enabled it caches only
+  shared, regenerable catalogue projections.
 - `docker-compose.dlna.yml` is the optional DLNA/UPnP override. Use it with
   `docker compose -f docker-compose.yml -f docker-compose.dlna.yml up -d --build`
   when SSDP discovery must work from TVs or VLC on the LAN.
@@ -97,7 +98,7 @@ overlay is enabled, run it with
 fixed container ownership contract before Compose is invoked.
 
 See [`ops/postgres/README.md`](ops/postgres/README.md) for role separation,
-existing-volume handling, TLS guidance, and the dormant Redis scaffold.
+existing-volume handling, TLS guidance, and the optional Redis cache profile.
 See [docs/provider-secrets.md](docs/provider-secrets.md) before enabling the
 provider-keyring overlay; the image uses fixed UID/GID `10001:10001` and the
 host file must be readable by that group without being world-readable.
@@ -112,15 +113,18 @@ Generate the same bundle locally with
 `ops/generate-sbom.sh jellyrin:release supply-chain-artifacts` after building
 the release candidate as documented in [`ops/supply-chain.md`](ops/supply-chain.md).
 
-## Recommended low-resource topology
+## Recommended topology
 
 For a node that indexes external providers, use the default Compose deployment:
 
 - PostgreSQL is the only durable runtime database and stays on the private
   backend network.
-- Redis stays disabled. The measured decision and the conditions that would
-  justify enabling it are recorded in
+- Redis stays disabled for small installations. Large shared catalogues may enable it for public
+  facets and library counts; its measured limits and fail-open contract are recorded in
   [`docs/redis-decision.md`](docs/redis-decision.md).
+- nginx is optional. Jellyrin can listen directly on a LAN/publication port and compresses normal
+  JSON/web responses itself. Use a reverse proxy when TLS, a public hostname, ACME or perimeter
+  controls are required.
 - The default is `JELLYRIN_FFMPEG_MODE=enabled` because browser, Android and
   Android TV profiles can require AC3-to-AAC or H.264 transcoding. VOD and Live
   HLS still try direct play/remux first and make at most one encode fallback

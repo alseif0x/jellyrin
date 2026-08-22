@@ -363,8 +363,8 @@ histórica y no debe confundirse con este estado vigente.
   journal/logs/argv también quedó limpio. Cualquier import legacy futuro debe
   repetir ambos gates y reimportar el catálogo afectado —no editar filas
   manualmente— antes de abrir ingress.
-- Redis queda habilitado únicamente como caché-aside opcional de facetas públicas
-  compartidas. PostgreSQL sigue siendo fuente de verdad; TTL, tamaño, timeout,
+- Redis queda habilitado únicamente como caché-aside opcional de facetas públicas y conteos
+  compartidos por biblioteca. PostgreSQL sigue siendo fuente de verdad; TTL, tamaño, timeout,
   single-flight y circuit breaker están acotados y la caída de Redis hace bypass.
   No se usa para coordinación, sesiones, progreso, permisos ni playback. Los
   gates y el benchmark histórico permanecen en `docs/redis-decision.md`.
@@ -920,7 +920,7 @@ se marcará completo solo después de su validación y rollout correspondiente.
 | Xtream integrado y vault | Referencias JIT, relay loopback, XOR Live TV, AEAD; VOD/Series por streaming acotado a staging durable, fallback Series por categoría, publicación conjunta y `0 = todo`; probe media+metadata agrupado; métricas counts-only y límites efectivos | Xtream 27/27; sync real completo en 4.969 s con 39.093 películas, 455.520 episodios, 3 series omitidas, 0 duplicadas, pico 158.728.192 bytes y 0 stages residuales; Live TV direct/remux real verde; audits DB/logs/argv 0 findings | Repetición periódica del audit y matriz de clientes reales |
 | Catálogo general | Pushdown SQL paginado con total exacto, playback join y ParentId; Series usa una proyección durable/atómica por driver, página claves canónicas y conserva fallback legacy fail-closed; NextUp pliega el stream a un ganador por serie con clave/orden compartidos en core | API 356/0/3, DB 174/0/4, core 19/19 y Clippy estricto; migrador 38/38. PostgreSQL real: 455.585 episodios/22.201 series; tras el rollout 124, Series exacto en 129 ms y NextUp 22.034 exactos en 2,78–2,88 s, con memoria acotada por series e hidratación de solo la página | E2E visual/reproducción y caminos legacy poco frecuentes |
 | Facetas y filtros | Proyección item-level 117, resumen exacto 118, revisiones/CAS 119 y frontera de publicación 120 por carpeta/tipo; ganador determinista, coverage revisionada e invalidación fail-closed; 124 serializa publicación e invalidación de Series | 494.613 items/989.226 contribuciones → 96 filas; 124 aplicada en 742 ms. PostgreSQL aislado valida la carrera publication/write; staging conserva coverage de Series (455.585/22.201), resumen `1567/1567` y `2004/2004`, cero revisiones sucias | Scope padre+hijos/múltiple, coalescer de grandes lotes y E2E cliente real |
-| Redis | Opcional, cache-aside de facetas públicas | Round-trip real, límites y fallback; benchmark reproducible conservado | Medir hit ratio/p95/evictions antes de ampliar el scope |
+| Redis | Opcional, cache-aside de facetas públicas y conteos por biblioteca | Round-trip real, límites y fallback; benchmark reproducible conservado | Medir hit ratio/p95/evictions antes de ampliar el scope |
 | Supply chain | Pins, SBOM/scanners/excepciones gobernadas; runtime distroless sin shell/package manager; SQLx 0.9 sin `rsa`; FFmpeg por commit con 16 fixes oficiales verificados y NVD fail-closed; Jellyfin Web endurecido | Sobre HEAD `630a430`: supply-chain 46/46, packaging 47/47, security-hardening 16/16, systemd 14/14, performance/recovery 37/37; imagen Docker AArch64 nativa `e561d9fe178a` de 88.538.826 bytes con healthcheck de imagen, corpus y runtime smokes verdes, Compose real hasta esquema 117, SBOM verificado y RustSec/Trivy/NVD `passed=true` | Repetir todo en AMD64 nativo; después firma/provenance y pull por digest |
 | Staging bare-metal | PostgreSQL/runtime separados, loopback, TLS, renovación, logs proxy sin query, keyring por `LoadCredential`; FFmpeg software habilitado con un job, dos threads, niceness 10 y techo físico de 150% de CPU | Núcleo `b06b648`; esquema 124 desplegado el 2026-08-11 a las 16:17 UTC en 742 ms; health/readiness local y health HTTPS verdes, 0 reinicios/warnings, ~32 MiB actuales. 757 canales, 39.113 películas, 22.201 series y 455.585 episodios. Series exacto en 129 ms; `/Shows/NextUp` 22.034 exactos en 2,78–2,88 s; transcodes sustituidos se aíslan y serializan por usuario/dispositivo | E2E visual autenticado; worker externo/hardware para 4K; resolver egress/secretos operativos y ejecutar E2E MAGSTV; backups off-host |
 
@@ -1166,7 +1166,8 @@ Las decisiones de arquitectura son:
 4. MySQL queda reconocido como selector reservado. Para habilitarlo deberá
    aportar adaptador, SQL, migraciones y suite de conformidad nativos; no se
    introducirá `AnyPool` ni un mínimo común de consultas.
-5. Redis se integra solo como caché opcional de facetas públicas compartidas;
+5. Redis se integra solo como caché opcional de facetas públicas y conteos compartidos por
+   biblioteca;
    nunca será fuente de verdad, coordinación crítica ni propietario de FFmpeg.
 6. Los catálogos externos son reconstruibles; usuarios, configuración,
    credenciales, progreso y listas son datos irremplazables y se migrarán con
@@ -2860,7 +2861,7 @@ la migración es reversible. Usar patrón expand/contract para cambios online.
 
 ### 13.11 Redis: caché opcional y umbral de ampliación
 
-Redis implementa únicamente cache-aside de facetas públicas por biblioteca.
+Redis implementa únicamente cache-aside de facetas públicas y conteos compartidos por biblioteca.
 PostgreSQL aporta persistencia/coordinación; FFmpeg, broadcasts, leases y canales
 de cancelación conservan ownership local. La caché tiene namespace versionado,
 claves de scope hasheadas, TTL 30 s, valor máximo 64 KiB, timeout 20 ms,
@@ -3409,7 +3410,7 @@ Después de instrumentación, este track puede desarrollarse en paralelo:
 2. Ejecutar carga, caos, seguridad y restore end-to-end.
 3. Ajustar recursos con datos del host, documentar dashboards y alertas.
 4. Activar cada política FFmpeg con feature flag y cohortes/clientes conocidos.
-5. `[~]` Redis se limita a facetas públicas; medir hit ratio/p95/evictions en el
+5. `[~]` Redis se limita a facetas públicas y conteos por biblioteca; medir hit ratio/p95/evictions en el
    rollout antes de ampliar su alcance.
 
 Cada fase debe tener migración, métricas, criterio de salida y rollback. Mantener

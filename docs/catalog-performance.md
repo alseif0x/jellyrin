@@ -191,9 +191,10 @@ verificar constraints y medir escritura/lectura antes y después.
 ## Decisión de caché
 
 Redis se añade de forma opcional después de corregir cardinalidad, serialización, imágenes e
-índices. No cachea `NextUp`, progreso ni respuestas finales personalizadas. Su único consumidor
-inicial son las facetas públicas compartidas por biblioteca: géneros, estudios, personas,
-etiquetas y años. El diseño cache-aside usa TTL 30 s, máximo 64 KiB, timeout 20 ms, claves
+índices. No cachea `NextUp`, progreso ni respuestas finales personalizadas. Sus consumidores son
+las facetas públicas compartidas por biblioteca —géneros, estudios, personas, etiquetas y años— y
+el pequeño mapa de conteos por biblioteca usado por Home/Views. El diseño cache-aside usa TTL 30 s,
+máximo 64 KiB, timeout 20 ms, claves
 versionadas/hasheadas, single-flight y bypass automático de cinco segundos ante fallo.
 
 En el despliegue real, Redis tiene `maxmemory=128 MiB` y un cgroup de 192 MiB. Géneros de

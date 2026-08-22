@@ -1,7 +1,7 @@
 # Supply-chain lock, SBOM and vulnerability policy
 
 `ops/supply-chain.lock.env` is the reviewed, public lock for container inputs. It fixes the Rust
-builder, Debian build helper, distroless production runtime, PostgreSQL and the dormant Redis
+builder, Debian build helper, distroless production runtime, PostgreSQL and the optional Redis
 scaffold by tag plus OCI manifest digest. Build-stage apt sources use a dated Debian snapshot.
 FFmpeg is compiled in a separate stage from an official commit-addressed source archive after
 verifying its locked SHA-256; the runtime receives only the two stripped binaries. Their required

@@ -1841,6 +1841,7 @@ impl PostgresDatabase {
             virtual_folder_id,
             start_index,
             limit,
+            true,
             TvSeriesCatalogNameFilter::default(),
         )
         .await
@@ -1851,6 +1852,7 @@ impl PostgresDatabase {
         virtual_folder_id: Option<Uuid>,
         start_index: usize,
         limit: usize,
+        include_total_record_count: bool,
         filter: TvSeriesCatalogNameFilter,
     ) -> anyhow::Result<Option<TvSeriesCatalogPage>> {
         let search_pattern = filter
@@ -1945,7 +1947,7 @@ impl PostgresDatabase {
         .fetch_one(&mut *transaction)
         .await?;
         if !projection_covered {
-            let page = Self::tv_series_catalog_page_from_live(
+            let mut page = Self::tv_series_catalog_page_from_live(
                 &mut transaction,
                 virtual_folder_id,
                 start_index,
@@ -1953,15 +1955,23 @@ impl PostgresDatabase {
                 name_patterns,
             )
             .await?;
+            if !include_total_record_count && let Some(page) = page.as_mut() {
+                page.total_record_count = 0;
+            }
             transaction.commit().await?;
             return Ok(page);
         }
         let requested_limit = limit;
-        let mut series = sqlx::query_as::<_, (String, String, i64)>(
+        let total_projection = if include_total_record_count {
+            "COUNT(*) OVER ()"
+        } else {
+            "0::bigint"
+        };
+        let series_sql = format!(
             r#"
             SELECT series_id,
                    min(series_name) AS series_name,
-                   COUNT(*) OVER () AS total_series
+                   {total_projection} AS total_series
             FROM media_item_tv_series AS series
             JOIN media_item_tv_series_coverage AS coverage
               ON coverage.virtual_folder_id = series.virtual_folder_id
@@ -1976,18 +1986,24 @@ impl PostgresDatabase {
             ORDER BY lower(min(series_name)), min(series_name), series_id
             LIMIT $2 OFFSET $3
             "#,
-        )
-        .bind(virtual_folder_id)
-        .bind(i64::try_from(limit.max(1))?)
-        .bind(i64::try_from(start_index)?)
-        .bind(TV_SERIES_CATALOG_PROJECTION_VERSION)
-        .bind(search_pattern.as_deref())
-        .bind(starts_with_pattern.as_deref())
-        .bind(lower_bound.as_deref())
-        .bind(upper_bound.as_deref())
-        .fetch_all(&mut *transaction)
-        .await?;
-        let total = if let Some((_, _, total)) = series.first() {
+        );
+        // The only interpolated fragment is one of the two fixed aggregate projections above;
+        // every request-controlled value remains a bind parameter.
+        let mut series =
+            sqlx::query_as::<_, (String, String, i64)>(sqlx::AssertSqlSafe(series_sql.as_str()))
+                .bind(virtual_folder_id)
+                .bind(i64::try_from(limit.max(1))?)
+                .bind(i64::try_from(start_index)?)
+                .bind(TV_SERIES_CATALOG_PROJECTION_VERSION)
+                .bind(search_pattern.as_deref())
+                .bind(starts_with_pattern.as_deref())
+                .bind(lower_bound.as_deref())
+                .bind(upper_bound.as_deref())
+                .fetch_all(&mut *transaction)
+                .await?;
+        let total = if !include_total_record_count {
+            0
+        } else if let Some((_, _, total)) = series.first() {
             *total
         } else if start_index == 0 {
             0
@@ -10820,6 +10836,7 @@ mod tests {
                     None,
                     0,
                     20,
+                    true,
                     TvSeriesCatalogNameFilter {
                         search_term: Some("example".to_string()),
                         ..TvSeriesCatalogNameFilter::default()
@@ -10830,12 +10847,26 @@ mod tests {
             assert_eq!(searched.total_record_count, 1);
             assert_eq!(searched.series.len(), 1);
             assert_eq!(searched.series[0].name, "Example Show");
+            let without_total = test
+                .database
+                .tv_series_catalog_search_page(
+                    None,
+                    0,
+                    20,
+                    false,
+                    TvSeriesCatalogNameFilter::default(),
+                )
+                .await?
+                .unwrap();
+            assert_eq!(without_total.total_record_count, 0);
+            assert_eq!(without_total.series.len(), 1);
             let letter_page = test
                 .database
                 .tv_series_catalog_search_page(
                     None,
                     0,
                     20,
+                    true,
                     TvSeriesCatalogNameFilter {
                         starts_with: Some("E".to_string()),
                         starts_with_or_greater: Some("E".to_string()),
@@ -10853,6 +10884,7 @@ mod tests {
                     None,
                     0,
                     20,
+                    true,
                     TvSeriesCatalogNameFilter {
                         search_term: Some("missing".to_string()),
                         ..TvSeriesCatalogNameFilter::default()
