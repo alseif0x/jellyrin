@@ -397,9 +397,12 @@ static AUTH_FAILURES: OnceLock<Mutex<AuthFailureRegistry>> = OnceLock::new();
 static REMOTE_IMAGE_HTTP_CLIENTS: OnceLock<Mutex<RemoteImageClientCache>> = OnceLock::new();
 static PLUGIN_VOD_GRID_IMAGE_ADMISSION: OnceLock<Arc<Semaphore>> = OnceLock::new();
 static PLUGIN_VOD_ARTWORK_PREFETCH_ADMISSION: OnceLock<Arc<Semaphore>> = OnceLock::new();
-static PLUGIN_VOD_ARTWORK_PREFETCH_CLAIMS: OnceLock<StdMutex<HashMap<Uuid, StdInstant>>> =
+type PluginVodArtworkFillKey = (PathBuf, Uuid);
+static PLUGIN_VOD_ARTWORK_PREFETCH_CLAIMS: OnceLock<
+    StdMutex<HashMap<PluginVodArtworkFillKey, StdInstant>>,
+> = OnceLock::new();
+static PLUGIN_VOD_ARTWORK_FILL_PENDING: OnceLock<StdMutex<HashSet<PluginVodArtworkFillKey>>> =
     OnceLock::new();
-static PLUGIN_VOD_ARTWORK_FILL_PENDING: OnceLock<StdMutex<HashSet<Uuid>>> = OnceLock::new();
 static INTERNAL_REMOTE_RELAYS: OnceLock<StdMutex<HashMap<String, InternalRemoteRelayEntry>>> =
     OnceLock::new();
 static RECENT_METADATA_ENTITIES: OnceLock<StdMutex<HashMap<String, MetadataEntityMatch>>> =
@@ -61852,7 +61855,8 @@ fn queue_plugin_vod_artwork_prefetch_ids(state: &AppState, item_ids: &[Uuid]) {
         if queued >= PLUGIN_VOD_ARTWORK_PREFETCH_MAX_PER_PAGE {
             break;
         }
-        if !claim_plugin_vod_artwork_prefetch(item_id) {
+        let fill_key = plugin_vod_artwork_fill_key(state, item_id);
+        if !claim_plugin_vod_artwork_prefetch(fill_key.clone()) {
             continue;
         }
         queued += 1;
@@ -61861,7 +61865,7 @@ fn queue_plugin_vod_artwork_prefetch_ids(state: &AppState, item_ids: &[Uuid]) {
         // for the fill instead of racing it to the cache and losing. Losing that race is what made
         // artwork look random: whichever tiles happened to be filled when their single `<img>`
         // request was served showed art, and the browser never asks again.
-        let pending = PluginVodArtworkFillGuard::register(item_id);
+        let pending = PluginVodArtworkFillGuard::register(fill_key);
         tokio::spawn(async move {
             let _pending = pending;
             let permit = plugin_vod_artwork_prefetch_admission()
@@ -61881,14 +61885,14 @@ fn queue_plugin_vod_artwork_prefetch_ids(state: &AppState, item_ids: &[Uuid]) {
 }
 
 /// Marks one item as having a fill in flight for as long as it is held, including on panic.
-struct PluginVodArtworkFillGuard(Uuid);
+struct PluginVodArtworkFillGuard(PluginVodArtworkFillKey);
 
 impl PluginVodArtworkFillGuard {
-    fn register(item_id: Uuid) -> Self {
+    fn register(fill_key: PluginVodArtworkFillKey) -> Self {
         if let Ok(mut pending) = plugin_vod_artwork_fill_pending().lock() {
-            pending.insert(item_id);
+            pending.insert(fill_key.clone());
         }
-        Self(item_id)
+        Self(fill_key)
     }
 }
 
@@ -61900,14 +61904,18 @@ impl Drop for PluginVodArtworkFillGuard {
     }
 }
 
-fn plugin_vod_artwork_fill_pending() -> &'static StdMutex<HashSet<Uuid>> {
+fn plugin_vod_artwork_fill_pending() -> &'static StdMutex<HashSet<PluginVodArtworkFillKey>> {
     PLUGIN_VOD_ARTWORK_FILL_PENDING.get_or_init(|| StdMutex::new(HashSet::new()))
 }
 
-fn plugin_vod_artwork_fill_is_pending(item_id: Uuid) -> bool {
+fn plugin_vod_artwork_fill_key(state: &AppState, item_id: Uuid) -> PluginVodArtworkFillKey {
+    (api_cache_root(&state.log_dir), item_id)
+}
+
+fn plugin_vod_artwork_fill_is_pending(fill_key: &PluginVodArtworkFillKey) -> bool {
     plugin_vod_artwork_fill_pending()
         .lock()
-        .map(|pending| pending.contains(&item_id))
+        .map(|pending| pending.contains(fill_key))
         .unwrap_or(false)
 }
 
@@ -61925,7 +61933,8 @@ async fn await_pending_plugin_vod_artwork(
     image_type: &str,
     image_index: usize,
 ) -> Result<Option<PathBuf>, ApiError> {
-    if !plugin_vod_artwork_fill_is_pending(item_id) {
+    let fill_key = plugin_vod_artwork_fill_key(state, item_id);
+    if !plugin_vod_artwork_fill_is_pending(&fill_key) {
         return Ok(None);
     }
     let deadline = StdInstant::now() + PLUGIN_VOD_ARTWORK_FILL_MAX_WAIT;
@@ -61936,7 +61945,7 @@ async fn await_pending_plugin_vod_artwork(
         {
             return Ok(Some(path));
         }
-        if !plugin_vod_artwork_fill_is_pending(item_id) || StdInstant::now() >= deadline {
+        if !plugin_vod_artwork_fill_is_pending(&fill_key) || StdInstant::now() >= deadline {
             return Ok(None);
         }
     }
@@ -61965,7 +61974,7 @@ async fn prefetch_one_plugin_vod_artwork(state: &AppState, item_id: Uuid) -> Res
 ///
 /// The claim expires so a later failure can be retried, and the registry is bounded: at the cap the
 /// oldest claims are dropped rather than letting a long browsing session grow memory without limit.
-fn claim_plugin_vod_artwork_prefetch(item_id: Uuid) -> bool {
+fn claim_plugin_vod_artwork_prefetch(fill_key: PluginVodArtworkFillKey) -> bool {
     let registry = PLUGIN_VOD_ARTWORK_PREFETCH_CLAIMS.get_or_init(|| StdMutex::new(HashMap::new()));
     let Ok(mut claims) = registry.lock() else {
         return false;
@@ -61974,21 +61983,21 @@ fn claim_plugin_vod_artwork_prefetch(item_id: Uuid) -> bool {
     claims.retain(|_, claimed_at: &mut StdInstant| {
         now.duration_since(*claimed_at) < PLUGIN_VOD_ARTWORK_PREFETCH_CLAIM_TTL
     });
-    if claims.contains_key(&item_id) {
+    if claims.contains_key(&fill_key) {
         return false;
     }
     if claims.len() >= PLUGIN_VOD_ARTWORK_PREFETCH_MAX_CLAIMS {
         let oldest = claims
             .iter()
             .min_by_key(|(_, claimed_at)| **claimed_at)
-            .map(|(id, _)| *id);
+            .map(|(key, _)| key.clone());
         if let Some(oldest) = oldest {
             claims.remove(&oldest);
         } else {
             return false;
         }
     }
-    claims.insert(item_id, now);
+    claims.insert(fill_key, now);
     true
 }
 
