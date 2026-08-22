@@ -31063,7 +31063,7 @@ async fn client_log_document(
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
     body: Body,
-) -> Result<StatusCode, ApiError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
     let content_type = headers
         .get(header::CONTENT_TYPE)
@@ -31097,7 +31097,7 @@ async fn client_log_document(
     use tokio::io::AsyncWriteExt;
     file.write_all(line.as_bytes()).await?;
     file.write_all(b"\n").await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(Json(serde_json::json!({ "FileName": "clientlog.log" })))
 }
 
 fn content_disposition_filename(value: &str) -> Option<String> {
@@ -62023,6 +62023,11 @@ async fn item_image_or_placeholder(
         }
         return Ok(placeholder_png_response());
     }
+    if let Some(response) =
+        virtual_folder_image_response(&state.db, item_id, image_type, image_index).await?
+    {
+        return Ok(response);
+    }
     if let Some(channel_item) = channel_content_item_by_id(&state.db, item_id).await?
         && let Some(response) = channel_item_image_response(&channel_item, image_type, image_index)?
     {
@@ -62111,6 +62116,46 @@ struct ItemImageRequest<'a> {
     headers: &'a HeaderMap,
     query_token: Option<&'a str>,
     allow_plugin_vod_fill: bool,
+}
+
+/// A real library id is also UUID-shaped, so it must be resolved before the synthetic
+/// Series/Season fallback. Passing a Movies library into that fallback scans the TV projection and
+/// ultimately returns a transparent pixel. A deterministic library tile is both cheap and useful
+/// until the operator uploads custom library artwork.
+async fn virtual_folder_image_response(
+    db: &Database,
+    item_id: &str,
+    image_type: &str,
+    image_index: usize,
+) -> Result<Option<axum::response::Response>, ApiError> {
+    if image_index != 0
+        || !matches!(
+            normalize_image_type(image_type).as_str(),
+            "primary" | "thumb"
+        )
+    {
+        return Ok(None);
+    }
+    let Ok(folder_id) = parse_jellyfin_uuid(item_id) else {
+        return Ok(None);
+    };
+    let Some(folder) = db
+        .virtual_folders()
+        .await?
+        .into_iter()
+        .find(|folder| folder.id == folder_id)
+    else {
+        return Ok(None);
+    };
+    let item = serde_json::json!({
+        "Id": folder.id.simple().to_string(),
+        "Name": folder.name,
+    });
+    Ok(Some(live_tv_generated_image_response(
+        &item,
+        &folder.id.simple().to_string(),
+        &format!("virtual-folder:{}", folder.id.simple()),
+    )))
 }
 
 async fn find_local_item_image(
@@ -77444,7 +77489,10 @@ done
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["FileName"], "clientlog.log");
         let client_log = std::fs::read_to_string(log_dir.join("clientlog.log")).unwrap();
         assert!(client_log.contains("client failed"));
         assert!(client_log.contains(user.id.simple().to_string().as_str()));
@@ -77468,7 +77516,10 @@ done
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["FileName"], "clientlog.log");
         let client_log = std::fs::read_to_string(log_dir.join("clientlog.log")).unwrap();
         let uploaded_log: Value = serde_json::from_str(client_log.lines().last().unwrap()).unwrap();
         assert_eq!(
@@ -96210,10 +96261,10 @@ done
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response.headers().get(header::CONTENT_TYPE).unwrap(),
-            "image/png"
+            "image/svg+xml; charset=utf-8"
         );
         let body = response.into_body().collect().await.unwrap().to_bytes();
-        assert!(body.starts_with(&[137, 80, 78, 71]));
+        assert!(String::from_utf8_lossy(&body).contains("Movies"));
 
         let response = app
             .clone()
