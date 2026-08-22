@@ -292,6 +292,12 @@ const INTERNAL_REMOTE_RELAY_MAX_ENTRIES: usize = 4_096;
 const INTERNAL_REMOTE_RELAY_TOKEN_BYTES: usize = 32;
 const INTERNAL_REMOTE_RELAY_PROBE_TTL: StdDuration = StdDuration::from_secs(2 * 60);
 const INTERNAL_REMOTE_RELAY_TRANSCODE_TTL: StdDuration = StdDuration::from_secs(12 * 60 * 60);
+// FFmpeg commonly opens the same seekable MPEG-TS input several times (HEAD plus byte ranges)
+// while locating a timestamp. Resolving a fresh provider grant for every one of those loopback
+// requests makes an otherwise fast seek exceed Android TV's source timeout. Keep the signed URL
+// only inside the unguessable relay lease, briefly and in memory; public proxy requests still
+// resolve independently, and an authorization rejection evicts it immediately.
+const INTERNAL_PLUGIN_VOD_PLAYBACK_CACHE_TTL: StdDuration = StdDuration::from_secs(90);
 const REMOTE_MEDIA_RESPONSE_HEADER_TIMEOUT: StdDuration = StdDuration::from_secs(15);
 const REMOTE_MEDIA_CHUNK_IDLE_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 const REMOTE_MEDIA_DNS_TIMEOUT: StdDuration = StdDuration::from_secs(10);
@@ -49195,15 +49201,83 @@ async fn stream_plugin_vod_media(
     include_body: bool,
     user_context: Option<jellyrin_plugin_sdk::PluginUserContext>,
 ) -> Result<axum::response::Response, ApiError> {
-    for attempt in 0..2 {
-        let playback = resolve_plugin_vod_playback(
+    stream_plugin_vod_media_with_cache(state, reference, headers, include_body, user_context, None)
+        .await
+}
+
+fn cached_plugin_vod_playback_is_fresh(cached: &CachedPluginVodPlayback) -> bool {
+    if cached.cached_at.elapsed() >= INTERNAL_PLUGIN_VOD_PLAYBACK_CACHE_TTL {
+        return false;
+    }
+    cached
+        .playback
+        .expires_at
+        .as_deref()
+        .is_none_or(|expires_at| {
+            OffsetDateTime::parse(expires_at, &Rfc3339).is_ok_and(|expires_at| {
+                expires_at > OffsetDateTime::now_utc() + Duration::seconds(2)
+            })
+        })
+}
+
+async fn plugin_vod_playback_for_relay(
+    state: &AppState,
+    reference: &PluginVodRemoteReference,
+    user_context: Option<jellyrin_plugin_sdk::PluginUserContext>,
+    cache: Option<&Arc<Mutex<Option<CachedPluginVodPlayback>>>>,
+) -> Result<VodPlaybackResult, ApiError> {
+    let Some(cache) = cache else {
+        return resolve_plugin_vod_playback(
             &state.db,
             &reference.plugin_id,
             &reference.tuner_id,
             &reference.provider_reference,
-            user_context.clone(),
+            user_context,
         )
-        .await?;
+        .await;
+    };
+
+    // Hold the relay-local lock through the first resolution so FFmpeg's simultaneous HEAD/range
+    // opens coalesce onto one grant. The lock is released before opening or streaming the source.
+    let mut cached = cache.lock().await;
+    if cached
+        .as_ref()
+        .is_some_and(cached_plugin_vod_playback_is_fresh)
+    {
+        return Ok(cached
+            .as_ref()
+            .expect("fresh relay playback cache entry")
+            .playback
+            .clone());
+    }
+    *cached = None;
+    let playback = resolve_plugin_vod_playback(
+        &state.db,
+        &reference.plugin_id,
+        &reference.tuner_id,
+        &reference.provider_reference,
+        user_context,
+    )
+    .await?;
+    *cached = Some(CachedPluginVodPlayback {
+        playback: playback.clone(),
+        cached_at: StdInstant::now(),
+    });
+    Ok(playback)
+}
+
+async fn stream_plugin_vod_media_with_cache(
+    state: &AppState,
+    reference: &PluginVodRemoteReference,
+    headers: &HeaderMap,
+    include_body: bool,
+    user_context: Option<jellyrin_plugin_sdk::PluginUserContext>,
+    cache: Option<Arc<Mutex<Option<CachedPluginVodPlayback>>>>,
+) -> Result<axum::response::Response, ApiError> {
+    for attempt in 0..2 {
+        let playback =
+            plugin_vod_playback_for_relay(state, reference, user_context.clone(), cache.as_ref())
+                .await?;
         if !opaque_live_tv_delivery_is_safe_for_direct_proxy(&playback) {
             return Err(ApiError::service_unavailable(
                 "VOD provider did not authorize a safe direct stream",
@@ -49252,6 +49326,9 @@ async fn stream_plugin_vod_media(
         {
             // Dropping both the response and playback value zeroizes the rejected sensitive URL
             // before asking the provider for a replacement.
+            if let Some(cache) = &cache {
+                *cache.lock().await = None;
+            }
             continue;
         }
         return plugin_vod_upstream_response(upstream, headers, include_body).await;
@@ -49400,9 +49477,9 @@ async fn internal_remote_media_response(
     if !peer.ip().is_loopback() {
         return Err(ApiError::not_found("remote media relay not found"));
     }
-    let target = internal_remote_relay_target(token)
+    let relay = internal_remote_relay_lookup(token)
         .ok_or_else(|| ApiError::not_found("remote media relay not found"))?;
-    match target {
+    match relay.target {
         InternalRemoteRelayTarget::MediaItem {
             item_id,
             user_context,
@@ -49411,9 +49488,35 @@ async fn internal_remote_media_response(
             if !is_xtream_virtual_item(&item) && !is_plugin_vod_virtual_item(&item) {
                 return Err(ApiError::not_found("remote media relay not found"));
             }
-            // Both virtual-item kinds share the library streaming pipeline: Xtream resolves its
-            // cached source URL; plugin-VOD resolves a fresh signed URL through the provider
-            // gate and the sensitive remote proxy.
+            if is_plugin_vod_virtual_item(&item) {
+                let metadata_by_item =
+                    media_metadata_by_item_id(&state.db, HashSet::from([item.id])).await?;
+                let metadata = metadata_by_item.get(&item.id);
+                if !is_plugin_vod_remote_media(metadata) {
+                    return Err(ApiError::service_unavailable(
+                        "VOD provider playback route is unavailable",
+                    ));
+                }
+                let reference =
+                    metadata
+                        .and_then(plugin_vod_remote_reference)
+                        .ok_or_else(|| {
+                            ApiError::service_unavailable(
+                                "VOD provider playback route is unavailable",
+                            )
+                        })?;
+                return stream_plugin_vod_media_with_cache(
+                    state,
+                    &reference,
+                    headers,
+                    include_body,
+                    user_context,
+                    Some(relay.plugin_vod_playback_cache),
+                )
+                .await;
+            }
+            // Xtream keeps its existing durable encrypted source reference. Plugin VOD above
+            // instead shares only one short-lived, in-memory playback grant inside this relay.
             stream_resolved_media_item(state, item, headers, include_body, user_context).await
         }
         InternalRemoteRelayTarget::LiveTvChannel {
@@ -58725,6 +58828,18 @@ impl std::fmt::Debug for InternalRemoteRelayTarget {
 struct InternalRemoteRelayEntry {
     target: InternalRemoteRelayTarget,
     expires_at: StdInstant,
+    plugin_vod_playback_cache: Arc<Mutex<Option<CachedPluginVodPlayback>>>,
+}
+
+struct CachedPluginVodPlayback {
+    playback: VodPlaybackResult,
+    cached_at: StdInstant,
+}
+
+#[derive(Clone)]
+struct InternalRemoteRelayLookup {
+    target: InternalRemoteRelayTarget,
+    plugin_vod_playback_cache: Arc<Mutex<Option<CachedPluginVodPlayback>>>,
 }
 
 /// Keeps an unguessable loopback relay route alive for exactly as long as its
@@ -58800,6 +58915,7 @@ fn register_internal_remote_relay(
         InternalRemoteRelayEntry {
             target,
             expires_at: now + ttl,
+            plugin_vod_playback_cache: Arc::new(Mutex::new(None)),
         },
     );
     Ok(InternalRemoteRelayLease {
@@ -58808,7 +58924,12 @@ fn register_internal_remote_relay(
     })
 }
 
+#[cfg(test)]
 fn internal_remote_relay_target(token: &str) -> Option<InternalRemoteRelayTarget> {
+    internal_remote_relay_lookup(token).map(|lookup| lookup.target)
+}
+
+fn internal_remote_relay_lookup(token: &str) -> Option<InternalRemoteRelayLookup> {
     if token.len() != 43
         || !token
             .bytes()
@@ -58822,7 +58943,10 @@ fn internal_remote_relay_target(token: &str) -> Option<InternalRemoteRelayTarget
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     registry.retain(|_, entry| entry.expires_at > now);
-    registry.get(token).map(|entry| entry.target.clone())
+    registry.get(token).map(|entry| InternalRemoteRelayLookup {
+        target: entry.target.clone(),
+        plugin_vod_playback_cache: Arc::clone(&entry.plugin_vod_playback_cache),
+    })
 }
 
 /// Recovers a finite runtime from the protected media only when catalogue and JIT metadata both
@@ -69521,6 +69645,83 @@ mod tests {
             resolve["Payload"]["Arguments"]["SecretGrant"]["TunerId"],
             "vod-tuner"
         );
+        super::stop_external_plugin_host(plugin_id).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial(plugin_host)]
+    async fn plugin_vod_internal_relay_reuses_one_grant_for_ffmpeg_range_opens() {
+        let plugin_id = "66666666-7777-4888-9999-000000000031";
+        let ts_payload = vec![0x47_u8; 188 * 4];
+        let (upstream_base, _) = start_fixed_ts_upstream(ts_payload.clone()).await;
+        let (db, tmp, _api_key, movie_id) = prepare_vod_playback_environment(plugin_id).await;
+        let signed_url = format!("{upstream_base}/vod/seek.ts?signature=relay-cache-secret");
+        tokio::fs::write(tmp.path().join("vod-source-url"), &signed_url)
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("vod-delivery-mode"), "mpegts")
+            .await
+            .unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let state = AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: tmp.path().join("logs"),
+            local_address: format!("http://{address}"),
+        };
+        let relay = super::register_internal_remote_relay(
+            &state,
+            super::InternalRemoteRelayTarget::MediaItem {
+                item_id: movie_id,
+                user_context: None,
+            },
+            StdDuration::from_secs(60),
+        )
+        .unwrap();
+        let relay_url = relay.url().to_string();
+        let app = router(state);
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        for range in ["bytes=0-187", "bytes=188-375", "bytes=376-563"] {
+            let response = client
+                .get(&relay_url)
+                .header(header::RANGE, range)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.bytes().await.unwrap().as_ref(),
+                ts_payload.as_slice()
+            );
+        }
+
+        let invokes = tokio::fs::read_to_string(tmp.path().join("external-invokes"))
+            .await
+            .unwrap();
+        assert_eq!(
+            invokes
+                .lines()
+                .filter(|line| line.contains("\"Action\":\"ResolvePlayback\""))
+                .count(),
+            1,
+            "one relay lease must reuse one in-memory provider grant across FFmpeg range opens"
+        );
+        assert!(!invokes.contains("relay-cache-secret"));
+
+        drop(relay);
+        server.abort();
         super::stop_external_plugin_host(plugin_id).await;
     }
 
