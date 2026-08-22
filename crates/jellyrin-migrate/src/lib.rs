@@ -37,7 +37,7 @@ use spec::{
 };
 use value::{TypedValue, parse_uuid};
 
-pub const SOURCE_SCHEMA_VERSION: i64 = 202_608_140_001;
+pub const SOURCE_SCHEMA_VERSION: i64 = 202_608_200_001;
 pub const TARGET_SCHEMA_VERSION: i64 = 202_608_200_001;
 const MIN_POSTGRES_VERSION_NUM: i64 = 160_000;
 const MIGRATION_BATCH_ROWS: usize = 500;
@@ -1212,8 +1212,8 @@ impl NormalizedTableDigest {
         for (target, value) in self.xor.iter_mut().zip(row_hash) {
             *target ^= value;
         }
-        for (index, bytes) in row_hash.chunks_exact(8).enumerate() {
-            let value = u64::from_be_bytes(bytes.try_into().expect("SHA-256 chunk is 8 bytes"));
+        for (index, bytes) in row_hash.as_chunks::<8>().0.iter().enumerate() {
+            let value = u64::from_be_bytes(*bytes);
             self.sum[index] = self.sum[index].wrapping_add(value);
             self.sum_of_squares[index] =
                 self.sum_of_squares[index].wrapping_add(value.wrapping_mul(value));

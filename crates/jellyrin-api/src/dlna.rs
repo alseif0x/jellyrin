@@ -625,7 +625,7 @@ pub(crate) async fn media_stream(
         .media_item_by_id(item_id)
         .await
         .map_err(|_| ApiError::not_found("DLNA media item not found"))?;
-    stream_resolved_media_item(&state, item, &headers, true).await
+    stream_resolved_media_item(&state, item, &headers, true, None).await
 }
 
 pub(crate) async fn media_stream_head(
@@ -640,7 +640,7 @@ pub(crate) async fn media_stream_head(
         .media_item_by_id(item_id)
         .await
         .map_err(|_| ApiError::not_found("DLNA media item not found"))?;
-    stream_resolved_media_item(&state, item, &headers, false).await
+    stream_resolved_media_item(&state, item, &headers, false, None).await
 }
 
 pub(crate) async fn media_hls_master_playlist(
@@ -4487,13 +4487,10 @@ fn search_criteria_expression_matches(
     if and_terms.len() > 1 {
         let mut recognized = false;
         for term in and_terms {
-            if let Some(matches) = search_criteria_expression_matches(item, metadata, term) {
-                recognized = true;
-                if !matches {
-                    return Some(false);
-                }
-            } else {
-                return None;
+            let matches = search_criteria_expression_matches(item, metadata, term)?;
+            recognized = true;
+            if !matches {
+                return Some(false);
             }
         }
         return recognized.then_some(true);

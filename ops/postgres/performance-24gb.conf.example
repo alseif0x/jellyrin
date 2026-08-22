@@ -1,0 +1,7 @@
+# Jellyrin catalogue profile for a dedicated PostgreSQL host with approximately 24 GiB RAM.
+# Include from postgresql.conf only after measuring the target; shared_buffers requires restart.
+shared_buffers = '3GB'
+effective_cache_size = '12GB'
+work_mem = '12MB'
+maintenance_work_mem = '512MB'
+random_page_cost = 1.5

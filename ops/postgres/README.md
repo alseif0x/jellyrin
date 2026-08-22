@@ -82,6 +82,12 @@ in that topology; it removes the unused `pgpass` credential. For a remote
 database, keep the generic unit, replace the socket with a TLS hostname,
 require full certificate verification, and provision a dedicated password.
 
+For the measured dedicated 24 GiB host, `performance-24gb.conf.example` records the conservative
+catalogue profile and `../jellyrin-database-performance.conf` records the matching API/worker pool
+split. These are host-sized examples, not universal defaults: validate RAM, concurrent query count
+and `pg_stat_statements` before installing them. In particular, `work_mem` is per sort/hash node and
+`shared_buffers` requires a PostgreSQL restart.
+
 Do not reuse the runtime role. Create a non-superuser login dedicated to backup, grant it
 `CONNECT` on the database and membership in PostgreSQL's `pg_read_all_data` predefined role.
 The service files keep credentials out of command arguments, logs and repository env files.

@@ -27,7 +27,7 @@ use super::{
     MediaItemQueryFilterSelection, MediaItemQueryFilterValues, PostgresDatabase,
     REMOTE_MEDIA_CATALOG_STAGE_MAX_LIBRARY_ITEMS, ReadyRemoteMediaCatalogStage,
     RemoteMediaCatalogStage, RemoteMediaItemUpsert, RemoteMediaLibrarySnapshot,
-    RemoteMediaLibraryStageSpec, SortDirection, TV_SERIES_CATALOG_PROJECTION_VERSION,
+    RemoteMediaLibraryStageSpec, SortDirection, TV_SERIES_CATALOG_PROJECTION_VERSION, TvNextUpPage,
     TvSeriesCatalogKey, TvSeriesCatalogNameFilter, TvSeriesCatalogNamePatterns,
     TvSeriesCatalogPage, catalog_lock_jitter_seed, catalog_sync_duration_millis,
     encode_media_item_query_filter_position, extract_media_item_facets,
@@ -871,6 +871,34 @@ impl PostgresDatabase {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    /// Bounded source for the trailer endpoints.
+    ///
+    /// `/Trailers` used to materialise the whole catalogue in Rust to find the few items carrying
+    /// a `RemoteTrailers` array, which exceeded the statement timeout on a real library. The key
+    /// test runs in PostgreSQL instead; the caller still applies the exact URL-shape filter, so a
+    /// generous predicate here cannot admit a trailer the API would not have produced anyway.
+    pub async fn media_items_with_remote_trailers(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MediaItem>> {
+        let rows = sqlx::query_as::<_, PostgresMediaItemRow>(
+            r#"
+            SELECT id, virtual_folder_id, name, path, media_type, collection_type,
+                   file_size, runtime_ticks, bitrate, width, height, media_streams,
+                   created_at, updated_at
+            FROM media_items
+            WHERE missing_since IS NULL
+              AND (metadata @? '$."RemoteTrailers"' OR metadata @? '$."Trailers"')
+            ORDER BY lower(name), name
+            LIMIT $1
+            "#,
+        )
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
     pub async fn media_items_by_name_search(
         &self,
         search_term: &str,
@@ -950,15 +978,18 @@ impl PostgresDatabase {
             .begin_with(POSTGRES_REPEATABLE_READ_ONLY_BEGIN)
             .await?;
 
-        let mut count = QueryBuilder::<Postgres>::new("SELECT COUNT(*)::bigint ");
-        push_postgres_catalog_from(&mut count, query);
-        push_postgres_catalog_filters(&mut count, query);
-        let total_record_count = count
-            .build_query_scalar::<i64>()
-            .fetch_one(&mut *transaction)
-            .await?;
-        let total_record_count =
-            usize::try_from(total_record_count).context("media catalog count exceeded usize")?;
+        let total_record_count = if query.include_total_record_count {
+            let mut count = QueryBuilder::<Postgres>::new("SELECT COUNT(*)::bigint ");
+            push_postgres_catalog_from(&mut count, query);
+            push_postgres_catalog_filters(&mut count, query);
+            let count = count
+                .build_query_scalar::<i64>()
+                .fetch_one(&mut *transaction)
+                .await?;
+            usize::try_from(count).context("media catalog count exceeded usize")?
+        } else {
+            0
+        };
 
         let effective_limit = query.limit.min(MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE);
         if effective_limit == 0 {
@@ -2797,6 +2828,199 @@ impl PostgresDatabase {
         result
     }
 
+    /// Return only the requested NextUp page from the narrow TV projection.
+    ///
+    /// The previous repository call selected one row for every visible series and transferred
+    /// tens of thousands of rows to the API before it retained a small page. This query keeps the
+    /// same one-per-series and ordering rules while paging inside PostgreSQL. A lateral page joined
+    /// to the count deliberately returns one nullable row even when the requested offset is past
+    /// the end, preserving Jellyfin's exact total.
+    pub async fn tv_next_up_candidate_page(
+        &self,
+        user_id: Uuid,
+        start_index: usize,
+        limit: usize,
+        include_total_record_count: bool,
+    ) -> anyhow::Result<TvNextUpPage> {
+        let observation = self.telemetry.start_operation(
+            DatabaseOperation::CatalogNextUpCandidates,
+            DatabasePoolRole::Api,
+        );
+        let result = async {
+            let projection_covered: bool = sqlx::query_scalar(
+                r#"
+                SELECT NOT EXISTS (
+                    SELECT 1
+                    FROM virtual_folders AS folder
+                    LEFT JOIN media_item_tv_series_coverage AS coverage
+                      ON coverage.virtual_folder_id = folder.id
+                     AND coverage.projection_version = $1
+                    WHERE lower(coalesce(folder.collection_type, '')) = ANY(
+                              ARRAY['tvshows', 'tvshow', 'series']::text[]
+                          )
+                      AND coverage.virtual_folder_id IS NULL
+                )
+                AND NOT EXISTS (
+                    SELECT series_id
+                    FROM media_item_tv_series
+                    GROUP BY series_id
+                    HAVING count(*) > 1
+                )
+                "#,
+            )
+            .bind(TV_SERIES_CATALOG_PROJECTION_VERSION)
+            .fetch_one(&self.pool)
+            .await?;
+            if !projection_covered {
+                let mut items = self.tv_next_up_candidate_items(user_id).await?;
+                items.sort_by(compare_tv_episode_items);
+                let total_record_count = if include_total_record_count {
+                    items.len()
+                } else {
+                    0
+                };
+                let items = items.into_iter().skip(start_index).take(limit).collect();
+                return anyhow::Ok(TvNextUpPage {
+                    items,
+                    total_record_count,
+                    start_index,
+                });
+            }
+
+            let offset = i64::try_from(start_index).unwrap_or(i64::MAX);
+            let page_limit = i64::try_from(limit).unwrap_or(i64::MAX);
+            if !include_total_record_count {
+                let rows = sqlx::query_as::<_, PostgresProjectedNextUpCandidateRow>(
+                    r#"
+                    SELECT candidate.item_id, candidate.virtual_folder_id,
+                           candidate.item_name, candidate.item_path
+                    FROM media_item_tv_series AS series
+                    JOIN LATERAL (
+                        SELECT member.item_id, member.virtual_folder_id,
+                               member.item_name, member.item_path
+                        FROM media_item_tv_series_members AS member
+                        WHERE member.series_id = series.series_id
+                          AND member.virtual_folder_id = series.virtual_folder_id
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM playback_states AS playback
+                              WHERE playback.item_id = member.item_id
+                                AND playback.user_id = $1
+                                AND playback.played
+                          )
+                        ORDER BY member.season_number, member.episode_number,
+                                 member.sort_name, member.item_id
+                        LIMIT 1
+                    ) AS candidate ON true
+                    ORDER BY lower(series.series_name), series.series_name,
+                             series.series_id, series.virtual_folder_id
+                    OFFSET $2 LIMIT $3
+                    "#,
+                )
+                .bind(user_id)
+                .bind(offset)
+                .bind(page_limit)
+                .fetch_all(&self.pool)
+                .await?;
+                return anyhow::Ok(TvNextUpPage {
+                    items: rows.into_iter().map(MediaItem::from).collect(),
+                    total_record_count: 0,
+                    start_index,
+                });
+            }
+            let rows = sqlx::query_as::<_, PostgresProjectedNextUpPageRow>(
+                r#"
+                WITH counted AS (
+                    SELECT
+                        (SELECT count(*)::bigint
+                         FROM media_item_tv_series
+                         WHERE episode_count > 0)
+                        -
+                        (SELECT count(*)::bigint
+                         FROM (
+                             SELECT DISTINCT played_member.series_id,
+                                             played_member.virtual_folder_id
+                             FROM playback_states AS playback
+                             JOIN media_item_tv_series_members AS played_member
+                               ON played_member.item_id = playback.item_id
+                             WHERE playback.user_id = $1 AND playback.played
+                         ) AS affected
+                         WHERE NOT EXISTS (
+                             SELECT 1
+                             FROM media_item_tv_series_members AS candidate
+                             WHERE candidate.series_id = affected.series_id
+                               AND candidate.virtual_folder_id = affected.virtual_folder_id
+                               AND NOT EXISTS (
+                                   SELECT 1
+                                   FROM playback_states AS state
+                                   WHERE state.user_id = $1
+                                     AND state.item_id = candidate.item_id
+                                     AND state.played
+                               )
+                         )) AS total_record_count
+                )
+                SELECT page.item_id, page.virtual_folder_id, page.item_name, page.item_path,
+                       counted.total_record_count
+                FROM counted
+                LEFT JOIN LATERAL (
+                    SELECT candidate.item_id, candidate.virtual_folder_id,
+                           candidate.item_name, candidate.item_path,
+                           series.series_name, series.series_id
+                    FROM media_item_tv_series AS series
+                    JOIN LATERAL (
+                        SELECT member.item_id, member.virtual_folder_id,
+                               member.item_name, member.item_path
+                        FROM media_item_tv_series_members AS member
+                        WHERE member.series_id = series.series_id
+                          AND member.virtual_folder_id = series.virtual_folder_id
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM playback_states AS playback
+                              WHERE playback.item_id = member.item_id
+                                AND playback.user_id = $1
+                                AND playback.played
+                          )
+                        ORDER BY member.season_number, member.episode_number,
+                                 member.sort_name, member.item_id
+                        LIMIT 1
+                    ) AS candidate ON true
+                    WHERE series.episode_count > 0
+                    ORDER BY lower(series.series_name), series.series_name,
+                             series.series_id, series.virtual_folder_id
+                    OFFSET $2 LIMIT $3
+                ) AS page ON true
+                ORDER BY lower(page.series_name), page.series_name,
+                         page.series_id, page.virtual_folder_id
+                "#,
+            )
+            .bind(user_id)
+            .bind(offset)
+            .bind(page_limit)
+            .fetch_all(&self.pool)
+            .await?;
+            let total_record_count = rows
+                .first()
+                .map(|row| {
+                    usize::try_from(nonnegative_count(row.total_record_count)).unwrap_or(usize::MAX)
+                })
+                .unwrap_or(0);
+            let items = rows
+                .into_iter()
+                .filter_map(PostgresProjectedNextUpPageRow::into_media_item)
+                .collect();
+            anyhow::Ok(TvNextUpPage {
+                items,
+                total_record_count,
+                start_index,
+            })
+        }
+        .await;
+        observation.finish_result(&result, |page| {
+            u64::try_from(page.items.len()).unwrap_or(u64::MAX)
+        });
+        result
+    }
+
     /// Exact visible items for a bounded id list, preserving the caller's order.
     ///
     /// This hydrates a page whose selection ran on rows without `media_streams`.
@@ -3332,6 +3556,11 @@ impl PostgresDatabase {
             query.push(")");
         }
         query.push(" ORDER BY facet.item_id");
+        if let Some(limit) = query_spec.limit {
+            query
+                .push(" LIMIT ")
+                .push_bind(i64::try_from(limit).unwrap_or(i64::MAX));
+        }
         Ok(query
             .build_query_scalar::<Uuid>()
             .fetch_all(&self.pool)
@@ -5865,6 +6094,24 @@ fn push_postgres_catalog_filters(
 ) {
     builder.push(" WHERE item.missing_since IS NULL");
 
+    if let Some(allowed) = query.allowed_plugin_tuner_ids.as_ref() {
+        builder.push(" AND (item.path NOT LIKE 'plugin-vod://%' OR ");
+        if allowed.is_empty() {
+            builder.push("FALSE");
+        } else {
+            builder
+                .push("lower(coalesce(item.metadata->>'TunerId', '')) = ANY(")
+                .push_bind(
+                    allowed
+                        .iter()
+                        .map(|value| value.to_ascii_lowercase())
+                        .collect::<Vec<_>>(),
+                )
+                .push(")");
+        }
+        builder.push(")");
+    }
+
     if !query.ids.is_empty() {
         builder
             .push(" AND item.id = ANY(")
@@ -6571,6 +6818,36 @@ impl From<PostgresProjectedNextUpCandidateRow> for MediaItem {
             created_at: OffsetDateTime::UNIX_EPOCH,
             updated_at: OffsetDateTime::UNIX_EPOCH,
         }
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct PostgresProjectedNextUpPageRow {
+    item_id: Option<Uuid>,
+    virtual_folder_id: Option<Uuid>,
+    item_name: Option<String>,
+    item_path: Option<String>,
+    total_record_count: i64,
+}
+
+impl PostgresProjectedNextUpPageRow {
+    fn into_media_item(self) -> Option<MediaItem> {
+        Some(MediaItem {
+            id: self.item_id?,
+            virtual_folder_id: self.virtual_folder_id?,
+            name: self.item_name?,
+            path: self.item_path?,
+            media_type: "Video".to_string(),
+            collection_type: Some("tvshows".to_string()),
+            file_size: None,
+            runtime_ticks: None,
+            bitrate: None,
+            width: None,
+            height: None,
+            media_streams: Vec::new(),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+        })
     }
 }
 
@@ -10314,6 +10591,51 @@ mod tests {
             let mut expected = vec![unplayed_id, other_series_id];
             expected.sort_unstable();
             assert_eq!(bounded, expected);
+
+            let first_page = test
+                .database
+                .tv_next_up_candidate_page(user.id, 0, 1, true)
+                .await?;
+            assert_eq!(first_page.total_record_count, 2);
+            assert_eq!(first_page.items.len(), 1);
+            let second_page = test
+                .database
+                .tv_next_up_candidate_page(user.id, 1, 1, true)
+                .await?;
+            assert_eq!(second_page.total_record_count, 2);
+            assert_eq!(second_page.items.len(), 1);
+            assert_ne!(first_page.items[0].id, second_page.items[0].id);
+            let past_end = test
+                .database
+                .tv_next_up_candidate_page(user.id, 10, 1, true)
+                .await?;
+            assert_eq!(past_end.total_record_count, 2);
+            assert!(past_end.items.is_empty());
+            let without_total = test
+                .database
+                .tv_next_up_candidate_page(user.id, 0, 1, false)
+                .await?;
+            assert_eq!(without_total.total_record_count, 0);
+            assert_eq!(without_total.items.len(), 1);
+            test.database
+                .upsert_playback_state(crate::UpsertPlaybackState {
+                    user_id: user.id,
+                    item_id: other_series_id,
+                    media_source_id: None,
+                    audio_stream_index: None,
+                    subtitle_stream_index: None,
+                    position_ticks: 0,
+                    is_paused: false,
+                    played: true,
+                })
+                .await?;
+            let after_completing_series = test
+                .database
+                .tv_next_up_candidate_page(user.id, 0, 10, true)
+                .await?;
+            assert_eq!(after_completing_series.total_record_count, 1);
+            assert_eq!(after_completing_series.items.len(), 1);
+            assert_eq!(after_completing_series.items[0].id, unplayed_id);
             anyhow::Ok(())
         }
         .await;

@@ -10,13 +10,13 @@ use anyhow::Context;
 use clap::Parser;
 use jellyrin_api::{
     AppState, SystemLifecycleCommand, cleanup_stale_hls_transcodes, configure_api_cache_root,
-    configure_plugin_packages_root, ensure_builtin_xtream_plugin, initialize_transcode_config,
-    last_system_lifecycle_command, publish_system_lifecycle_command,
+    configure_plugin_packages_root, configure_shared_catalog_cache, ensure_builtin_xtream_plugin,
+    initialize_transcode_config, last_system_lifecycle_command, publish_system_lifecycle_command,
     reconcile_live_tv_recordings_on_startup, reconcile_transcode_sessions_on_startup, router,
-    shutdown_runtime_resources, spawn_dlna_ssdp_service, spawn_file_watcher_with_consumer,
-    spawn_periodic_live_tv_timer_scheduler, spawn_periodic_transcode_cleanup,
-    spawn_periodic_xtream_media_sync_scheduler, subscribe_system_lifecycle_commands,
-    validate_ffmpeg_runtime,
+    shutdown_runtime_resources, spawn_artwork_cache_maintenance, spawn_dlna_ssdp_service,
+    spawn_file_watcher_with_consumer, spawn_periodic_live_tv_timer_scheduler,
+    spawn_periodic_transcode_cleanup, spawn_periodic_xtream_media_sync_scheduler,
+    subscribe_system_lifecycle_commands, validate_ffmpeg_runtime,
 };
 use jellyrin_db::{Database, DatabaseConfig, DatabaseDriver, DatabaseManager, ProviderSecretVault};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
@@ -97,6 +97,27 @@ struct Args {
 
     #[arg(
         long,
+        env = "JELLYRIN_REDIS_URL",
+        hide_env_values = true,
+        value_name = "URL"
+    )]
+    redis_url: Option<String>,
+
+    #[arg(long, env = "JELLYRIN_REDIS_URL_FILE")]
+    redis_url_file: Option<PathBuf>,
+
+    #[arg(long, default_value_t = 30, env = "JELLYRIN_CATALOG_CACHE_TTL_SECONDS")]
+    catalog_cache_ttl_seconds: u64,
+
+    #[arg(
+        long,
+        default_value_t = 20,
+        env = "JELLYRIN_REDIS_COMMAND_TIMEOUT_MILLISECONDS"
+    )]
+    redis_command_timeout_milliseconds: u64,
+
+    #[arg(
+        long,
         default_value = "primary",
         env = "JELLYRIN_PROVIDER_SECRET_KEY_ID"
     )]
@@ -155,6 +176,31 @@ async fn load_provider_secret_vault(
         return ProviderSecretVault::from_keyring_json(&keyring).map(Some);
     }
     Ok(None)
+}
+
+async fn load_redis_url(args: &mut Args) -> anyhow::Result<Option<Zeroizing<String>>> {
+    anyhow::ensure!(
+        args.redis_url.is_none() || args.redis_url_file.is_none(),
+        "configure at most one Redis URL source: URL or URL file"
+    );
+    let url = if let Some(url) = args.redis_url.take() {
+        Some(Zeroizing::new(url))
+    } else if let Some(path) = args.redis_url_file.as_deref() {
+        Some(read_protected_provider_secret_file(path).await?)
+    } else {
+        None
+    };
+    let Some(mut url) = url else {
+        return Ok(None);
+    };
+    let trimmed = url.trim().to_string();
+    url.zeroize();
+    anyhow::ensure!(!trimmed.is_empty(), "Redis URL must not be empty");
+    anyhow::ensure!(
+        trimmed.len() <= 4_096,
+        "Redis URL exceeds the maximum supported size"
+    );
+    Ok(Some(Zeroizing::new(trimmed)))
 }
 
 async fn read_protected_provider_secret_file(path: &Path) -> anyhow::Result<Zeroizing<String>> {
@@ -227,10 +273,14 @@ async fn main() -> anyhow::Result<()> {
 
     let mut args = Args::parse();
     let provider_secret_vault = load_provider_secret_vault(&mut args).await?;
+    let redis_url = load_redis_url(&mut args).await?;
     prepare_dirs(&args).await?;
     configure_api_cache_root(&args.cache_dir).context("failed to configure API cache storage")?;
     configure_plugin_packages_root(&args.data_dir)
         .context("failed to configure plugin package storage")?;
+    // Artwork is cached on demand as people browse, so it needs both a one-off compaction of
+    // entries stored before the size bound existed and an ongoing disk budget.
+    spawn_artwork_cache_maintenance(args.cache_dir.clone());
     initialize_transcode_config();
     validate_ffmpeg_runtime()
         .await
@@ -262,6 +312,19 @@ async fn main() -> anyhow::Result<()> {
     db.validate_provider_secret_readiness()
         .await
         .context("provider secret key configuration is not ready")?;
+    if redis_url.is_some() {
+        let cache_enabled = configure_shared_catalog_cache(
+            redis_url.as_deref().map(String::as_str),
+            Duration::from_secs(args.catalog_cache_ttl_seconds.clamp(5, 300)),
+            Duration::from_millis(args.redis_command_timeout_milliseconds.clamp(5, 250)),
+        )
+        .await;
+        if cache_enabled {
+            tracing::info!("shared Redis catalogue cache enabled");
+        } else {
+            tracing::warn!("shared Redis catalogue cache unavailable; using PostgreSQL");
+        }
+    }
     let rotated_provider_secrets = db
         .rotate_provider_secrets_to_active_key()
         .await

@@ -91,7 +91,7 @@ async function main() {
     check('compose-migration-gate', compose.includes('jellyrin-migrate:') && compose.includes('condition: service_completed_successfully')),
     check('compose-distroless-healthcheck', compose.includes('test: ["CMD", "/usr/local/bin/jellyrin-server", "--healthcheck"]') && !compose.includes('test: ["CMD", "curl"')),
     check('compose-postgres-private-network', infrastructureCompose.includes('${POSTGRES_IMAGE:-docker.io/library/postgres:') && infrastructureCompose.includes('internal: true')),
-    check('compose-infrastructure-images-locked', infrastructureCompose.includes('docker.io/library/postgres:17.10-bookworm@sha256:') && infrastructureCompose.includes('docker.io/library/redis:7.2.14-bookworm@sha256:')),
+    check('compose-infrastructure-images-locked', infrastructureCompose.includes('docker.io/library/postgres:17.10-bookworm@sha256:') && infrastructureCompose.includes('docker.io/library/redis:8.2.8-bookworm@sha256:')),
     check('compose-persistent-volumes', compose.includes('jellyrin-postgres') && compose.includes('jellyrin-data') && compose.includes('jellyrin-config') && compose.includes('jellyrin-cache')),
     check('systemd-production-unit', systemd.includes('EnvironmentFile=/etc/jellyrin/jellyrin.env') && systemd.includes('ExecStart=/usr/local/bin/jellyrin-server') && systemd.includes('Requires=jellyrin-migrate.service')),
     check('systemd-migration-unit', migrationSystemd.includes('Type=oneshot') && migrationSystemd.includes('ExecStart=/usr/local/bin/jellyrin-migrate schema') && migrationSystemd.includes('EnvironmentFile=/etc/jellyrin-migrate.env')),

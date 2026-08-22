@@ -1,41 +1,54 @@
 # Decisión sobre Redis para Jellyrin
 
-**Estado (2026-08-08): no integrar ni desplegar Redis.** Se conserva únicamente
-scaffolding dormido de Compose bajo profiles explícitos para reproducir el
-benchmark o reevaluar una necesidad futura; no es un componente opcional del
-despliegue vigente. En la topología objetivo
-actual —una instancia de Jellyrin, PostgreSQL local y catálogo multimedia
-externo— Redis no elimina trabajo de FFmpeg, no sustituye ningún lock o handle
-local y no tiene todavía un consumidor en la aplicación. Activar el contenedor
-ahora añadiría memoria, una conexión y un modo de fallo con cero cache hits.
+**Estado (revalidado el 2026-08-21): Redis es un caché opcional y fail-open para
+facetas públicas compartidas del catálogo.** La decisión cambió al confirmar que
+la instalación servirá a muchos usuarios y que géneros, estudios, personas,
+etiquetas y años repiten exactamente la misma proyección por biblioteca. No se
+ha convertido Redis en fuente de verdad ni en requisito de disponibilidad.
 
-Esta decisión es revisable. La sección [Umbral de activación](#umbral-de-activación)
-define qué evidencia tendría que cambiarla.
+PostgreSQL sigue resolviendo usuarios, permisos, asignación de cuenta de plugin,
+progreso, favoritos, sesiones, límites de dispositivos y todo dato de playback.
+Redis tampoco sustituye locks, semáforos, handles FFmpeg ni canales locales.
 
 ## Auditoría del estado actual
 
-No existe dependencia de Redis en ningún `Cargo.toml` ni una URL Redis leída por
-el servidor. `AppState` contiene PostgreSQL y paths locales, no un cliente de
-caché. La definición de `docker-compose.infrastructure.yml` es por tanto solo
-scaffolding operativo: profile `cache`/`distributed-cache`, sin puerto publicado,
-autenticado, sin AOF/RDB y con `allkeys-lru`.
+El servidor usa `redis-rs` con una conexión async multiplexada y reconexión. La
+configuración es opcional mediante `JELLYRIN_REDIS_URL` o, preferiblemente con
+systemd, `JELLYRIN_REDIS_URL_FILE`. Compose conserva el profile explícito
+`cache`/`distributed-cache`, sin puerto publicado, autenticado, sin AOF/RDB y
+con `allkeys-lru`.
+
+El consumidor está deliberadamente acotado:
+
+- solo guarda vectores de nombres públicos de facetas;
+- la clave incluye namespace versionado, tipo de faceta y SHA-256 del conjunto
+  ordenado de bibliotecas; no expone UUID en claro;
+- cada valor tiene un máximo de 64 KiB y TTL configurable de 5–300 s (30 s por
+  defecto);
+- cada comando tiene timeout de 5–250 ms (20 ms por defecto);
+- un error abre un bypass de cinco segundos: durante esa ventana se consulta
+  PostgreSQL directamente;
+- un single-flight local evita que una expiración lance la misma consulta muchas
+  veces desde un proceso;
+- Redis no participa en `/readyz` y su caída no bloquea arranque, login,
+  navegación ni reproducción.
 
 | Necesidad | Propietario actual | Decisión |
 | --- | --- | --- |
 | Usuarios, tokens, sesiones de dispositivo, progreso y listas | PostgreSQL | Deben seguir siendo durables; Redis no será fuente primaria. |
 | Quick Connect y sesiones activas/transcode | PostgreSQL, con expiración o reconciliación | El estado se necesita después de un reinicio; no moverlo a una caché sin persistencia. |
-| Catálogo de paquetes | Tabla materializada `package_catalog_cache` | Ya evita consultar repositorios externos en lectura; medir la consulta antes de duplicarla. |
+| Facetas públicas del catálogo | PostgreSQL + Redis cache-aside opcional | Compartibles entre usuarios; TTL corto, valor acotado y fallback transparente. |
+| Catálogo de paquetes | Tabla materializada `package_catalog_cache` | Ya evita consultar repositorios externos en lectura; no duplicarlo en Redis. |
 | Exclusión de sync de catálogo, configuración de plugins y emisión de token | Advisory locks/row locks PostgreSQL | Son suficientes para una o varias instancias y se liberan con transacción o conexión. |
 | Cupos FFmpeg y de probes | Semáforos en el proceso propietario | Redis no puede poseer un proceso hijo ni devolver un permiso RAII. |
 | Cancelación FFmpeg/recording, broadcast de stream y leases de tuner | Handles y canales locales | Deben quedarse junto al proceso/socket. En multinodo haría falta routing por `node_id`, fencing y estado durable, no solo Redis. |
 | SyncPlay y eventos websocket | Estado/canales locales con limpieza de participantes stale | Distribuirlo exige rediseñar ownership y replay. Pub/Sub no es adecuado para órdenes críticas porque su entrega es como máximo una vez. |
 | Lockout de login | `AUTH_FAILURES` en memoria | En single-node no necesita una ida de red. Antes hay que acotar y expirar el mapa; en multinodo se reevaluará un rate limit compartido. |
 
-PostgreSQL ya ofrece el componente de coordinación compartida necesario. Sus
+PostgreSQL ofrece el componente de coordinación compartida necesario. Sus
 advisory locks tienen semántica de sesión o transacción y los de sesión se
-liberan cuando termina la conexión. Redis sigue siendo válido en el futuro para
-cache-aside o invalidaciones best-effort, pero no mejora las garantías de los
-casos anteriores.
+liberan cuando termina la conexión. Redis solo reduce lecturas repetidas y no
+mejora las garantías de los casos anteriores.
 
 ### Hallazgo previo a cualquier caché distribuida
 
@@ -77,7 +90,7 @@ JELLYRIN_REDIS_EVAL_SATURATE=1 ./qa/redis-cache-benchmark.sh
 
 El 2026-08-08 se ejecutó en ARM64, cuatro CPU, Redis 7.0.15 y PostgreSQL
 16.14. El host tenía carga concurrente, por lo que estos números son una foto
-reproducible y no una capacidad contractual. Compose fija Redis 7.2.14 y añade
+reproducible y no una capacidad contractual. Compose fija Redis 8.2.8 y añade
 red de contenedor; el test TCP loopback es una aproximación favorable para
 Redis. Ambos datasets estaban calientes.
 
@@ -107,24 +120,83 @@ serialización JSON y red del proveedor dominan mucho antes. Además, la copia d
 50 MiB ocupó cerca de 68 MiB adicionales dentro de Redis; PostgreSQL y su page
 cache ya forman parte del presupuesto obligatorio.
 
+### Revalidación con el catálogo real (2026-08-21)
+
+La auditoría de Home y bibliotecas confirmó que Redis no debía ocultar planes defectuosos. `Latest`
+materializaba cerca de un millón de filas y `NextUp` enviaba 43.363 candidatos a Rust para mostrar
+20. Tras paginar en PostgreSQL y respetar `EnableTotalRecordCount`, el SQL de `NextUp` sin total
+promedia 0,407 ms y el endpoint completo 31–54 ms. El conteo exacto posterior bajó su plan de unos
+466 ms a unos 12 ms. Esos caminos dependientes del usuario no entran en Redis. La activación se
+limita a facetas compartidas, donde muchos usuarios reutilizan el mismo resultado.
+
+El rollout real se hizo con Redis 8.2.8, autenticado y limitado a loopback. El presupuesto
+inicial se amplió preventivamente a `maxmemory=128 MiB` dentro de un cgroup de 192 MiB, aunque
+el working set observado todavía es inferior a 1 MiB. Tras vaciar exclusivamente la caché
+efímera, la faceta de géneros de
+Películas (56 valores, respuesta de 36.676 bytes) tardó 185 ms en frío y 6–8 ms en cinco
+lecturas calientes. Redis confirmó cinco hits, dos misses del fill con recheck, cero errores y
+un único valor con TTL; `used_memory` fue aproximadamente 645 KiB. Las seis respuestas fueron
+idénticas byte a byte.
+
+La prueba fail-open detuvo deliberadamente solo Redis: la misma ruta siguió respondiendo 200
+desde PostgreSQL en 205 ms y Jellyrin permaneció activo. Tras restaurarlo y superar el bypass de
+cinco segundos, la primera lectura repobló la clave en 186 ms y la siguiente volvió a 6 ms, con
+contenido idéntico. El contenedor terminó `healthy`, sin reinicios ni OOM. Esta mejora de unas
+25–30 veces en caliente sí supera el umbral de activación para una proyección compartida por
+muchos usuarios; no justifica cachear respuestas personalizadas.
+
+Una ráfaga adicional de 32 solicitudes simultáneas con la clave vacía terminó 32/32 en 200, con
+un único payload y p95 de 240 ms durante el fill frío. Redis observó 33 misses y 31 hits por el
+recheck bajo lock, pero exactamente **un** `SET`: el single-flight evitó que los 32 solicitantes
+repitieran en paralelo la proyección PostgreSQL. Tras ese fill todos comparten la lectura caliente
+de 6–8 ms hasta el TTL.
+
+Los resultados completos, incluidos imágenes, gzip e índices, están en
+[`catalog-performance.md`](catalog-performance.md).
+
 ## Decisión operativa
 
-1. No añadir por ahora crate/cliente Redis, `REDIS_URL`, health/readiness ni
-   invalidaciones en la aplicación.
-2. Mantener `redis` solo como scaffolding dormido bajo profiles explícitos y no
-   iniciarlo en instalación, upgrade ni arranque normal.
+1. Redis sigue siendo opcional; no configurar URL equivale exactamente al camino
+   PostgreSQL anterior.
+2. Activarlo solo bajo profile o unidad explícitos, autenticado y sin publicar
+   el puerto fuera de loopback/red backend.
 3. Mantener locks de sync en PostgreSQL y handles/canales/semaforización junto
    al proceso que posee FFmpeg o el stream.
-4. Optimizar primero consultas e índices con `EXPLAIN (ANALYZE, BUFFERS)`, y
-   acotar los mapas locales hallados. Una caché no debe ocultar una consulta o
-   una cardinalidad defectuosa.
+4. Optimizar primero consultas e índices con `EXPLAIN (ANALYZE, BUFFERS)`; una
+   caché no debe ocultar una consulta o cardinalidad defectuosa.
 5. No almacenar tokens, credenciales, URLs de proveedor, segmentos, imágenes ni
    payloads grandes en Redis.
+6. Medir `keyspace_hits`, `keyspace_misses`, evictions, RSS y latencia p95 antes
+   de ampliar el conjunto de claves.
+
+### Activación segura
+
+Para Compose completo, definir `REDIS_PASSWORD`, habilitar el profile `cache` y
+proporcionar `JELLYRIN_REDIS_URL` en el fichero de entorno protegido. En un
+despliegue bare-metal de Jellyrin con Redis aislado en Docker se usa
+`ops/docker-compose.redis-cache.yml`: recibe un fichero root-only con la
+contraseña, deriva un ACL SHA-256 solo dentro del tmpfs
+del contenedor, publica únicamente `127.0.0.1:16379` y mantiene 128 MiB de
+`maxmemory` dentro de un cgroup de 192 MiB. La contraseña no aparece en argv,
+variables Docker ni `docker inspect`.
+
+La URL de Jellyrin se guarda aparte, por ejemplo
+`redis://:CONTRASEÑA@127.0.0.1:16379/0`, en un fichero 0400/0440 fuera del repo.
+El drop-in `ops/jellyrin-redis-cache.conf.example` la entrega mediante
+`LoadCredential`; no se debe copiar la URL a logs, commits o argumentos de
+proceso. Tras activar:
+
+1. comprobar health del contenedor y que el listener sea solo loopback;
+2. reiniciar Jellyrin y confirmar el evento fijo `shared Redis catalogue cache enabled`;
+3. ejecutar dos lecturas idénticas de Géneros/Estudios y verificar miss→hit;
+4. detener Redis temporalmente y confirmar que la misma ruta sigue respondiendo
+   desde PostgreSQL dentro del SLO;
+5. restaurar Redis y comprobar reconexión antes de declarar el rollout completo.
 
 ## Umbral de activación
 
-Redis solo pasa de scaffolding a implementación si existe un caso concreto y se
-cumplen **todos** los criterios siguientes:
+La faceta compartida cumple el umbral funcional inicial. Cualquier ampliación a
+otro tipo de dato debe cumplir **todos** los criterios siguientes:
 
 1. **Causa demostrada:** hay al menos dos nodos que necesitan rate limit o
    invalidación compartida, o un endpoint single-node incumple su SLO y
@@ -140,8 +212,8 @@ cumplen **todos** los criterios siguientes:
    con jitter y working set medido, no estimado.
 4. **Presupuesto:** RSS Redis menor al 5 % de la RAM del host y quedan al menos
    512 MiB libres durante un encode FFmpeg de peor caso. En este host se empieza
-   con `maxmemory` de 32–64 MiB, no 96 MiB, y se dimensiona el cgroup con RSS
-   saturado, no con `used_memory` vacío.
+   con un presupuesto inicial medido y se dimensiona el cgroup con RSS saturado, no con
+   `used_memory` vacío. La instalación actual reserva 128 MiB de datos y 192 MiB de cgroup.
 5. **Degradación segura:** timeout corto, circuit breaker y fallback a
    PostgreSQL mantienen el SLO cuando Redis está detenido o saturado. Redis no
    participa en `/readyz` si solo es caché y su caída no impide login, browse ni
@@ -151,9 +223,7 @@ cumplen **todos** los criterios siguientes:
    permiten secretos ni identificadores de alta sensibilidad en claves o
    valores.
 
-El primer candidato razonable sería rate limit compartido al desplegar dos o
-más nodos. Para catálogos, se escogerá una única respuesta cara e inmutable por
-TTL; no se añadirá una caché genérica de repositorio. Pub/Sub solo podrá llevar
+No se añadirá una caché genérica de repositorio. Pub/Sub solo podrá llevar
 invalidaciones descartables: la documentación de Redis especifica entrega
 at-most-once, por lo que cancelaciones y órdenes críticas necesitan estado
 durable y replay.
@@ -161,5 +231,6 @@ durable y replay.
 ## Referencias
 
 - [Redis: límites de memoria y eviction](https://redis.io/docs/latest/develop/reference/eviction/)
+- [Redis: patrón cache-aside](https://redis.io/docs/latest/develop/use-cases/cache-aside/)
 - [Redis: semántica de Pub/Sub](https://redis.io/docs/latest/develop/pubsub/)
 - [PostgreSQL: advisory locks](https://www.postgresql.org/docs/current/explicit-locking.html#ADVISORY-LOCKS)
