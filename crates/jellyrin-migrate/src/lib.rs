@@ -37,8 +37,8 @@ use spec::{
 };
 use value::{TypedValue, parse_uuid};
 
-pub const SOURCE_SCHEMA_VERSION: i64 = 202_608_200_001;
-pub const TARGET_SCHEMA_VERSION: i64 = 202_608_200_001;
+pub const SOURCE_SCHEMA_VERSION: i64 = 202_608_220_001;
+pub const TARGET_SCHEMA_VERSION: i64 = 202_608_220_001;
 const MIN_POSTGRES_VERSION_NUM: i64 = 160_000;
 const MIGRATION_BATCH_ROWS: usize = 500;
 const TARGET_APPLICATION_LOCK_TIMEOUT: &str = "10s";
