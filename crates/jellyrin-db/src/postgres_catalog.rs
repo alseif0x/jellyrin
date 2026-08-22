@@ -1271,17 +1271,35 @@ impl PostgresDatabase {
     ) -> anyhow::Result<Option<MediaItemQueryFilterValues>> {
         let covered = sqlx::query_scalar::<_, bool>(
             r#"
-            SELECT count(*) = cardinality($1::uuid[]) * cardinality($3::text[])
-               AND COALESCE(bool_and(
-                       coverage.projection_version = $2
-                       AND coverage.source_revision = revision.source_revision
-                       AND revision.reconciled_revision = revision.source_revision
-                   ), FALSE)
-            FROM media_item_query_filter_summary_coverage AS coverage
-            JOIN media_item_query_filter_summary_revisions AS revision
-              ON revision.virtual_folder_id = coverage.virtual_folder_id
-            WHERE coverage.virtual_folder_id = ANY($1)
-              AND coverage.effective_item_type = ANY($3)
+            WITH expected AS (
+                SELECT folder.id AS virtual_folder_id,
+                       requested.effective_item_type
+                FROM virtual_folders AS folder
+                CROSS JOIN unnest($3::text[]) AS requested(effective_item_type)
+                WHERE folder.id = ANY($1)
+                  AND (
+                      (requested.effective_item_type = 'movie'
+                       AND lower(COALESCE(folder.collection_type, '')) = 'movies')
+                      OR
+                      (requested.effective_item_type = 'episode'
+                       AND lower(COALESCE(folder.collection_type, ''))
+                           IN ('tvshows', 'tvshow', 'series'))
+                  )
+            )
+            SELECT EXISTS(SELECT 1 FROM expected)
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM expected
+                   LEFT JOIN media_item_query_filter_summary_coverage AS coverage
+                     ON coverage.virtual_folder_id = expected.virtual_folder_id
+                    AND coverage.effective_item_type = expected.effective_item_type
+                   LEFT JOIN media_item_query_filter_summary_revisions AS revision
+                     ON revision.virtual_folder_id = expected.virtual_folder_id
+                   WHERE coverage.virtual_folder_id IS NULL
+                      OR coverage.projection_version <> $2
+                      OR coverage.source_revision <> revision.source_revision
+                      OR revision.reconciled_revision <> revision.source_revision
+               )
             "#,
         )
         .bind(folder_ids)
@@ -9852,6 +9870,49 @@ mod tests {
             assert!(filters2_values.containers.is_empty());
             assert!(!filters2_values.has_subtitles);
             assert!(!filters2_values.has_trailer);
+
+            let episode_folder = test
+                .database
+                .replace_remote_media_library_snapshot(
+                    "Episode Filters",
+                    "tvshows",
+                    "provider://episode-filters",
+                    vec![remote_item(
+                        Uuid::new_v4(),
+                        "Target Episode",
+                        "provider://episode-filters/target.mkv",
+                        "Video",
+                        "tvshows",
+                        json!({"Genres": ["Episode Genre"]}),
+                    )],
+                )
+                .await?;
+            let mixed_library_query = MediaItemCatalogQuery {
+                start_index: 0,
+                limit: 0,
+                virtual_folder_ids: vec![target_folder.id, episode_folder.id],
+                include_item_types: vec!["Movie".to_owned(), "Episode".to_owned()],
+                ..MediaItemCatalogQuery::default()
+            };
+            let mixed_library_values = test
+                .database
+                .media_item_query_filter_values(
+                    &mixed_library_query,
+                    MediaItemQueryFilterSelection::GENRES_ONLY,
+                )
+                .await?;
+            assert!(
+                mixed_library_values
+                    .genres
+                    .iter()
+                    .any(|value| value == "Drama")
+            );
+            assert!(
+                mixed_library_values
+                    .genres
+                    .iter()
+                    .any(|value| value == "Episode Genre")
+            );
 
             let multi_folder_query = MediaItemCatalogQuery {
                 start_index: 0,
