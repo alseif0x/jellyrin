@@ -50360,7 +50360,9 @@ async fn metadata_collection_keys(
     if let Some(user_id) = requested_user_id {
         ensure_user_access(&auth_user, user_id)?;
     }
-    let facet_query = metadata_facet_query_with_redundant_types_removed(&state.db, &query).await?;
+    let mut facet_query =
+        metadata_facet_query_with_redundant_types_removed(&state.db, &query).await?;
+    normalize_series_filter_catalog_query(&mut facet_query);
     if facet_kind == MediaItemFacetKind::Genre
         && !facet_query.include_item_types.is_empty()
         && let Some(values) = media_catalog_filter_values_result(
