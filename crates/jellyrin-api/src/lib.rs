@@ -32744,10 +32744,11 @@ fn special_user_view_to_json(
     collection_type: &str,
     server_id: &str,
 ) -> serde_json::Value {
+    let id = special_user_view_id(collection_type);
     serde_json::json!({
         "Name": name,
         "ServerId": server_id,
-        "Id": special_user_view_id(collection_type),
+        "Id": id,
         "Etag": null,
         "DateCreated": null,
         "CanDelete": false,
@@ -32766,8 +32767,8 @@ fn special_user_view_to_json(
         "ParentId": null,
         "Type": "CollectionFolder",
         "CollectionType": collection_type,
-        "UserData": { "PlaybackPositionTicks": 0, "PlayCount": 0, "IsFavorite": false, "Played": false, "Key": special_user_view_id(collection_type), "ItemId": special_user_view_id(collection_type) },
-        "ImageTags": { "Primary": "placeholder" },
+        "UserData": { "PlaybackPositionTicks": 0, "PlayCount": 0, "IsFavorite": false, "Played": false, "Key": id, "ItemId": id },
+        "ImageTags": { "Primary": generated_folder_primary_image_tag(&id) },
         "PrimaryImageAspectRatio": 1.0,
         "BackdropImageTags": [],
         "LocationType": "Virtual",
@@ -34806,7 +34807,7 @@ fn physical_folder_item_to_json(
         "ChildCount": child_count,
         "RecursiveItemCount": child_count,
         "UserData": { "PlaybackPositionTicks": 0, "PlayCount": 0, "IsFavorite": false, "Played": false },
-        "ImageTags": { "Primary": default_primary_image_tag(&id) },
+        "ImageTags": { "Primary": generated_folder_primary_image_tag(&id) },
         "PrimaryImageAspectRatio": 0.6666667,
         "BackdropImageTags": [],
         "LocationType": "FileSystem",
@@ -57171,6 +57172,10 @@ fn default_primary_image_tag(item_id: &str) -> String {
     format!("generated-{item_id}")
 }
 
+fn generated_folder_primary_image_tag(item_id: &str) -> String {
+    format!("generated-raster-v1-{item_id}")
+}
+
 fn user_view_to_json(folder: &VirtualFolder, server_id: &str) -> serde_json::Value {
     user_view_to_json_with_count(folder, server_id, 0)
 }
@@ -57180,10 +57185,11 @@ fn user_view_to_json_with_count(
     server_id: &str,
     child_count: usize,
 ) -> serde_json::Value {
+    let id = folder.id.simple().to_string();
     serde_json::json!({
         "Name": folder.name,
         "ServerId": server_id,
-        "Id": folder.id.simple().to_string(),
+        "Id": id,
         "Etag": null,
         "DateCreated": format_time_for_json(folder.created_at),
         "CanDelete": false,
@@ -57204,8 +57210,8 @@ fn user_view_to_json_with_count(
         "ParentId": null,
         "Type": "CollectionFolder",
         "CollectionType": folder.collection_type,
-        "UserData": { "PlaybackPositionTicks": 0, "PlayCount": 0, "IsFavorite": false, "Played": false, "Key": folder.id.simple().to_string(), "ItemId": folder.id.simple().to_string() },
-        "ImageTags": { "Primary": "placeholder" },
+        "UserData": { "PlaybackPositionTicks": 0, "PlayCount": 0, "IsFavorite": false, "Played": false, "Key": id, "ItemId": id },
+        "ImageTags": { "Primary": generated_folder_primary_image_tag(&id) },
         "PrimaryImageAspectRatio": 0.6666667,
         "BackdropImageTags": [],
         "LocationType": "FileSystem",
@@ -97042,7 +97048,10 @@ done
         assert_eq!(ancestors.as_array().unwrap().len(), 2);
         assert_eq!(ancestors[0]["Id"], parent_id);
         assert_eq!(ancestors[0]["Type"], "CollectionFolder");
-        assert_eq!(ancestors[0]["ImageTags"]["Primary"], "placeholder");
+        assert_eq!(
+            ancestors[0]["ImageTags"]["Primary"],
+            super::generated_folder_primary_image_tag(parent_id)
+        );
         assert_eq!(ancestors[0]["ParentId"], ancestors[1]["Id"]);
         assert_eq!(ancestors[1]["Type"], "Folder");
 
