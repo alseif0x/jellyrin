@@ -4017,6 +4017,12 @@ impl PostgresDatabase {
     ) -> anyhow::Result<()> {
         let stage_id = stage.parsed_id()?;
         let mut tx = self.worker_pool.begin().await?;
+        // A ready stage may contain hundreds of thousands of rows. Cascading its deletion must
+        // have the same bounded maintenance budget as publication; the general worker timeout is
+        // intentionally much shorter and otherwise leaves a failed import impossible to clean up.
+        sqlx::query("SET LOCAL statement_timeout = '60min'")
+            .execute(&mut *tx)
+            .await?;
         let stage_state = sqlx::query_as::<_, (String, i32)>(
             "SELECT status, extractor_version \
              FROM remote_media_catalog_stages WHERE id = $1 FOR UPDATE",
@@ -4083,7 +4089,7 @@ impl PostgresDatabase {
         // statement timeout while PostgreSQL maintains indexes and statement-level transition
         // table triggers. Keep this operation bounded, but give it enough time to finish without
         // forcing the provider catalogue to be downloaded again.
-        sqlx::query("SET LOCAL statement_timeout = '15min'")
+        sqlx::query("SET LOCAL statement_timeout = '60min'")
             .execute(&mut *tx)
             .await?;
         sqlx::query("SET LOCAL jit = off").execute(&mut *tx).await?;
