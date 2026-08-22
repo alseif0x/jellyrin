@@ -33305,10 +33305,10 @@ fn media_catalog_query_for_items(
         return Ok(None);
     }
     let include_item_types = csv_values_lowercase(&query.include_item_types).unwrap_or_default();
-    if include_item_types
-        .iter()
-        .any(|item_type| matches!(item_type.as_str(), "series" | "tvchannel" | "livetvchannel"))
-    {
+    if include_item_types.iter().any(|item_type| {
+        matches!(item_type.as_str(), "tvchannel" | "livetvchannel")
+            || (item_type == "series" && query.allowed_plugin_tuner_ids.is_none())
+    }) {
         return Ok(None);
     }
     if !person_ids.is_empty()
@@ -33340,15 +33340,23 @@ fn media_catalog_query_for_items(
         return Ok(None);
     }
 
-    let descending = query
+    let sort_directions = query
         .sort_order
         .as_deref()
-        .is_some_and(|order| order.eq_ignore_ascii_case("Descending"));
-    let sort_direction = if descending {
-        SortDirection::Descending
-    } else {
-        SortDirection::Ascending
-    };
+        .unwrap_or_default()
+        .split(',')
+        .map(|order| {
+            if order.trim().eq_ignore_ascii_case("Descending") {
+                SortDirection::Descending
+            } else {
+                SortDirection::Ascending
+            }
+        })
+        .collect::<Vec<_>>();
+    let default_sort_direction = sort_directions
+        .first()
+        .copied()
+        .unwrap_or(SortDirection::Ascending);
     let sort = query
         .sort_by
         .as_deref()
@@ -33358,6 +33366,9 @@ fn media_catalog_query_for_items(
             "sortname" | "name" => Some(MediaItemCatalogSortField::SortName),
             "datecreated" => Some(MediaItemCatalogSortField::DateCreated),
             "datelastmediaadded" => Some(MediaItemCatalogSortField::DateLastMediaAdded),
+            "premieredate" => Some(MediaItemCatalogSortField::PremiereDate),
+            "communityrating" => Some(MediaItemCatalogSortField::CommunityRating),
+            "dateplayed" => Some(MediaItemCatalogSortField::DatePlayed),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -33471,7 +33482,16 @@ fn media_catalog_query_for_items(
         is_resumable: resumable_filter_value(&filters),
         sort: sort
             .into_iter()
-            .map(|field| (field, sort_direction))
+            .enumerate()
+            .map(|(index, field)| {
+                (
+                    field,
+                    sort_directions
+                        .get(index)
+                        .copied()
+                        .unwrap_or(default_sort_direction),
+                )
+            })
             .collect(),
         ..MediaItemCatalogQuery::default()
     }))
@@ -34041,8 +34061,13 @@ async fn items_result(
     {
         return Ok(result);
     }
-    if let Some(result) =
-        media_catalog_items_result(&state.db, &query, &server_id, requested_user_id).await?
+    if let Some(result) = media_catalog_items_result(
+        &state.db,
+        &query,
+        &server_id,
+        requested_user_id.or(Some(auth_user.id)),
+    )
+    .await?
     {
         queue_plugin_vod_artwork_prefetch_from_page(&state, &result.0);
         return Ok(result);
@@ -34939,6 +34964,9 @@ async fn latest_items(
     )
     .await?;
     let server_id = state.db.server_state().await?.server_id.to_string();
+    if let Some(result) = special_user_view_latest_items(&state.db, &query, &server_id).await? {
+        return Ok(result);
+    }
     if let Some(result) = live_tv_latest_items_for_parent(&state.db, &query, &server_id).await? {
         return Ok(result);
     }
@@ -34991,6 +35019,9 @@ async fn current_user_latest_items(
     )
     .await?;
     let server_id = state.db.server_state().await?.server_id.to_string();
+    if let Some(result) = special_user_view_latest_items(&state.db, &query, &server_id).await? {
+        return Ok(result);
+    }
     if let Some(result) = live_tv_latest_items_for_parent(&state.db, &query, &server_id).await? {
         return Ok(result);
     }
@@ -35040,6 +35071,9 @@ async fn user_latest_items(
     )
     .await?;
     let server_id = state.db.server_state().await?.server_id.to_string();
+    if let Some(result) = special_user_view_latest_items(&state.db, &query, &server_id).await? {
+        return Ok(result);
+    }
     if let Some(result) = live_tv_latest_items_for_parent(&state.db, &query, &server_id).await? {
         return Ok(result);
     }
@@ -35136,6 +35170,26 @@ async fn latest_items_candidates(
         db,
     )
     .await
+}
+
+/// Special virtual views do not have persisted media rows. In particular, feeding their synthetic
+/// collection folder through the generic Latest fallback serializes it as `BaseItem`, which strict
+/// SDK clients reject. Return the real BoxSet-shaped collection entries instead.
+async fn special_user_view_latest_items(
+    db: &Database,
+    query: &ItemsQuery,
+    server_id: &str,
+) -> Result<Option<Json<Vec<serde_json::Value>>>, ApiError> {
+    if special_user_view_collection_type_for_parent(query.parent_id.as_deref()) != Some("boxsets") {
+        return Ok(None);
+    }
+    let limit = latest_items_limit(query);
+    let items = special_collection_items(db, server_id)
+        .await?
+        .into_iter()
+        .take(limit)
+        .collect();
+    Ok(Some(Json(items)))
 }
 
 fn latest_items_limit(query: &ItemsQuery) -> usize {
@@ -35786,7 +35840,22 @@ async fn shows_next_up(
         query.is_played = Some(false);
     }
 
-    let common_next_up_query = is_common_next_up_query(&query);
+    let next_up_virtual_folder_id = if let Some(parent_id) = query.parent_id.as_deref() {
+        let Ok(parent_id) = parse_jellyfin_uuid(parent_id) else {
+            return Err(ApiError::bad_request("invalid parent id"));
+        };
+        state
+            .db
+            .virtual_folders()
+            .await?
+            .into_iter()
+            .find(|folder| folder.id == parent_id)
+            .map(|folder| folder.id)
+    } else {
+        None
+    };
+    let common_next_up_query = is_common_next_up_query(&query)
+        && (query.parent_id.is_none() || next_up_virtual_folder_id.is_some());
     if common_next_up_query
         && query.series_id.is_none()
         && let Some(limit) = query.limit
@@ -35795,6 +35864,7 @@ async fn shows_next_up(
         let candidate_page = MediaCatalogStore::tv_next_up_candidate_page(
             &state.db,
             requested_user_id,
+            next_up_virtual_folder_id,
             start_index,
             limit,
             query_flag(&query._enable_total_record_count).unwrap_or(true),
@@ -35886,6 +35956,7 @@ async fn shows_next_up(
 fn is_common_next_up_query(query: &ItemsQuery) -> bool {
     let expected = ItemsQuery {
         user_id: query.user_id.clone(),
+        parent_id: query.parent_id.clone(),
         series_id: query.series_id.clone(),
         include_item_types: query.include_item_types.clone(),
         is_played: query.is_played,
@@ -99228,6 +99299,31 @@ done
                 .iter()
                 .all(|(_, direction)| *direction == jellyrin_db::SortDirection::Descending)
         );
+        let wholphin_sorts = super::media_catalog_query_for_items(
+            &super::parse_items_query(Some(
+                "Limit=25&SortBy=PremiereDate,SeriesSortName,AiredEpisodeOrder&SortOrder=Descending,Ascending,Descending&IncludeItemTypes=Episode",
+            )),
+            Some(user.id),
+        )
+        .unwrap()
+        .expect("Wholphin episode shelves should use database paging");
+        assert_eq!(
+            wholphin_sorts.sort,
+            vec![(
+                jellyrin_db::MediaItemCatalogSortField::PremiereDate,
+                jellyrin_db::SortDirection::Descending,
+            )]
+        );
+        let mut plugin_series = super::parse_items_query(Some(
+            "Limit=25&SortBy=CommunityRating&SortOrder=Descending&IncludeItemTypes=Series",
+        ));
+        plugin_series.allowed_plugin_tuner_ids = Some(vec!["test-tuner".to_string()]);
+        assert!(
+            super::media_catalog_query_for_items(&plugin_series, Some(user.id))
+                .unwrap()
+                .is_some(),
+            "plugin Series anchors must not fall back to a catalogue-wide scan"
+        );
         let genre_query = super::media_catalog_query_for_items(
             &super::parse_items_query(Some("GenreIds=Drama,genre-id&Limit=10")),
             Some(user.id),
@@ -104268,6 +104364,10 @@ done
         ));
         common.is_played = Some(false);
         assert!(super::is_common_next_up_query(&common));
+
+        let mut scoped = common.clone();
+        scoped.parent_id = Some(Uuid::new_v4().simple().to_string());
+        assert!(super::is_common_next_up_query(&scoped));
 
         let mut searched = common.clone();
         searched.search_term = Some("show".to_string());

@@ -629,6 +629,9 @@ pub enum MediaItemCatalogSortField {
     SortName,
     DateCreated,
     DateLastMediaAdded,
+    PremiereDate,
+    CommunityRating,
+    DatePlayed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1917,6 +1920,7 @@ pub trait MediaCatalogStore: DatabaseBackend {
     fn tv_next_up_candidate_page(
         &self,
         user_id: Uuid,
+        virtual_folder_id: Option<Uuid>,
         start_index: usize,
         limit: usize,
         include_total_record_count: bool,
@@ -2112,6 +2116,7 @@ impl MediaCatalogStore for PostgresDatabase {
     fn tv_next_up_candidate_page(
         &self,
         user_id: Uuid,
+        virtual_folder_id: Option<Uuid>,
         start_index: usize,
         limit: usize,
         include_total_record_count: bool,
@@ -2119,6 +2124,7 @@ impl MediaCatalogStore for PostgresDatabase {
         PostgresDatabase::tv_next_up_candidate_page(
             self,
             user_id,
+            virtual_folder_id,
             start_index,
             limit,
             include_total_record_count,
@@ -2341,6 +2347,7 @@ impl MediaCatalogStore for SqliteDatabase {
     fn tv_next_up_candidate_page(
         &self,
         user_id: Uuid,
+        virtual_folder_id: Option<Uuid>,
         start_index: usize,
         limit: usize,
         include_total_record_count: bool,
@@ -2348,6 +2355,7 @@ impl MediaCatalogStore for SqliteDatabase {
         SqliteDatabase::tv_next_up_candidate_page(
             self,
             user_id,
+            virtual_folder_id,
             start_index,
             limit,
             include_total_record_count,
@@ -2598,6 +2606,9 @@ impl_xtream_catalog_store!(SqliteDatabase);
 
 #[cfg(any(test, feature = "sqlite"))]
 const SQLITE_MEDIA_ITEM_TYPE_SQL: &str = r#"CASE
+    WHEN item.media_type = 'Series'
+         AND lower(coalesce(json_extract(item.metadata_json, '$.PluginVodKind'), '')) = 'series'
+        THEN 'series'
     WHEN item.media_type = 'Video' AND item.collection_type = 'movies' THEN 'movie'
     WHEN item.media_type = 'Video'
          AND item.collection_type IN ('musicvideos', 'musicvideo') THEN 'musicvideo'
@@ -2997,6 +3008,13 @@ fn push_sqlite_catalog_order(builder: &mut QueryBuilder<Sqlite>, query: &MediaIt
             MediaItemCatalogSortField::SortName => "lower(item.name)",
             MediaItemCatalogSortField::DateCreated => "item.created_at",
             MediaItemCatalogSortField::DateLastMediaAdded => "item.updated_at",
+            MediaItemCatalogSortField::PremiereDate => {
+                "COALESCE(json_extract(item.metadata_json, '$.PremiereDate'), json_extract(item.metadata_json, '$.ProductionYear'))"
+            }
+            MediaItemCatalogSortField::CommunityRating => {
+                "CAST(COALESCE(json_extract(item.metadata_json, '$.CommunityRating'), json_extract(item.metadata_json, '$.Rating')) AS REAL)"
+            }
+            MediaItemCatalogSortField::DatePlayed => "playback.updated_at",
         });
         builder.push(match direction {
             SortDirection::Ascending => " ASC",
@@ -10206,13 +10224,16 @@ impl SqliteDatabase {
     pub async fn tv_next_up_candidate_page(
         &self,
         user_id: Uuid,
+        virtual_folder_id: Option<Uuid>,
         start_index: usize,
         limit: usize,
         include_total_record_count: bool,
     ) -> anyhow::Result<TvNextUpPage> {
         let candidates = self.tv_next_up_candidate_items(user_id).await?;
         let mut next_by_series = HashMap::<String, MediaItem>::new();
-        for candidate in candidates {
+        for candidate in candidates.into_iter().filter(|candidate| {
+            virtual_folder_id.is_none_or(|folder_id| candidate.virtual_folder_id == folder_id)
+        }) {
             if effective_media_item_type(&candidate) != "Episode" {
                 continue;
             }

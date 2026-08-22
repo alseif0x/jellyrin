@@ -2872,6 +2872,7 @@ impl PostgresDatabase {
     pub async fn tv_next_up_candidate_page(
         &self,
         user_id: Uuid,
+        virtual_folder_id: Option<Uuid>,
         start_index: usize,
         limit: usize,
         include_total_record_count: bool,
@@ -2892,21 +2893,27 @@ impl PostgresDatabase {
                     WHERE lower(coalesce(folder.collection_type, '')) = ANY(
                               ARRAY['tvshows', 'tvshow', 'series']::text[]
                           )
+                      AND ($2::uuid IS NULL OR folder.id = $2)
                       AND coverage.virtual_folder_id IS NULL
                 )
                 AND NOT EXISTS (
                     SELECT series_id
                     FROM media_item_tv_series
+                    WHERE $2::uuid IS NULL OR virtual_folder_id = $2
                     GROUP BY series_id
                     HAVING count(*) > 1
                 )
                 "#,
             )
             .bind(TV_SERIES_CATALOG_PROJECTION_VERSION)
+            .bind(virtual_folder_id)
             .fetch_one(&self.pool)
             .await?;
             if !projection_covered {
                 let mut items = self.tv_next_up_candidate_items(user_id).await?;
+                items.retain(|item| {
+                    virtual_folder_id.is_none_or(|folder_id| item.virtual_folder_id == folder_id)
+                });
                 items.sort_by(compare_tv_episode_items);
                 let total_record_count = if include_total_record_count {
                     items.len()
@@ -2928,7 +2935,7 @@ impl PostgresDatabase {
                     r#"
                     SELECT candidate.item_id, candidate.virtual_folder_id,
                            candidate.item_name, candidate.item_path
-                    FROM media_item_tv_series AS series
+                        FROM media_item_tv_series AS series
                     JOIN LATERAL (
                         SELECT member.item_id, member.virtual_folder_id,
                                member.item_name, member.item_path
@@ -2946,12 +2953,14 @@ impl PostgresDatabase {
                                  member.sort_name, member.item_id
                         LIMIT 1
                     ) AS candidate ON true
+                    WHERE $2::uuid IS NULL OR series.virtual_folder_id = $2
                     ORDER BY lower(series.series_name), series.series_name,
                              series.series_id, series.virtual_folder_id
-                    OFFSET $2 LIMIT $3
+                    OFFSET $3 LIMIT $4
                     "#,
                 )
                 .bind(user_id)
+                .bind(virtual_folder_id)
                 .bind(offset)
                 .bind(page_limit)
                 .fetch_all(&self.pool)
@@ -2968,7 +2977,8 @@ impl PostgresDatabase {
                     SELECT
                         (SELECT count(*)::bigint
                          FROM media_item_tv_series
-                         WHERE episode_count > 0)
+                         WHERE episode_count > 0
+                           AND ($2::uuid IS NULL OR virtual_folder_id = $2))
                         -
                         (SELECT count(*)::bigint
                          FROM (
@@ -2978,6 +2988,7 @@ impl PostgresDatabase {
                              JOIN media_item_tv_series_members AS played_member
                                ON played_member.item_id = playback.item_id
                              WHERE playback.user_id = $1 AND playback.played
+                               AND ($2::uuid IS NULL OR played_member.virtual_folder_id = $2)
                          ) AS affected
                          WHERE NOT EXISTS (
                              SELECT 1
@@ -3019,15 +3030,17 @@ impl PostgresDatabase {
                         LIMIT 1
                     ) AS candidate ON true
                     WHERE series.episode_count > 0
+                      AND ($2::uuid IS NULL OR series.virtual_folder_id = $2)
                     ORDER BY lower(series.series_name), series.series_name,
                              series.series_id, series.virtual_folder_id
-                    OFFSET $2 LIMIT $3
+                    OFFSET $3 LIMIT $4
                 ) AS page ON true
                 ORDER BY lower(page.series_name), page.series_name,
                          page.series_id, page.virtual_folder_id
                 "#,
             )
             .bind(user_id)
+            .bind(virtual_folder_id)
             .bind(offset)
             .bind(page_limit)
             .fetch_all(&self.pool)
@@ -5992,6 +6005,9 @@ impl PostgresDatabase {
 }
 
 const POSTGRES_MEDIA_ITEM_TYPE_SQL: &str = r#"CASE
+    WHEN item.media_type = 'Series'
+         AND lower(coalesce(item.metadata->>'PluginVodKind', '')) = 'series'
+        THEN 'series'
     WHEN item.media_type = 'Video' AND item.collection_type = 'movies' THEN 'movie'
     WHEN item.media_type = 'Video'
          AND item.collection_type IN ('musicvideos', 'musicvideo') THEN 'musicvideo'
@@ -6086,6 +6102,21 @@ fn postgres_query_filter_summary_scope(
 
 fn push_postgres_catalog_from(builder: &mut QueryBuilder<Postgres>, query: &MediaItemCatalogQuery) {
     let selector_groups = normalized_postgres_filter_selector_groups(query);
+    if selector_groups.is_empty()
+        && query.is_played == Some(true)
+        && let Some(user_id) = query.user_id
+    {
+        // Watched/recently-played shelves are normally tiny relative to the media catalogue. Drive
+        // them from the per-user playback index so DatePlayed never scans every episode first.
+        builder
+            .push(
+                " FROM playback_states AS playback \
+                 JOIN media_items AS item ON item.id = playback.item_id \
+                 AND playback.user_id = ",
+            )
+            .push_bind(user_id);
+        return;
+    }
     if selector_groups.is_empty() {
         builder.push(" FROM media_items AS item ");
     } else {
@@ -6465,6 +6496,7 @@ fn push_postgres_include_item_types_filter(
         "movie",
         "musicvideo",
         "episode",
+        "series",
         "video",
         "audio",
         "photo",
@@ -6484,6 +6516,9 @@ fn push_postgres_include_item_types_filter(
             }
             "episode" => {
                 "(item.collection_type IN ('tvshows', 'tvshow', 'series') AND item.media_type = 'Video' AND lower(item.path) !~ '(^|/)(extras|featurettes|special features|behind the scenes|deleted scenes|interviews|trailers)(/|$)')"
+            }
+            "series" => {
+                "(item.media_type = 'Series' AND lower(coalesce(item.metadata->>'PluginVodKind', '')) = 'series')"
             }
             "video" => {
                 "(item.media_type = 'Video' AND ((item.collection_type IN ('tvshows', 'tvshow', 'series') AND lower(item.path) ~ '(^|/)(extras|featurettes|special features|behind the scenes|deleted scenes|interviews|trailers)(/|$)') OR item.collection_type IS NULL OR item.collection_type NOT IN ('movies', 'musicvideos', 'musicvideo', 'tvshows', 'tvshow', 'series')))"
@@ -6559,6 +6594,13 @@ fn push_postgres_catalog_order(
             MediaItemCatalogSortField::SortName => "lower(item.name)",
             MediaItemCatalogSortField::DateCreated => "item.created_at",
             MediaItemCatalogSortField::DateLastMediaAdded => "item.updated_at",
+            MediaItemCatalogSortField::PremiereDate => {
+                "public.jellyrin_metadata_timestamp(item.metadata, ARRAY['PremiereDate', 'AirDate', 'DateCreated'])"
+            }
+            MediaItemCatalogSortField::CommunityRating => {
+                "public.jellyrin_metadata_number(item.metadata, ARRAY['CommunityRating', 'Rating'])"
+            }
+            MediaItemCatalogSortField::DatePlayed => "playback.updated_at",
         });
         builder.push(match direction {
             SortDirection::Ascending => " ASC",
@@ -10709,26 +10751,26 @@ mod tests {
 
             let first_page = test
                 .database
-                .tv_next_up_candidate_page(user.id, 0, 1, true)
+                .tv_next_up_candidate_page(user.id, None, 0, 1, true)
                 .await?;
             assert_eq!(first_page.total_record_count, 2);
             assert_eq!(first_page.items.len(), 1);
             let second_page = test
                 .database
-                .tv_next_up_candidate_page(user.id, 1, 1, true)
+                .tv_next_up_candidate_page(user.id, None, 1, 1, true)
                 .await?;
             assert_eq!(second_page.total_record_count, 2);
             assert_eq!(second_page.items.len(), 1);
             assert_ne!(first_page.items[0].id, second_page.items[0].id);
             let past_end = test
                 .database
-                .tv_next_up_candidate_page(user.id, 10, 1, true)
+                .tv_next_up_candidate_page(user.id, None, 10, 1, true)
                 .await?;
             assert_eq!(past_end.total_record_count, 2);
             assert!(past_end.items.is_empty());
             let without_total = test
                 .database
-                .tv_next_up_candidate_page(user.id, 0, 1, false)
+                .tv_next_up_candidate_page(user.id, None, 0, 1, false)
                 .await?;
             assert_eq!(without_total.total_record_count, 0);
             assert_eq!(without_total.items.len(), 1);
@@ -10746,7 +10788,7 @@ mod tests {
                 .await?;
             let after_completing_series = test
                 .database
-                .tv_next_up_candidate_page(user.id, 0, 10, true)
+                .tv_next_up_candidate_page(user.id, None, 0, 10, true)
                 .await?;
             assert_eq!(after_completing_series.total_record_count, 1);
             assert_eq!(after_completing_series.items.len(), 1);
