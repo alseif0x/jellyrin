@@ -38749,7 +38749,8 @@ async fn item_ancestors(
         return Ok(Json(vec![root]));
     }
 
-    let tv_snapshot = tv_episode_catalog_snapshot_scoped_to_series(&state.db, &item_id).await?;
+    let (tv_snapshot, resolved_series_id) =
+        tv_episode_catalog_snapshot_scoped_to_series(&state.db, &item_id).await?;
 
     if let Some((series_name, series_id)) = tv_season_parent_from_snapshot(&tv_snapshot, &item_id) {
         let folder_id = tv_snapshot
@@ -38778,7 +38779,9 @@ async fn item_ancestors(
         return Ok(Json(vec![series_json, folder_json, root]));
     }
 
-    if let Some(series_name) = series_name_for_id_from_snapshot(&tv_snapshot, &item_id) {
+    if let Some(series_name) =
+        series_name_for_id_from_snapshot(&tv_snapshot, &resolved_series_id)
+    {
         let folder_id = tv_snapshot
             .items
             .iter()
@@ -49804,22 +49807,29 @@ async fn series_episodes(
         query.include_item_types.push("Episode".to_string());
     }
 
-    let TvEpisodeCatalogSnapshot {
+    let (TvEpisodeCatalogSnapshot {
         items,
         metadata_by_item,
-    } = tv_episode_catalog_snapshot_scoped_to_series(&state.db, &series_id).await?;
+    }, resolved_series_id) =
+        tv_episode_catalog_snapshot_scoped_to_series(&state.db, &series_id).await?;
     let candidate_episodes =
         filtered_media_items(items, &query, Some(requested_user_id), &state.db).await?;
     let mut episodes = candidate_episodes
         .into_iter()
-        .filter(|item| tv_episode_matches_series(item, metadata_by_item.get(&item.id), &series_id))
+        .filter(|item| {
+            tv_episode_matches_series(item, metadata_by_item.get(&item.id), &resolved_series_id)
+        })
         .filter(|item| {
             query.season_id.as_deref().is_none_or(|season_id| {
                 tv_episode_matches_season(item, metadata_by_item.get(&item.id), season_id)
             })
         })
         .collect::<Vec<_>>();
-    if episodes.is_empty() && series_name_for_id(&state.db, &series_id).await?.is_none() {
+    if episodes.is_empty()
+        && series_name_for_id(&state.db, &resolved_series_id)
+            .await?
+            .is_none()
+    {
         return Err(ApiError::not_found("Series not found"));
     }
     episodes.sort_by(|left, right| {
@@ -49877,10 +49887,10 @@ async fn series_seasons_result(
     requested_user_id: Uuid,
     server_id: &str,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let TvEpisodeCatalogSnapshot {
+    let (TvEpisodeCatalogSnapshot {
         mut items,
         metadata_by_item,
-    } = tv_episode_catalog_snapshot_scoped_to_series(db, series_id).await?;
+    }, resolved_series_id) = tv_episode_catalog_snapshot_scoped_to_series(db, series_id).await?;
     if let Some(allowed_tuner_ids) = query.allowed_plugin_tuner_ids.as_ref() {
         items.retain(|item| {
             if !is_plugin_vod_virtual_item(item) {
@@ -49898,7 +49908,9 @@ async fn series_seasons_result(
     }
     let episodes = items
         .into_iter()
-        .filter(|item| tv_episode_matches_series(item, metadata_by_item.get(&item.id), series_id))
+        .filter(|item| {
+            tv_episode_matches_series(item, metadata_by_item.get(&item.id), &resolved_series_id)
+        })
         .collect::<Vec<_>>();
     let series_name = episodes
         .iter()
@@ -53316,15 +53328,18 @@ async fn authenticated_similar_show_items(
     items_query.sort_by = None;
     items_query.sort_order = None;
 
-    let TvEpisodeCatalogSnapshot {
+    let (TvEpisodeCatalogSnapshot {
         items,
         metadata_by_item,
-    } = tv_episode_catalog_snapshot_scoped_to_series(&state.db, &item_id).await?;
+    }, resolved_series_id) =
+        tv_episode_catalog_snapshot_scoped_to_series(&state.db, &item_id).await?;
     let candidate_episodes =
         filtered_media_items(items, &items_query, Some(requested_user_id), &state.db).await?;
     let mut episodes = candidate_episodes
         .into_iter()
-        .filter(|item| tv_episode_matches_series(item, metadata_by_item.get(&item.id), &item_id))
+        .filter(|item| {
+            tv_episode_matches_series(item, metadata_by_item.get(&item.id), &resolved_series_id)
+        })
         .collect::<Vec<_>>();
     if episodes.is_empty() {
         return Err(ApiError::not_found("Similar source not found"));
@@ -60603,14 +60618,32 @@ async fn tv_episode_catalog_snapshot_for_season(
 async fn tv_episode_catalog_snapshot_scoped_to_series(
     db: &Database,
     series_id: &str,
-) -> Result<TvEpisodeCatalogSnapshot, ApiError> {
+) -> Result<(TvEpisodeCatalogSnapshot, String), ApiError> {
     if let Some(snapshot) = tv_episode_catalog_snapshot_for_series(db, series_id).await? {
-        return Ok(snapshot);
+        return Ok((snapshot, series_id.to_string()));
+    }
+    // Plugin VOD listings expose the persisted Series anchor's item id, while its episodes carry
+    // the provider's canonical SeriesId. Resolve that public anchor id before trying legacy
+    // synthetic ids so both `/Shows/{id}/Seasons` and Wholphin's generic `/Items` shape agree with
+    // the id returned by the catalogue.
+    if let Ok(anchor_item_id) = parse_jellyfin_uuid(series_id)
+        && let Some(anchor) = db
+            .media_item_with_metadata_by_id_visible(anchor_item_id)
+            .await?
+        && let Some((canonical_series_id, _)) =
+            plugin_vod_series_anchor_info(&anchor.item, &anchor.metadata)
+        && let Some(snapshot) =
+            tv_episode_catalog_snapshot_for_series(db, &canonical_series_id).await?
+    {
+        return Ok((snapshot, canonical_series_id));
     }
     if let Some(snapshot) = tv_episode_catalog_snapshot_for_season(db, series_id).await? {
-        return Ok(snapshot);
+        return Ok((snapshot, series_id.to_string()));
     }
-    tv_episode_catalog_snapshot_without_canonical_series_id(db).await
+    Ok((
+        tv_episode_catalog_snapshot_without_canonical_series_id(db).await?,
+        series_id.to_string(),
+    ))
 }
 
 fn tv_season_parent_from_snapshot(
@@ -101074,6 +101107,106 @@ done
         assert_eq!(upcoming["Items"][0]["Id"], third.id.simple().to_string());
         assert_eq!(upcoming["Items"][0]["Type"], "Episode");
         assert_eq!(upcoming["Items"][0]["IndexNumber"], 3);
+    }
+
+    #[tokio::test]
+    async fn plugin_series_anchor_id_resolves_to_its_canonical_series_for_seasons() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "plugin-series-anchor-seasons-key")
+            .await
+            .unwrap();
+        let anchor_id = stable_entity_id("plugin-series-anchor", "public-item");
+        let canonical_series_id = stable_entity_id("plugin-series-anchor", "provider-series");
+        let season_id = stable_entity_id("plugin-series-anchor", "provider-season-1");
+        let mut items = vec![RemoteMediaItemUpsert {
+            id: anchor_id.clone(),
+            name: "Anchored Show".to_string(),
+            path: "plugin-vod://anchor-test/series".to_string(),
+            media_type: "Series".to_string(),
+            collection_type: "tvshows".to_string(),
+            runtime_ticks: None,
+            bitrate: None,
+            width: None,
+            height: None,
+            media_streams: Vec::new(),
+            metadata: json!({
+                "PluginVodKind": "series",
+                "SeriesId": canonical_series_id,
+                "SeriesName": "Anchored Show"
+            }),
+        }];
+        for episode_number in 1..=2 {
+            items.push(RemoteMediaItemUpsert {
+                id: stable_entity_id("plugin-series-anchor", &format!("episode-{episode_number}")),
+                name: format!("Anchored Show S01E{episode_number:02}"),
+                path: format!("plugin-vod://anchor-test/series/episode-{episode_number}"),
+                media_type: "Video".to_string(),
+                collection_type: "tvshows".to_string(),
+                runtime_ticks: Some(600_000_000),
+                bitrate: Some(1_000_000),
+                width: Some(1280),
+                height: Some(720),
+                media_streams: Vec::new(),
+                metadata: json!({
+                    "PluginVodKind": "episode",
+                    "SeriesId": canonical_series_id,
+                    "SeriesName": "Anchored Show",
+                    "SeasonId": season_id,
+                    "ParentIndexNumber": 1,
+                    "IndexNumber": episode_number
+                }),
+            });
+        }
+        db.replace_remote_media_library_snapshot(
+            "Anchor Test",
+            "tvshows",
+            "plugin-vod://anchor-test",
+            items,
+        )
+        .await
+        .unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        for endpoint in [
+            format!(
+                "/Items?ParentId={anchor_id}&Recursive=false&IncludeItemTypes=Season&StartIndex=0&Limit=20&SortBy=IndexNumber&EnableUserData=true&EnableTotalRecordCount=true&EnableImages=true"
+            ),
+            format!("/Shows/{anchor_id}/Seasons?UserId={}", user.id),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(&endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            let seasons: Value = serde_json::from_slice(
+                &response.into_body().collect().await.unwrap().to_bytes(),
+            )
+            .unwrap();
+            assert_eq!(seasons["TotalRecordCount"], 1, "{endpoint}");
+            assert_eq!(seasons["Items"][0]["Type"], "Season", "{endpoint}");
+            assert_eq!(seasons["Items"][0]["ChildCount"], 2, "{endpoint}");
+            assert_eq!(
+                seasons["Items"][0]["SeriesId"], canonical_series_id,
+                "{endpoint}"
+            );
+        }
     }
 
     #[tokio::test]
