@@ -57191,7 +57191,11 @@ fn hyphenate_uuid(value: &str) -> String {
 }
 
 fn default_primary_image_tag(item_id: &str) -> String {
-    format!("generated-{item_id}")
+    // Keep this version aligned with the bytes returned by the generated item fallback. Android
+    // TV caches image responses by tag; retaining the legacy tag after replacing its transparent
+    // pixel would make the client reuse that invisible response forever and never request the
+    // visible raster tile.
+    format!("generated-raster-v1-{item_id}")
 }
 
 fn generated_folder_primary_image_tag(item_id: &str) -> String {
@@ -65334,11 +65338,13 @@ mod tests {
 
     #[tokio::test]
     async fn missing_catalog_artwork_is_a_visible_raster_tile() {
-        let response = generated_item_placeholder_response(
-            "11111111-2222-3333-4444-555555555555",
-            "Primary",
-            0,
+        let item_id = "11111111-2222-3333-4444-555555555555";
+        assert_eq!(
+            super::default_primary_image_tag(item_id),
+            format!("generated-raster-v1-{item_id}"),
+            "the image tag must invalidate the legacy transparent fallback cache"
         );
+        let response = generated_item_placeholder_response(item_id, "Primary", 0);
         assert_eq!(
             response
                 .headers()
