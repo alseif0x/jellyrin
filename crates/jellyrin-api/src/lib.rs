@@ -32185,7 +32185,7 @@ fn media_list_to_json(list: &MediaList, server_id: &str, child_count: usize) -> 
         "CollectionType": list.collection_type,
         "ChildCount": child_count,
         "RecursiveItemCount": child_count,
-        "UserData": { "PlaybackPositionTicks": 0, "PlayCount": 0, "IsFavorite": false, "Played": false },
+        "UserData": default_user_data_json(&list_id),
         "ImageTags": { "Primary": primary_image_tag },
         "PrimaryImageAspectRatio": 0.6666667,
         "BackdropImageTags": [],
@@ -34809,7 +34809,7 @@ fn physical_folder_item_to_json(
         "CollectionType": folder.collection_type,
         "ChildCount": child_count,
         "RecursiveItemCount": child_count,
-        "UserData": { "PlaybackPositionTicks": 0, "PlayCount": 0, "IsFavorite": false, "Played": false },
+        "UserData": default_user_data_json(&id),
         "ImageTags": { "Primary": generated_folder_primary_image_tag(&id) },
         "PrimaryImageAspectRatio": 0.6666667,
         "BackdropImageTags": [],
@@ -36350,15 +36350,16 @@ async fn user_root_folder(
 
 async fn root_folder_json(db: &Database) -> Result<serde_json::Value, ApiError> {
     let server = db.server_state().await?;
+    let id = server.server_id.simple().to_string();
     Ok(serde_json::json!({
         "Name": "Root",
         "ServerId": server.server_id.to_string(),
-        "Id": server.server_id.simple().to_string(),
+        "Id": id,
         "Type": "Folder",
         "IsFolder": true,
         "Path": null,
         "ParentId": null,
-        "UserData": { "PlaybackPositionTicks": 0, "PlayCount": 0, "IsFavorite": false, "Played": false },
+        "UserData": default_user_data_json(&id),
         "ImageTags": {},
         "BackdropImageTags": []
     }))
@@ -36394,7 +36395,7 @@ async fn live_tv_root_item_json(db: &Database) -> Result<serde_json::Value, ApiE
         "CollectionType": "livetv",
         "ChildCount": child_count,
         "RecursiveItemCount": child_count,
-        "UserData": { "PlaybackPositionTicks": 0, "PlayCount": 0, "IsFavorite": false, "Played": false },
+        "UserData": default_user_data_json("livetv"),
         "ImageTags": {},
         "BackdropImageTags": [],
         "LocationType": "Virtual",
@@ -50974,6 +50975,7 @@ fn remote_trailer_json(
     name: Option<&str>,
 ) -> serde_json::Value {
     let source_id = item.id.simple().to_string();
+    let trailer_id = stable_entity_id("Trailer", &format!("{source_id}:{url}"));
     let display_name = name
         .map(str::to_string)
         .unwrap_or_else(|| format!("{} Trailer", item.name));
@@ -50981,7 +50983,7 @@ fn remote_trailer_json(
         "Name": display_name,
         "OriginalTitle": null,
         "ServerId": server_id,
-        "Id": stable_entity_id("Trailer", &format!("{source_id}:{url}")),
+        "Id": trailer_id,
         "Etag": null,
         "DateCreated": format_time_for_json(item.created_at),
         "CanDelete": false,
@@ -51002,7 +51004,7 @@ fn remote_trailer_json(
         "ParentId": source_id,
         "Type": "Trailer",
         "MediaType": "Video",
-        "UserData": { "PlaybackPositionTicks": 0, "PlayCount": 0, "IsFavorite": false, "Played": false },
+        "UserData": default_user_data_json(&trailer_id),
         "ImageTags": {},
         "BackdropImageTags": [],
         "LocationType": "Remote"
@@ -51186,7 +51188,7 @@ fn metadata_entity_json(
         "Type": item_type,
         "MediaType": null,
         "ProductionYear": production_year,
-        "UserData": { "PlaybackPositionTicks": 0, "PlayCount": 0, "IsFavorite": false, "Played": false },
+        "UserData": default_user_data_json(&id),
         "ImageTags": image_tags,
         "BackdropImageTags": [],
         "LocationType": "Virtual"
@@ -57220,6 +57222,17 @@ fn primary_image_tag_for_metadata(item_id: &str, metadata: Option<&serde_json::V
 
 fn generated_folder_primary_image_tag(item_id: &str) -> String {
     format!("generated-raster-v1-{item_id}")
+}
+
+fn default_user_data_json(item_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "PlaybackPositionTicks": 0,
+        "PlayCount": 0,
+        "IsFavorite": false,
+        "Played": false,
+        "Key": item_id,
+        "ItemId": item_id,
+    })
 }
 
 fn user_view_to_json(folder: &VirtualFolder, server_id: &str) -> serde_json::Value {
@@ -101886,6 +101899,14 @@ done
         assert_eq!(result["Items"].as_array().unwrap().len(), 1);
         assert_eq!(result["Items"][0]["Name"], "Needle Other");
         assert_eq!(result["Items"][0]["Type"], "Genre");
+        assert_eq!(
+            result["Items"][0]["UserData"]["Key"],
+            result["Items"][0]["Id"]
+        );
+        assert_eq!(
+            result["Items"][0]["UserData"]["ItemId"],
+            result["Items"][0]["Id"]
+        );
 
         for (endpoint, expected_name, expected_type) in [
             (
@@ -101926,6 +101947,14 @@ done
             assert_eq!(result["TotalRecordCount"], 1, "{endpoint}");
             assert_eq!(result["Items"][0]["Name"], expected_name, "{endpoint}");
             assert_eq!(result["Items"][0]["Type"], expected_type, "{endpoint}");
+            assert_eq!(
+                result["Items"][0]["UserData"]["Key"], result["Items"][0]["Id"],
+                "{endpoint}"
+            );
+            assert_eq!(
+                result["Items"][0]["UserData"]["ItemId"], result["Items"][0]["Id"],
+                "{endpoint}"
+            );
         }
 
         let other_id = other_folder.id.simple();
@@ -113974,6 +114003,24 @@ done
             .unwrap();
         assert_eq!(edited_folder.name, "Edited Metadata Folder");
         assert_eq!(edited_folder.collection_type.as_deref(), Some("tvshows"));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items/{metadata_folder_id}"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let folder_detail: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(folder_detail["UserData"]["Key"], metadata_folder_id);
+        assert_eq!(folder_detail["UserData"]["ItemId"], metadata_folder_id);
 
         let response = app
             .clone()
