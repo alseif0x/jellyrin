@@ -228,15 +228,7 @@ test.describe('MAGSTV episode candidate sampling contract', () => {
 
 test.describe('MAGSTV live TV candidate sampling contract', () => {
   test('spreads candidates across the catalogue instead of only probing its first group', () => {
-    const items = Array.from({ length: 21 }, (_, index) => ({ Id: `channel-${index}` }));
-
-    expect(sampleLiveTvCandidates(items, 5).map((item) => item.Id)).toEqual([
-      'channel-0',
-      'channel-5',
-      'channel-10',
-      'channel-15',
-      'channel-20',
-    ]);
+    expect(evenlySpacedIndexes(21, 5)).toEqual([0, 5, 10, 15, 20]);
   });
 });
 
@@ -444,7 +436,7 @@ async function catalogueSnapshot(request, auth) {
     request.get(itemsPath(auth.User.Id, views.series.Id, 'Series'), { headers, timeout: 60_000 }),
     request.get(itemsPath(auth.User.Id, views.series.Id, 'Episode'), { headers, timeout: 60_000 }),
     request.get(
-      `/LiveTv/Channels?UserId=${encodeURIComponent(auth.User.Id)}&ParentId=${encodeURIComponent(views.liveTv.Id)}&StartIndex=0&Limit=2000`,
+      `/LiveTv/Channels?UserId=${encodeURIComponent(auth.User.Id)}&ParentId=${encodeURIComponent(views.liveTv.Id)}&StartIndex=0&Limit=1`,
       { headers, timeout: 60_000 },
     ),
   ]);
@@ -462,7 +454,12 @@ async function catalogueSnapshot(request, auth) {
     episodesResponse.json(),
     channelsResponse.json(),
   ]);
-  const normalizedChannels = normalizePage(channels);
+  const normalizedChannels = await sampleLiveTvCandidatesFromApi(
+    request,
+    auth,
+    views.liveTv.Id,
+    channels,
+  );
   const normalized = {
     views,
     movies: normalizePage(movies),
@@ -470,20 +467,46 @@ async function catalogueSnapshot(request, auth) {
     episodes: normalizePage(episodes),
     channels: {
       total: normalizedChannels.total,
-      items: sampleLiveTvCandidates(normalizedChannels.items, catalogueCandidateLimit),
+      items: normalizedChannels.items,
     },
   };
   expect(normalized.channels.items.every((item) => item.TunerHostId === TUNER_ID)).toBe(true);
   return normalized;
 }
 
-function sampleLiveTvCandidates(items, limit) {
-  if (!Array.isArray(items) || !items.length || limit <= 0) return [];
-  if (items.length <= limit) return items;
-  if (limit === 1) return [items[0]];
-  const lastIndex = items.length - 1;
+async function sampleLiveTvCandidatesFromApi(request, auth, viewId, firstPageBody) {
+  const firstPage = normalizePage(firstPageBody);
+  const indexes = evenlySpacedIndexes(firstPage.total, catalogueCandidateLimit);
+  const candidates = [];
+  const lookupConcurrency = 4;
+  for (let offset = 0; offset < indexes.length; offset += lookupConcurrency) {
+    const batch = indexes.slice(offset, offset + lookupConcurrency);
+    const results = await Promise.all(batch.map(async (startIndex) => {
+      if (startIndex === 0) return firstPage.items[0] || null;
+      const response = await request.get(
+        `/LiveTv/Channels?UserId=${encodeURIComponent(auth.User.Id)}`
+          + `&ParentId=${encodeURIComponent(viewId)}`
+          + `&StartIndex=${startIndex}&Limit=1`,
+        {
+          headers: { 'X-Emby-Token': auth.AccessToken },
+          timeout: 60_000,
+        },
+      );
+      if (response.status() !== 200) return null;
+      return normalizePage(await response.json()).items[0] || null;
+    }));
+    candidates.push(...results.filter(Boolean));
+  }
+  return { total: firstPage.total, items: candidates };
+}
+
+function evenlySpacedIndexes(total, limit) {
+  if (total <= 0 || limit <= 0) return [];
+  if (total <= limit) return Array.from({ length: total }, (_, index) => index);
+  if (limit === 1) return [0];
+  const lastIndex = total - 1;
   return Array.from({ length: limit }, (_, index) => (
-    items[Math.round((index * lastIndex) / (limit - 1))]
+    Math.round((index * lastIndex) / (limit - 1))
   ));
 }
 
