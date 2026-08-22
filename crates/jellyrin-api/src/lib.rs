@@ -33533,14 +33533,6 @@ async fn resolved_media_catalog_query_for_items(
         return Ok(None);
     }
 
-    // First establish that every non-parent predicate is supported. This avoids fetching the
-    // virtual-folder list for requests that would use the fallback regardless.
-    let mut scoped_query = query.clone();
-    scoped_query.parent_id = None;
-    let Some(mut db_query) = media_catalog_query_for_items(&scoped_query, user_id)? else {
-        return Ok(None);
-    };
-
     let Ok(parent_id) = parse_jellyfin_uuid(parent_id) else {
         return Ok(None);
     };
@@ -33548,6 +33540,31 @@ async fn resolved_media_catalog_query_for_items(
     let Some(parent) = folders.iter().find(|folder| folder.id == parent_id) else {
         return Ok(None);
     };
+
+    // A plugin VOD library persists first-class Series anchors, while a physical TV library still
+    // needs the legacy episode-to-Series projection. An unfiltered plugin does not populate
+    // `allowed_plugin_tuner_ids`; use a temporary marker to pass the mapper's Series gate, then
+    // restore the original no-filter visibility before executing SQL.
+    let persisted_plugin_series = query.allowed_plugin_tuner_ids.is_none()
+        && query_requests_only_item_type(query, "Series")
+        && parent
+            .locations
+            .iter()
+            .any(|location| location.trim().starts_with("plugin-vod://"));
+
+    // First establish that every non-parent predicate is supported. This avoids enabling SQL for
+    // UUID-shaped Series/Season parents and keeps unsupported request shapes on the legacy path.
+    let mut scoped_query = query.clone();
+    scoped_query.parent_id = None;
+    if persisted_plugin_series {
+        scoped_query.allowed_plugin_tuner_ids = Some(Vec::new());
+    }
+    let Some(mut db_query) = media_catalog_query_for_items(&scoped_query, user_id)? else {
+        return Ok(None);
+    };
+    if persisted_plugin_series {
+        db_query.allowed_plugin_tuner_ids = None;
+    }
 
     db_query.virtual_folder_ids.push(parent.id);
     if query.recursive.unwrap_or(false) {
@@ -99787,6 +99804,49 @@ done
         })
         .await
         .unwrap();
+
+        let persisted_series = db
+            .replace_remote_media_library_snapshot(
+                "Plugin Series",
+                "tvshows",
+                "plugin-vod://catalog-parent-fast-path",
+                vec![RemoteMediaItemUpsert {
+                    id: stable_entity_id("catalog-parent-fast-path", "plugin-series"),
+                    name: "Persisted Plugin Series".to_string(),
+                    path: "plugin-vod://catalog-parent-fast-path/series".to_string(),
+                    media_type: "Series".to_string(),
+                    collection_type: "tvshows".to_string(),
+                    runtime_ticks: None,
+                    bitrate: None,
+                    width: None,
+                    height: None,
+                    media_streams: Vec::new(),
+                    metadata: json!({
+                        "PluginVodKind": "series",
+                        "CommunityRating": 8.5
+                    }),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let persisted_series_query = super::parse_items_query(Some(&format!(
+            "ParentId={}&IncludeItemTypes=Series&Limit=20&SortBy=CommunityRating&SortOrder=Descending&EnableTotalRecordCount=false",
+            persisted_series.id.simple()
+        )));
+        let persisted_series_mapping = super::resolved_media_catalog_query_for_items(
+            &db,
+            &persisted_series_query,
+            Some(user.id),
+        )
+        .await
+        .unwrap()
+        .expect("a plugin VOD Series shelf should use SQL even without an authorization filter");
+        assert_eq!(
+            persisted_series_mapping.virtual_folder_ids,
+            vec![persisted_series.id]
+        );
+        assert!(persisted_series_mapping.allowed_plugin_tuner_ids.is_none());
 
         let direct_query = super::parse_items_query(Some(&format!(
             "ParentId={}&IncludeItemTypes=Movie&Limit=10&Recursive=false",
