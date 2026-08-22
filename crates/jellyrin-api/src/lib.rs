@@ -57198,6 +57198,26 @@ fn default_primary_image_tag(item_id: &str) -> String {
     format!("generated-raster-v1-{item_id}")
 }
 
+fn primary_image_tag_for_metadata(item_id: &str, metadata: Option<&serde_json::Value>) -> String {
+    let provider_image_is_ready = metadata.is_some_and(|metadata| {
+        [
+            "PluginVodImageAvailable",
+            "SeriesPluginVodImageAvailable",
+            "SeasonPluginVodImageAvailable",
+        ]
+        .iter()
+        .any(|field| {
+            json_field_case_insensitive(metadata, field).and_then(serde_json::Value::as_bool)
+                == Some(true)
+        })
+    });
+    if provider_image_is_ready {
+        format!("provider-raster-v1-{item_id}")
+    } else {
+        default_primary_image_tag(item_id)
+    }
+}
+
 fn generated_folder_primary_image_tag(item_id: &str) -> String {
     format!("generated-raster-v1-{item_id}")
 }
@@ -57297,7 +57317,7 @@ fn media_item_to_json_with_playback_and_metadata(
 ) -> serde_json::Value {
     let item_type = media_item_type(item);
     let item_id = item.id.simple().to_string();
-    let image_tag = default_primary_image_tag(&item_id);
+    let image_tag = primary_image_tag_for_metadata(&item_id, metadata);
     let container = media_item_container(item);
     let file_name = media_item_file_name(item);
     let file_size = media_item_file_size(item);
@@ -65343,6 +65363,14 @@ mod tests {
             super::default_primary_image_tag(item_id),
             format!("generated-raster-v1-{item_id}"),
             "the image tag must invalidate the legacy transparent fallback cache"
+        );
+        assert_eq!(
+            super::primary_image_tag_for_metadata(
+                item_id,
+                Some(&serde_json::json!({ "PluginVodImageAvailable": true })),
+            ),
+            format!("provider-raster-v1-{item_id}"),
+            "resolved provider art must have a distinct client cache key"
         );
         let response = generated_item_placeholder_response(item_id, "Primary", 0);
         assert_eq!(
