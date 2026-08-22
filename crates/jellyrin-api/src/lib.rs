@@ -52292,8 +52292,17 @@ async fn authenticated_item_sidecars(
     kind: SidecarKind,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    let item = media_item_by_id(&state.db, &item_id).await?;
-    local_sidecar_result(&state.db, &item, user.id, kind).await
+    match media_item_by_id(&state.db, &item_id).await {
+        Ok(item) => local_sidecar_result(&state.db, &item, user.id, kind).await,
+        Err(error) if error.status() == StatusCode::NOT_FOUND => {
+            if live_tv_item_exists(&state.db, &item_id).await? {
+                Ok(empty_sidecar_result())
+            } else {
+                Err(error)
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 
 async fn authenticated_item_sidecar_list(
@@ -52304,8 +52313,17 @@ async fn authenticated_item_sidecar_list(
     kind: SidecarKind,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
     let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    let item = media_item_by_id(&state.db, &item_id).await?;
-    local_sidecar_list(&state.db, &item, user.id, kind).await
+    match media_item_by_id(&state.db, &item_id).await {
+        Ok(item) => local_sidecar_list(&state.db, &item, user.id, kind).await,
+        Err(error) if error.status() == StatusCode::NOT_FOUND => {
+            if live_tv_item_exists(&state.db, &item_id).await? {
+                Ok(Json(Vec::new()))
+            } else {
+                Err(error)
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 
 async fn user_item_sidecars(
@@ -52319,8 +52337,32 @@ async fn user_item_sidecars(
     let auth_user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
     let user_id = resolve_user_id(&user_id)?;
     ensure_user_access(&auth_user, user_id)?;
-    let item = media_item_by_id(&state.db, &item_id).await?;
-    local_sidecar_result(&state.db, &item, user_id, kind).await
+    match media_item_by_id(&state.db, &item_id).await {
+        Ok(item) => local_sidecar_result(&state.db, &item, user_id, kind).await,
+        Err(error) if error.status() == StatusCode::NOT_FOUND => {
+            if live_tv_item_exists(&state.db, &item_id).await? {
+                Ok(empty_sidecar_result())
+            } else {
+                Err(error)
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn live_tv_item_exists(db: &Database, item_id: &str) -> Result<bool, ApiError> {
+    if live_tv_channel_optional_by_id(db, item_id).await?.is_some() {
+        return Ok(true);
+    }
+    Ok(live_tv_program_by_id(db, item_id).await?.is_some())
+}
+
+fn empty_sidecar_result() -> Json<serde_json::Value> {
+    Json(query_result_with_total(
+        Vec::<serde_json::Value>::new(),
+        0,
+        0,
+    ))
 }
 
 async fn local_sidecar_list(
@@ -93046,6 +93088,90 @@ done
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert_ne!(admin_id, viewer_id);
+    }
+
+    #[tokio::test]
+    async fn live_tv_items_return_empty_sidecars_instead_of_not_found() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("live-sidecar-user".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "live-sidecar-key")
+            .await
+            .unwrap();
+
+        let mut config = default_live_tv_configuration();
+        config["TunerHosts"] = serde_json::json!([{
+            "Id": "live-sidecar-tuner",
+            "FriendlyName": "Live sidecar tuner",
+            "Type": "m3u",
+            "Url": "http://127.0.0.1/live.m3u",
+            "Channels": [{
+                "Id": "live-sidecar-channel",
+                "Name": "Live sidecar channel",
+                "Number": "1",
+                "Path": "http://127.0.0.1/live.ts",
+                "ChannelType": "TV"
+            }]
+        }]);
+        db.update_named_configuration("livetv", live_tv_configuration_json(config))
+            .await
+            .unwrap();
+
+        let channel_id = crate::live_tv_channel_public_id("live-sidecar-channel");
+        let user_id = user.id.simple().to_string();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        for endpoint in [
+            format!("/Items/{channel_id}/Intros"),
+            format!("/Users/{user_id}/Items/{channel_id}/Intros"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let result: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(result["Items"], serde_json::json!([]));
+            assert_eq!(result["TotalRecordCount"], 0);
+            assert_eq!(result["StartIndex"], 0);
+        }
+
+        for endpoint in [
+            format!("/Items/{channel_id}/LocalTrailers"),
+            format!("/Items/{channel_id}/SpecialFeatures"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let result: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(result, serde_json::json!([]));
+        }
     }
 
     #[tokio::test]
