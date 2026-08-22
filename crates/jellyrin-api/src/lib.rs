@@ -53646,6 +53646,12 @@ async fn resolved_media_catalog_query_for_filter_values(
     db_query.search_scope = MediaItemCatalogSearchScope::AllMetadataScalars;
 
     let Some(parent_id) = query.parent_id.as_deref() else {
+        db_query.virtual_folder_ids = db
+            .virtual_folders()
+            .await?
+            .into_iter()
+            .map(|folder| folder.id)
+            .collect();
         return Ok(Some(db_query));
     };
     if special_user_view_collection_type_for_parent(Some(parent_id)).is_some()
