@@ -61397,6 +61397,20 @@ fn placeholder_png_response() -> axum::response::Response {
         .into_response()
 }
 
+/// A missing movie or episode poster must still be visible in television clients. Wholphin and
+/// Jellyfin Android TV render the historical transparent-pixel fallback as a permanently loading
+/// grey card, which makes a healthy catalog look broken when an upstream provider has stale
+/// artwork. Use deterministic raster artwork for item routes while retaining the tiny transparent
+/// response for branding and other non-catalog compatibility endpoints.
+fn generated_item_placeholder_response(
+    item_id: &str,
+    image_type: &str,
+    image_index: usize,
+) -> axum::response::Response {
+    let placeholder_key = format!("missing-item-image-v1:{image_type}:{image_index}");
+    live_tv_generated_image_response(&serde_json::Value::Null, item_id, &placeholder_key)
+}
+
 pub(crate) enum ImageOwner<'a> {
     Item(&'a str),
     User(&'a str),
@@ -62043,7 +62057,11 @@ async fn item_image_or_placeholder(
         {
             return Ok(response);
         }
-        return Ok(placeholder_png_response());
+        return Ok(generated_item_placeholder_response(
+            item_id,
+            image_type,
+            image_index,
+        ));
     }
     if let Some(response) =
         virtual_folder_image_response(&state.db, item_id, image_type, image_index).await?
@@ -62072,7 +62090,11 @@ async fn item_image_or_placeholder(
             {
                 return Ok(response);
             }
-            return Ok(placeholder_png_response());
+            return Ok(generated_item_placeholder_response(
+                item_id,
+                image_type,
+                image_index,
+            ));
         }
         Err(error) => return Err(error),
     };
@@ -62130,7 +62152,11 @@ async fn item_image_or_placeholder(
     {
         return stored_image_response_sized(state, generated_image, resize).await;
     }
-    Ok(placeholder_png_response())
+    Ok(generated_item_placeholder_response(
+        item_id,
+        image_type,
+        image_index,
+    ))
 }
 
 struct ItemImageRequest<'a> {
@@ -65203,12 +65229,12 @@ mod tests {
         enrich_media_streams_with_context, ensure_package_install_not_cancelled,
         external_id_infos_for_item_type, ffmpeg_job_allowed_for_mode, ffmpeg_listing_components,
         filter_package_list, format_time_for_json, generate_missing_hls_segment,
-        get_valid_filename, hdhomerun_bool_field, hls_effective_start_position_ticks,
-        hls_event_playlist_required, hls_on_demand_generation_lock,
-        hls_segment_start_position_ticks, hls_segment_ticks, hls_start_segment_number,
-        hls_storage_segment_id, hls_subtitle_language_tag, hls_transcode_dedupe_key,
-        hls_transcode_session_input_path, internal_remote_relay_target, is_live_tv_channel_id,
-        json_string_field, json_value_i64, last_system_lifecycle_command,
+        generated_item_placeholder_response, get_valid_filename, hdhomerun_bool_field,
+        hls_effective_start_position_ticks, hls_event_playlist_required,
+        hls_on_demand_generation_lock, hls_segment_start_position_ticks, hls_segment_ticks,
+        hls_start_segment_number, hls_storage_segment_id, hls_subtitle_language_tag,
+        hls_transcode_dedupe_key, hls_transcode_session_input_path, internal_remote_relay_target,
+        is_live_tv_channel_id, json_string_field, json_value_i64, last_system_lifecycle_command,
         live_hls_session_registry, live_tv_channel_is_remote, live_tv_channel_media_source,
         live_tv_channel_stable_uuid, live_tv_configuration_json, live_tv_guide_info,
         live_tv_hls_transcoding_profile_supported, live_tv_lookup_id,
@@ -65296,6 +65322,31 @@ mod tests {
     use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn missing_catalog_artwork_is_a_visible_raster_tile() {
+        let response = generated_item_placeholder_response(
+            "11111111-2222-3333-4444-555555555555",
+            "Primary",
+            0,
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("image/png")
+        );
+        assert!(response.headers().contains_key(header::ETAG));
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert_eq!(u32::from_be_bytes(body[16..20].try_into().unwrap()), 512);
+        assert_eq!(u32::from_be_bytes(body[20..24].try_into().unwrap()), 512);
+        assert!(
+            body.len() > 1_000,
+            "catalog fallback must not be transparent"
+        );
+    }
 
     #[tokio::test]
     async fn direct_http_json_responses_are_gzip_compressed() {
