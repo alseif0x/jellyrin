@@ -34982,15 +34982,13 @@ async fn latest_items(
         )
     });
     let limit = latest_items_limit(&query);
+    let page = filtered_items.into_iter().take(limit).collect::<Vec<_>>();
+    queue_plugin_vod_artwork_prefetch_ids(
+        &state,
+        &page.iter().map(|item| item.id).collect::<Vec<_>>(),
+    );
     Ok(Json(
-        items_to_json(
-            &state.db,
-            filtered_items.into_iter().take(limit).collect(),
-            &server_id,
-            requested_user_id,
-            false,
-        )
-        .await?,
+        items_to_json(&state.db, page, &server_id, requested_user_id, false).await?,
     ))
 }
 
@@ -35038,15 +35036,13 @@ async fn current_user_latest_items(
         )
     });
     let limit = latest_items_limit(&query);
+    let page = filtered_items.into_iter().take(limit).collect::<Vec<_>>();
+    queue_plugin_vod_artwork_prefetch_ids(
+        &state,
+        &page.iter().map(|item| item.id).collect::<Vec<_>>(),
+    );
     Ok(Json(
-        items_to_json(
-            &state.db,
-            filtered_items.into_iter().take(limit).collect(),
-            &server_id,
-            Some(requested_user_id),
-            false,
-        )
-        .await?,
+        items_to_json(&state.db, page, &server_id, Some(requested_user_id), false).await?,
     ))
 }
 
@@ -35090,15 +35086,13 @@ async fn user_latest_items(
         )
     });
     let limit = latest_items_limit(&query);
+    let page = filtered_items.into_iter().take(limit).collect::<Vec<_>>();
+    queue_plugin_vod_artwork_prefetch_ids(
+        &state,
+        &page.iter().map(|item| item.id).collect::<Vec<_>>(),
+    );
     Ok(Json(
-        items_to_json(
-            &state.db,
-            filtered_items.into_iter().take(limit).collect(),
-            &server_id,
-            Some(requested_user_id),
-            false,
-        )
-        .await?,
+        items_to_json(&state.db, page, &server_id, Some(requested_user_id), false).await?,
     ))
 }
 
@@ -68846,7 +68840,6 @@ mod tests {
             local_address: "http://127.0.0.1:8097".to_string(),
         });
         let image_uri = format!("/Items/{}/Images/Primary", movie_id.simple());
-        let authenticated_image_uri = format!("{image_uri}?api_key={api_key}");
 
         // Public image routes may serve already-cached bytes, but cannot initiate a credentialed
         // provider call without an authenticated Jellyfin request.
@@ -68874,19 +68867,45 @@ mod tests {
             0
         );
 
+        let movies_folder_id = db
+            .virtual_folders()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|folder| folder.name == "VOD Provider Movies")
+            .expect("VOD movies folder")
+            .id;
         let response = app
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri(&authenticated_image_uri)
+                    .uri(format!(
+                        "/Items/Latest?ParentId={}&IncludeItemTypes=Movie&Limit=1",
+                        movies_folder_id.simple()
+                    ))
+                    .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let authenticated_body = response.into_body().collect().await.unwrap().to_bytes();
-        assert_eq!(authenticated_body.as_ref(), expected_image.as_slice());
+
+        // Jellyfin Web deliberately omits credentials from `<img>` URLs. The authenticated Latest
+        // listing must therefore queue the provider fill before the public image request arrives.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&image_uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let listing_warmed_body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(listing_warmed_body.as_ref(), expected_image.as_slice());
         let upstream_request = image_request.await.unwrap();
         assert!(upstream_request.starts_with(&format!("GET {image_url} HTTP/1.1")));
 
@@ -68896,7 +68915,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri(&authenticated_image_uri)
+                    .uri(&image_uri)
                     .body(Body::empty())
                     .unwrap(),
             )
