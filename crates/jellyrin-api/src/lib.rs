@@ -47088,7 +47088,6 @@ pub(crate) async fn subtitle_stream_response(
     route: SubtitleStreamRoute,
     query: SubtitleStreamQuery,
 ) -> Result<axum::response::Response, ApiError> {
-    let (user, token) = require_user(&state.db, headers, query._api_key.as_deref()).await?;
     let item_id = query.item_id.as_deref().unwrap_or(&route.item_id);
     let media_source_id = query
         .media_source_id
@@ -47118,6 +47117,17 @@ pub(crate) async fn subtitle_stream_response(
     let extraction_end_position_ticks = end_position_ticks;
 
     let item = subtitle_media_item(state, item_id, Some(media_source_id)).await?;
+    // Local and DLNA subtitle delivery historically works without a Jellyfin token because the
+    // media player follows sidecar URLs directly. Provider-backed VOD is different: resolving its
+    // short-lived remote subtitle requires the authenticated user/device context so the plugin can
+    // enforce source assignment and concurrent-device policy. Authenticate only that sensitive
+    // path, preserving the existing local subtitle contract.
+    let user_context = if is_plugin_vod_virtual_item(&item) {
+        let (user, token) = require_user(&state.db, headers, query._api_key.as_deref()).await?;
+        Some(plugin_user_context(&user, &token))
+    } else {
+        None
+    };
     let plugin_vod_output = plugin_vod_subtitle_output(
         state,
         &item,
@@ -47125,7 +47135,7 @@ pub(crate) async fn subtitle_stream_response(
         extraction_format,
         start_position_ticks,
         extraction_end_position_ticks,
-        Some(plugin_user_context(&user, &token)),
+        user_context,
     )
     .await?;
     let stream = if plugin_vod_output.is_none() {
@@ -68844,6 +68854,21 @@ mod tests {
             movie_id.simple(),
             api_key
         );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Videos/{0}/{0}/Subtitles/3/Stream.srt",
+                        movie_id.simple()
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
         let response = app
             .clone()
             .oneshot(
@@ -114394,9 +114419,14 @@ done
                 }
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
             }
-            panic!(
-                "legacy HLS stop must release tuner: {:?}",
-                events.lock().unwrap()
+            // The release requests can arrive during the final sleep. Check once more at the
+            // deadline so the assertion observes the full interval instead of an instant just
+            // before it.
+            let events = events.lock().unwrap().clone();
+            assert!(
+                events.iter().any(|event| event == "/tuner0/target=none")
+                    && events.iter().any(|event| event == "/tuner0/lockkey=none"),
+                "legacy HLS stop must release tuner: {events:?}"
             );
         }
 
