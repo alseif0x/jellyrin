@@ -22,6 +22,7 @@ async function main() {
   const catalogBenchmark = await fs.readFile(path.join(repoRoot, 'qa/postgres-catalog-benchmark.js'), 'utf8');
   const rootCargo = await fs.readFile(path.join(repoRoot, 'Cargo.toml'), 'utf8');
   const infrastructure = await fs.readFile(path.join(repoRoot, 'docker-compose.infrastructure.yml'), 'utf8');
+  const redisOverlay = await fs.readFile(path.join(repoRoot, 'docker-compose.redis-cache.yml'), 'utf8');
   const minimumStack = await fs.readFile(path.join(repoRoot, 'docs/minimum-stack.md'), 'utf8');
   const playbackBatchFunctions = [
     'async fn items_to_json',
@@ -50,6 +51,7 @@ async function main() {
     check('postgres-query-timeouts', db.includes('statement_timeout') && db.includes('lock_timeout')),
     check('direct-http-compression-without-required-proxy', rootCargo.includes('"compression-gzip"') && api.includes('.layer(CompressionLayer::new())') && api.includes('direct_http_json_responses_are_gzip_compressed') && minimumStack.includes('nginx u otro proxy inverso | Opcional')),
     check('shared-folder-counts-use-bounded-fail-open-cache', extractFunction(api, 'async fn user_views_result').includes('cached_media_item_counts_by_virtual_folder') && extractFunction(api, 'async fn user_views_result_legacy').includes('cached_media_item_counts_by_virtual_folder') && extractFunction(catalogCache, 'pub(crate) async fn cached_media_item_counts_by_virtual_folder').includes('media_item_counts_by_virtual_folder') && catalogCache.includes('MAX_CACHE_VALUE_BYTES') && catalogCache.includes('CacheLookup::Unavailable')),
+    check('compose-cache-overlay-mounts-credential-and-orders-health', redisOverlay.includes('JELLYRIN_REDIS_URL_FILE: /run/secrets/jellyrin-redis-url') && redisOverlay.includes('JELLYRIN_REDIS_URL_HOST_FILE') && redisOverlay.includes('condition: service_healthy') && !redisOverlay.includes('JELLYRIN_REDIS_URL:')),
     check('series-page-skips-unrequested-exact-total', extractFunction(api, 'async fn tv_series_items_result').includes('query_flag(&query._enable_total_record_count)') && extractFunction(postgresCatalog, 'pub async fn tv_series_catalog_search_page').includes('if include_total_record_count') && extractFunction(postgresCatalog, 'pub async fn tv_series_catalog_search_page').includes('"0::bigint"') && postgresCatalog.includes('assert_eq!(without_total.total_record_count, 0)')),
     check('postgres-resource-profile-is-parameterized-and-documented', infrastructure.includes('${POSTGRES_MEMORY_LIMIT:-512m}') && infrastructure.includes('${POSTGRES_SHARED_BUFFERS:-128MB}') && infrastructure.includes('${POSTGRES_EFFECTIVE_IO_CONCURRENCY:-1}') && minimumStack.includes('POSTGRES_MEMORY_LIMIT') && minimumStack.includes('POSTGRES_EFFECTIVE_IO_CONCURRENCY')),
     check('postgres-readiness-and-schema-health', db.includes('pub async fn health') && db.includes('pub async fn schema_health')),

@@ -60,6 +60,9 @@ sigue siendo seis conexiones interactivas y dos de worker.
 Para catálogos grandes, el perfil medido usa 128 MiB de datos dentro de un contenedor de 192 MiB,
 `allkeys-lru`, 64 clientes, persistencia desactivada y autenticación. Solo guarda proyecciones
 regenerables, nunca tokens, credenciales, URLs firmadas, progreso o asignaciones de usuario.
+El despliegue Compose debe añadir `docker-compose.redis-cache.yml`, definir
+`JELLYRIN_REDIS_URL_HOST_FILE` con un fichero `root:10001` modo `0440` y activar el profile
+`cache`/`distributed-cache`. Sin ese overlay, Redis puede ejecutarse pero Jellyrin no lo consume.
 
 ## Software y arquitecturas
 

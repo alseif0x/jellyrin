@@ -58,6 +58,9 @@ Release artifacts live under `ops/` plus the root Docker files:
 - `docker-compose.dlna.yml` is the optional DLNA/UPnP override. Use it with
   `docker compose -f docker-compose.yml -f docker-compose.dlna.yml up -d --build`
   when SSDP discovery must work from TVs or VLC on the LAN.
+- `docker-compose.redis-cache.yml` is the opt-in credential overlay for the Redis cache profile.
+  It mounts a protected URL file and waits for Redis health before Jellyrin starts; installations
+  that do not use Redis must not include this overlay.
 - `ops/jellyrin.service` depends on the separate `ops/jellyrin-migrate.service`;
   each reads a different root-owned PostgreSQL environment file.
 - `ops/nginx-jellyrin.test.kode.live.conf.example` is the reverse-proxy template;

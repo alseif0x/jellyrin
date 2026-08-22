@@ -1,0 +1,13 @@
+services:
+  jellyrin:
+    # Opt-in overlay for the Compose Redis profile. The URL contains authentication material and
+    # therefore enters the container as a protected read-only file, never as an environment value.
+    environment:
+      JELLYRIN_REDIS_URL_FILE: /run/secrets/jellyrin-redis-url
+      JELLYRIN_CATALOG_CACHE_TTL_SECONDS: ${JELLYRIN_CATALOG_CACHE_TTL_SECONDS:-30}
+      JELLYRIN_REDIS_COMMAND_TIMEOUT_MILLISECONDS: ${JELLYRIN_REDIS_COMMAND_TIMEOUT_MILLISECONDS:-20}
+    volumes:
+      - ${JELLYRIN_REDIS_URL_HOST_FILE:?set an absolute root:10001 mode 0440 Redis URL file}:/run/secrets/jellyrin-redis-url:ro
+    depends_on:
+      redis:
+        condition: service_healthy

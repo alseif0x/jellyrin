@@ -42,10 +42,12 @@ projections. `docs/redis-decision.md` records the benchmark, fail-open contract 
 thresholds:
 
 ```bash
-docker compose --profile distributed-cache up -d
+COMPOSE_FILE=docker-compose.yml:docker-compose.redis-cache.yml \
+  docker compose --profile distributed-cache up -d
 ```
 
-The profile fails closed unless `REDIS_PASSWORD` is set.
+The profile fails closed unless `REDIS_PASSWORD` and `JELLYRIN_REDIS_URL_HOST_FILE` are set. The URL
+file is mounted read-only and Jellyrin waits for Redis health before reading it.
 
 ## External or systemd deployment
 

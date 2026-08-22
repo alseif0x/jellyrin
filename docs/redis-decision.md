@@ -17,6 +17,8 @@ configuración es opcional mediante `JELLYRIN_REDIS_URL` o, preferiblemente con
 systemd, `JELLYRIN_REDIS_URL_FILE`. Compose conserva el profile explícito
 `cache`/`distributed-cache`, sin puerto publicado, autenticado, sin AOF/RDB y
 con `allkeys-lru`.
+Compose conecta Jellyrin mediante el overlay opt-in `docker-compose.redis-cache.yml`: monta la URL
+protegida, espera al healthcheck de Redis y evita que la credencial aparezca en el entorno.
 
 Los consumidores están deliberadamente acotados:
 
