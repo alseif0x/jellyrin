@@ -27419,6 +27419,105 @@ async fn enrich_plugin_vod_item_metadata(
     }
 }
 
+const PLUGIN_VOD_DETAIL_TRACK_CACHE_TTL: StdDuration = StdDuration::from_secs(5 * 60);
+const PLUGIN_VOD_DETAIL_TRACK_CACHE_MAX_ENTRIES: usize = 512;
+const PLUGIN_VOD_DETAIL_TRACK_RESOLUTION_TIMEOUT: StdDuration = StdDuration::from_secs(8);
+
+#[derive(Clone)]
+struct PluginVodDetailTrackCacheEntry {
+    expires_at: StdInstant,
+    media_streams: Vec<serde_json::Value>,
+}
+
+fn plugin_vod_detail_track_cache() -> &'static Mutex<HashMap<String, PluginVodDetailTrackCacheEntry>>
+{
+    static CACHE: OnceLock<Mutex<HashMap<String, PluginVodDetailTrackCacheEntry>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Adds the provider's safe track labels to an item detail response.
+///
+/// MAGSTV only reveals the authoritative audio/subtitle layout during playback resolution. The
+/// signed source URL remains inside the short-lived provider result and is dropped here; only the
+/// already-allowlisted descriptors are cached briefly in memory and exposed to clients. A failed
+/// or slow provider call degrades to the catalogue placeholders instead of failing the detail page.
+async fn enrich_plugin_vod_item_media_streams(
+    state: &AppState,
+    item: &mut MediaItem,
+    metadata: &serde_json::Value,
+    user_context: jellyrin_plugin_sdk::PluginUserContext,
+) {
+    if !is_plugin_vod_virtual_item(item) {
+        return;
+    }
+    let Some(reference) = plugin_vod_remote_reference(metadata) else {
+        return;
+    };
+    let cache_key = stable_entity_id(
+        "plugin-vod-detail-tracks",
+        &format!(
+            "{}:{}:{}",
+            item.id, user_context.user_id, user_context.device_id
+        ),
+    );
+    let now = StdInstant::now();
+    {
+        let mut cache = plugin_vod_detail_track_cache().lock().await;
+        cache.retain(|_, entry| entry.expires_at > now);
+        if let Some(entry) = cache.get(&cache_key) {
+            item.media_streams = entry.media_streams.clone();
+            return;
+        }
+    }
+
+    let resolved = tokio::time::timeout(
+        PLUGIN_VOD_DETAIL_TRACK_RESOLUTION_TIMEOUT,
+        resolve_plugin_vod_playback(
+            &state.db,
+            &reference.plugin_id,
+            &reference.tuner_id,
+            &reference.provider_reference,
+            Some(user_context),
+        ),
+    )
+    .await;
+    let playback = match resolved {
+        Ok(Ok(playback)) => playback,
+        Ok(Err(error)) => {
+            tracing::warn!(
+                status = %error.status(),
+                "VOD track enrichment was unavailable"
+            );
+            return;
+        }
+        Err(_) => {
+            tracing::warn!("VOD track enrichment timed out");
+            return;
+        }
+    };
+    if !opaque_live_tv_delivery_is_safe_for_direct_proxy(&playback) {
+        tracing::warn!("VOD track enrichment rejected an unsafe delivery contract");
+        return;
+    }
+    let mut media_streams = playback.media_streams.clone();
+    repair_plugin_vod_placeholder_codecs(&mut media_streams, &playback);
+    if media_streams.is_empty() {
+        return;
+    }
+    item.media_streams = media_streams.clone();
+    let mut cache = plugin_vod_detail_track_cache().lock().await;
+    if cache.len() < PLUGIN_VOD_DETAIL_TRACK_CACHE_MAX_ENTRIES {
+        cache.insert(
+            cache_key,
+            PluginVodDetailTrackCacheEntry {
+                expires_at: StdInstant::now() + PLUGIN_VOD_DETAIL_TRACK_CACHE_TTL,
+                media_streams,
+            },
+        );
+    }
+}
+
 async fn enrich_plugin_vod_virtual_metadata(
     state: &AppState,
     item_id: &str,
@@ -36462,6 +36561,7 @@ async fn item_detail(
                 .item;
         }
         enrich_plugin_vod_item_metadata(&state, &mut item, &mut metadata).await;
+        enrich_plugin_vod_item_media_streams(&state, &mut item, &metadata, user_context).await;
         return Ok(Json(media_item_to_json_with_playback_and_metadata(
             &item,
             &server_id,
@@ -36576,6 +36676,7 @@ async fn current_user_item_detail(
                 .item;
         }
         enrich_plugin_vod_item_metadata(&state, &mut item, &mut metadata).await;
+        enrich_plugin_vod_item_media_streams(&state, &mut item, &metadata, user_context).await;
         return Ok(Json(media_item_to_json_with_playback_and_metadata(
             &item,
             &server_id,
@@ -36678,6 +36779,7 @@ async fn user_item_detail(
                 .item;
         }
         enrich_plugin_vod_item_metadata(&state, &mut item, &mut metadata).await;
+        enrich_plugin_vod_item_media_streams(&state, &mut item, &metadata, user_context).await;
         return Ok(Json(media_item_to_json_with_playback_and_metadata(
             &item,
             &server_id,
@@ -38779,9 +38881,7 @@ async fn item_ancestors(
         return Ok(Json(vec![series_json, folder_json, root]));
     }
 
-    if let Some(series_name) =
-        series_name_for_id_from_snapshot(&tv_snapshot, &resolved_series_id)
-    {
+    if let Some(series_name) = series_name_for_id_from_snapshot(&tv_snapshot, &resolved_series_id) {
         let folder_id = tv_snapshot
             .items
             .iter()
@@ -49807,11 +49907,13 @@ async fn series_episodes(
         query.include_item_types.push("Episode".to_string());
     }
 
-    let (TvEpisodeCatalogSnapshot {
-        items,
-        metadata_by_item,
-    }, resolved_series_id) =
-        tv_episode_catalog_snapshot_scoped_to_series(&state.db, &series_id).await?;
+    let (
+        TvEpisodeCatalogSnapshot {
+            items,
+            metadata_by_item,
+        },
+        resolved_series_id,
+    ) = tv_episode_catalog_snapshot_scoped_to_series(&state.db, &series_id).await?;
     let candidate_episodes =
         filtered_media_items(items, &query, Some(requested_user_id), &state.db).await?;
     let mut episodes = candidate_episodes
@@ -49887,10 +49989,13 @@ async fn series_seasons_result(
     requested_user_id: Uuid,
     server_id: &str,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let (TvEpisodeCatalogSnapshot {
-        mut items,
-        metadata_by_item,
-    }, resolved_series_id) = tv_episode_catalog_snapshot_scoped_to_series(db, series_id).await?;
+    let (
+        TvEpisodeCatalogSnapshot {
+            mut items,
+            metadata_by_item,
+        },
+        resolved_series_id,
+    ) = tv_episode_catalog_snapshot_scoped_to_series(db, series_id).await?;
     if let Some(allowed_tuner_ids) = query.allowed_plugin_tuner_ids.as_ref() {
         items.retain(|item| {
             if !is_plugin_vod_virtual_item(item) {
@@ -49914,7 +50019,10 @@ async fn series_seasons_result(
         .collect::<Vec<_>>();
     let series_name = episodes
         .iter()
-        .find_map(|item| tv_episode_info(item).map(|info| info.series_name))
+        .find_map(|item| {
+            tv_episode_info_with_metadata(item, metadata_by_item.get(&item.id))
+                .map(|info| info.series_name)
+        })
         .ok_or_else(|| ApiError::not_found("Series not found"))?;
     let series_id = episodes
         .iter()
@@ -52719,6 +52827,11 @@ async fn local_sidecar_items(
     source: &MediaItem,
     kind: SidecarKind,
 ) -> Result<Vec<MediaItem>, ApiError> {
+    // Remote plugin-VOD entries cannot have filesystem sidecars. Avoid materialising the entire
+    // virtual folder for the extras requests that Jellyfin clients issue on every detail page.
+    if is_plugin_vod_virtual_item(source) {
+        return Ok(Vec::new());
+    }
     let mut items = db
         .media_items_for_virtual_folders(&[source.virtual_folder_id])
         .await?
@@ -53099,6 +53212,16 @@ async fn theme_items_result(
     media_type: &str,
     query: &ItemsQuery,
 ) -> Result<serde_json::Value, ApiError> {
+    // Opaque remote VOD paths cannot own local theme media. Returning the canonical empty result
+    // here keeps the detail-page fan-out bounded even for very large provider catalogues.
+    if is_plugin_vod_virtual_item(source) {
+        return Ok(theme_media_query_result(
+            Vec::new(),
+            0,
+            query.start_index.unwrap_or(0),
+            &source.id.simple().to_string(),
+        ));
+    }
     let server_id = db.server_state().await?.server_id.to_string();
     let mut theme_items = db
         .media_items_for_virtual_folders(&[source.virtual_folder_id])
@@ -53129,6 +53252,14 @@ async fn soundtrack_items_result(
     user_id: Uuid,
     query: &ItemsQuery,
 ) -> Result<serde_json::Value, ApiError> {
+    if is_plugin_vod_virtual_item(source) {
+        return Ok(theme_media_query_result(
+            Vec::new(),
+            0,
+            query.start_index.unwrap_or(0),
+            &source.id.simple().to_string(),
+        ));
+    }
     let entries =
         MediaCatalogStore::media_items_with_metadata_by_effective_types(db, &["Audio".to_string()])
             .await?;
@@ -53328,11 +53459,13 @@ async fn authenticated_similar_show_items(
     items_query.sort_by = None;
     items_query.sort_order = None;
 
-    let (TvEpisodeCatalogSnapshot {
-        items,
-        metadata_by_item,
-    }, resolved_series_id) =
-        tv_episode_catalog_snapshot_scoped_to_series(&state.db, &item_id).await?;
+    let (
+        TvEpisodeCatalogSnapshot {
+            items,
+            metadata_by_item,
+        },
+        resolved_series_id,
+    ) = tv_episode_catalog_snapshot_scoped_to_series(&state.db, &item_id).await?;
     let candidate_episodes =
         filtered_media_items(items, &items_query, Some(requested_user_id), &state.db).await?;
     let mut episodes = candidate_episodes
@@ -60378,6 +60511,11 @@ fn tv_episode_info_with_metadata(
     let Some(metadata) = metadata else {
         return Some(info);
     };
+    if let Some(series_name) = first_metadata_value_from_json(metadata, &["SeriesName"])
+        .filter(|name| !name.trim().is_empty())
+    {
+        info.series_name = series_name;
+    }
     if let Some(season_number) = metadata_i32_field(metadata, &["ParentIndexNumber"]) {
         info.season_number = Some(season_number);
     }
@@ -62610,6 +62748,7 @@ async fn virtual_tv_item_image_response(
     // none, so fall back to the series anchor's stored image instead of leaving a blank card. The
     // anchor is where the provider artwork was cached, which is why looking it up by the season's
     // own id above cannot find it.
+    let mut seen_series_ids = HashSet::new();
     for item in &snapshot.items {
         let Some(series_id) = snapshot
             .metadata_by_item
@@ -62620,6 +62759,33 @@ async fn virtual_tv_item_image_response(
         };
         if series_id.eq_ignore_ascii_case(item_id) {
             continue;
+        }
+        if !seen_series_ids.insert(series_id.clone()) {
+            continue;
+        }
+        // Provider artwork is cached against the public Series row exposed in the catalogue,
+        // while the synthetic Season points at its canonical SeriesId. Resolve that indexed
+        // relationship and reuse the already-cached poster before trying the legacy canonical
+        // owner id.
+        if let Some(series_snapshot) =
+            tv_episode_catalog_snapshot_for_series(&state.db, &series_id).await?
+        {
+            for anchor in &series_snapshot.items {
+                let Some(metadata) = series_snapshot.metadata_by_item.get(&anchor.id) else {
+                    continue;
+                };
+                if !plugin_vod_series_anchor_matches(anchor, metadata, &series_id) {
+                    continue;
+                }
+                let anchor_id = anchor.id.simple().to_string();
+                if let Some(path) =
+                    find_stored_image(state, ImageOwner::Item(&anchor_id), image_type, 0).await?
+                {
+                    return stored_image_response_sized(state, path, resize)
+                        .await
+                        .map(Some);
+                }
+            }
         }
         if let Some(path) =
             find_stored_image(state, ImageOwner::Item(&series_id), image_type, 0).await?
@@ -69458,6 +69624,24 @@ mod tests {
                 detail["MediaSources"][0]["RunTimeTicks"],
                 expected_runtime_ticks
             );
+            let detail_text = serde_json::to_string(&detail).unwrap();
+            for secret in [
+                "signed-vod-secret",
+                "signed-subtitle-secret",
+                "vod-user",
+                "vod-pass",
+                "vod-canary-token-0123456789",
+            ] {
+                assert!(!detail_text.contains(secret), "{detail_text}");
+            }
+            let detail_streams = detail["MediaSources"][0]["MediaStreams"]
+                .as_array()
+                .unwrap();
+            assert_eq!(detail_streams.len(), 4);
+            assert_eq!(detail_streams[1]["Language"], "spa");
+            assert_eq!(detail_streams[2]["Language"], "eng");
+            assert_eq!(detail_streams[3]["Type"], "Subtitle");
+            assert_eq!(detail_streams[3]["Language"], "spa");
             let persisted = db
                 .media_item_by_id_visible(item_id)
                 .await
@@ -101111,6 +101295,7 @@ done
 
     #[tokio::test]
     async fn plugin_series_anchor_id_resolves_to_its_canonical_series_for_seasons() {
+        let storage = tempfile::tempdir().unwrap();
         let db = Database::connect("sqlite::memory:").await.unwrap();
         let user = db
             .update_first_user("admin".to_string(), "secret")
@@ -101170,12 +101355,23 @@ done
         )
         .await
         .unwrap();
-        let app = router(AppState {
-            db,
+        let state = AppState {
+            db: db.clone(),
             web_dir: ".".into(),
-            log_dir: ".".into(),
+            log_dir: storage.path().join("logs"),
             local_address: "http://127.0.0.1:8097".to_string(),
-        });
+        };
+        let expected_image = test_distinct_png_bytes();
+        super::store_image_bytes(
+            &state,
+            super::ImageOwner::Item(&anchor_id),
+            "Primary",
+            0,
+            expected_image.clone(),
+        )
+        .await
+        .unwrap();
+        let app = router(state);
 
         for endpoint in [
             format!(
@@ -101195,18 +101391,67 @@ done
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
-            let seasons: Value = serde_json::from_slice(
-                &response.into_body().collect().await.unwrap().to_bytes(),
-            )
-            .unwrap();
+            let seasons: Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
             assert_eq!(seasons["TotalRecordCount"], 1, "{endpoint}");
             assert_eq!(seasons["Items"][0]["Type"], "Season", "{endpoint}");
             assert_eq!(seasons["Items"][0]["ChildCount"], 2, "{endpoint}");
+            assert_eq!(
+                seasons["Items"][0]["SeriesName"], "Anchored Show",
+                "{endpoint}"
+            );
             assert_eq!(
                 seasons["Items"][0]["SeriesId"], canonical_series_id,
                 "{endpoint}"
             );
         }
+
+        for endpoint in [
+            format!("/Items/{anchor_id}/SpecialFeatures"),
+            format!("/Items/{anchor_id}/ThemeSongs?InheritFromParent=false"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(&endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            let body: Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            if let Some(items) = body.as_array() {
+                assert!(items.is_empty(), "{endpoint}");
+            } else {
+                assert_eq!(body["TotalRecordCount"], 0, "{endpoint}");
+                assert!(body["Items"].as_array().unwrap().is_empty(), "{endpoint}");
+            }
+        }
+
+        let image_response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items/{season_id}/Images/Primary"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(image_response.status(), StatusCode::OK);
+        let image_body = image_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(image_body.as_ref(), expected_image.as_slice());
     }
 
     #[tokio::test]

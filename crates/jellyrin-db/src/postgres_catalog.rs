@@ -1765,12 +1765,9 @@ impl PostgresDatabase {
     /// The same candidates restricted to one persisted `SeasonId`.
     ///
     /// Opening a season otherwise materializes every episode in the library just to keep the
-    /// handful
-    /// that belong to it. There is no index on this expression, but evaluating it over the visible
-    /// TV
-    /// rows costs a fraction of transferring their stream payloads, and the remaining predicates
-    /// match
-    /// `tv_series_lookup_candidates` exactly so the result is a strict subset of it.
+    /// handful that belong to it. The partial index on `btrim(metadata->>'SeasonId')` keeps this
+    /// lookup bounded; the remaining predicates match `tv_series_lookup_candidates` exactly so
+    /// the result is a strict subset of it.
     pub async fn tv_series_lookup_candidates_for_season(
         &self,
         season_id: &str,
