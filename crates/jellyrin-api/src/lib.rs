@@ -40354,31 +40354,31 @@ fn apply_plugin_vod_stream_selection_hls_policy(
     client: &str,
     options: &mut PlaybackInfoOptions,
 ) {
-    if !is_plugin_vod_remote_media(metadata)
-        || !plugin_vod_has_nondefault_stream_selection(item, options)
-        || !plugin_vod_tv_client_requires_selected_hls(client)
+    if !is_plugin_vod_remote_media(metadata) || !plugin_vod_tv_client_requires_selected_hls(client)
     {
         return;
     }
-    options.plugin_vod_selection_hls = true;
-    // Wholphin only installs a text-track selection listener for an explicitly external
-    // subtitle. For a transcoded source it otherwise trusts Media3's default HLS rendition,
-    // while the app's previously disabled text-track state wins and the selected rendition is
-    // never requested. Plugin VOD subtitles are independent JIT-resolved resources, so expose
-    // them through Jellyfin's ordinary authenticated WebVTT contract for this client. A/V still
-    // uses HLS to apply the requested audio track; the provider URL remains behind the internal
-    // relay and the subtitle reference is resolved only by the authenticated subtitle route.
-    if client.trim().eq_ignore_ascii_case("Wholphin")
-        && options
-            .subtitle_stream_index
-            .is_some_and(|subtitle_stream_index| subtitle_stream_index >= 0)
-    {
+    // Wholphin and Jellyfin Android TV both construct external Media3 subtitle sources before
+    // playback starts. An HLS/Embed descriptor is instead matched against rendition groups in the
+    // A/V manifest; MAGSTV subtitles are independent JIT resources and have no such embedded
+    // group. Advertise every text track through Jellyfin's authenticated WebVTT contract from the
+    // initial PlaybackInfo response, so changing subtitle selection can take effect in place.
+    if item.media_streams.iter().any(|stream| {
+        json_string_field(stream, "Type")
+            .is_some_and(|stream_type| stream_type.eq_ignore_ascii_case("Subtitle"))
+            && json_string_field(stream, "Codec")
+                .is_some_and(|codec| is_text_subtitle_codec(&codec))
+    }) {
         options.subtitle_profiles = Some(vec![SubtitleProfileMatcher {
             format: Some("webvtt".to_string()),
             method: Some("external".to_string()),
         }]);
         options.hls_subtitles_as_embedded = false;
     }
+    if !plugin_vod_has_nondefault_stream_selection(item, options) {
+        return;
+    }
+    options.plugin_vod_selection_hls = true;
     if !playback_profile_video_codec_compatible(item, options) {
         return;
     }
@@ -57560,7 +57560,10 @@ fn primary_image_tag_for_metadata(item_id: &str, metadata: Option<&serde_json::V
         })
     });
     if provider_image_is_ready {
-        format!("provider-raster-v1-{item_id}")
+        // v2 invalidates television-client entries created while the provider image was still
+        // being hydrated. Those clients cache by tag and otherwise keep the earlier placeholder
+        // even after the durable provider raster becomes available.
+        format!("provider-raster-v2-{item_id}")
     } else {
         default_primary_image_tag(item_id)
     }
@@ -57962,9 +57965,22 @@ fn apply_media_item_metadata(
             serde_json::json!({ "Primary": primary_tag }),
         );
     }
-    if let Some(series_primary_tag) =
-        first_metadata_value_from_json(metadata, &["SeriesPrimaryImageTag"])
-    {
+    let series_primary_tag = first_metadata_value_from_json(metadata, &["SeriesPrimaryImageTag"])
+        .or_else(|| {
+            // Jellyfin Android TV deliberately uses the series poster for portrait episode cards.
+            // Plugin catalogues persist that poster under the virtual Series owner, so advertise
+            // its deterministic tag even when the provider did not supply an explicit tag field.
+            // The authenticated image route resolves/caches the provider raster on first use.
+            (media_item_type(item) == "Episode" && is_plugin_vod_remote_media(Some(metadata)))
+                .then(|| {
+                    object
+                        .get("SeriesId")
+                        .and_then(serde_json::Value::as_str)
+                        .map(default_primary_image_tag)
+                })
+                .flatten()
+        });
+    if let Some(series_primary_tag) = series_primary_tag {
         object.insert(
             "SeriesPrimaryImageTag".to_string(),
             serde_json::Value::String(series_primary_tag),
@@ -65800,7 +65816,7 @@ mod tests {
                 item_id,
                 Some(&serde_json::json!({ "PluginVodImageAvailable": true })),
             ),
-            format!("provider-raster-v1-{item_id}"),
+            format!("provider-raster-v2-{item_id}"),
             "resolved provider art must have a distinct client cache key"
         );
         let response = generated_item_placeholder_response(item_id, "Primary", 0);
@@ -65819,6 +65835,40 @@ mod tests {
         assert!(
             body.len() > 1_000,
             "catalog fallback must not be transparent"
+        );
+    }
+
+    #[test]
+    fn plugin_episode_advertises_its_virtual_series_poster_to_android_tv() {
+        let series_id = Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_8888);
+        let episode = tv_refresh_test_item(
+            42,
+            Uuid::from_u128(7),
+            "Example S01E01",
+            "/Example/Season 01/Example S01E01.mkv",
+            "Video",
+            Some("tvshows"),
+        );
+        let metadata = serde_json::json!({
+            "Provider": "plugin:example",
+            "TunerId": "test-tuner",
+            "ProviderReference": "provider:v1:episode-1",
+            "PluginVodKind": "episode",
+            "SeriesId": series_id.simple().to_string(),
+            "SeriesName": "Example"
+        });
+
+        let value = super::media_item_to_json_with_playback_and_metadata(
+            &episode,
+            "server",
+            None,
+            Some(&metadata),
+        );
+
+        assert_eq!(value["SeriesId"], series_id.simple().to_string());
+        assert_eq!(
+            value["SeriesPrimaryImageTag"],
+            super::default_primary_image_tag(&series_id.simple().to_string())
         );
     }
 
@@ -110415,6 +110465,43 @@ done
         assert!(!super::selected_text_subtitle_can_use_external(
             &item, &native
         ));
+
+        let mut android_tv_initial = playback_info_options_from_body(&json!({
+            "EnableDirectPlay": true,
+            "EnableDirectStream": true,
+            "EnableTranscoding": true,
+            "SubtitleStreamIndex": -1,
+            "DeviceProfile": {
+                "DirectPlayProfiles": [{
+                    "Container": "ts,mpegts",
+                    "Type": "Video",
+                    "VideoCodec": "h264,hevc,mpeg2video",
+                    "AudioCodec": "aac,mp2,mp3,ac3,eac3"
+                }],
+                "TranscodingProfiles": [{
+                    "Container": "ts", "Type": "Video", "VideoCodec": "h264",
+                    "AudioCodec": "aac", "Protocol": "hls", "Context": "Streaming"
+                }],
+                "SubtitleProfiles": [{ "Format": "webvtt", "Method": "Hls" }]
+            }
+        }));
+        super::apply_plugin_vod_stream_selection_hls_policy(
+            &item,
+            Some(&metadata),
+            "Jellyfin Android TV",
+            &mut android_tv_initial,
+        );
+        assert!(super::text_subtitle_profile_supports_external(
+            &item,
+            &android_tv_initial
+        ));
+        assert!(!super::selected_text_subtitle_prefers_hls(
+            &android_tv_initial
+        ));
+        assert!(
+            !android_tv_initial.plugin_vod_selection_hls,
+            "initial playback only needs external subtitle sources, not an A/V restart"
+        );
 
         let mut selected_native_item = item.clone();
         selected_native_item.media_streams[0]["Codec"] = json!("hevc");
