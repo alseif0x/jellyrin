@@ -25143,6 +25143,22 @@ fn live_tv_program_datetime(program: &serde_json::Value, field: &str) -> Option<
     json_string_field(program, field).and_then(|value| OffsetDateTime::parse(&value, &Rfc3339).ok())
 }
 
+fn apply_live_tv_program_runtime_ticks(program: &mut serde_json::Value) {
+    if json_i64_field(program, "RunTimeTicks").is_some_and(|ticks| ticks >= 0) {
+        return;
+    }
+    let Some(start) = live_tv_program_datetime(program, "StartDate") else {
+        return;
+    };
+    let Some(end) = live_tv_program_datetime(program, "EndDate") else {
+        return;
+    };
+    let ticks = (end - start).whole_nanoseconds().max(0) / 100;
+    if let Ok(ticks) = i64::try_from(ticks) {
+        program["RunTimeTicks"] = serde_json::json!(ticks);
+    }
+}
+
 async fn live_tv_recording_stream(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -29057,8 +29073,9 @@ fn live_tv_fallback_program_items(
     channel_ids: &[String],
     server_id: &str,
 ) -> Vec<serde_json::Value> {
-    let start = OffsetDateTime::now_utc() - Duration::hours(12);
-    let end = OffsetDateTime::now_utc() + Duration::hours(12);
+    let now = OffsetDateTime::now_utc();
+    let start = now - Duration::hours(12);
+    let end = now + Duration::hours(12);
     let start_date = format_time_for_json(start);
     let end_date = format_time_for_json(end);
     channels
@@ -29126,6 +29143,7 @@ fn live_tv_fallback_program_item(
     if let Some(image_url) = live_tv_image_url(channel) {
         program["ImageUrl"] = serde_json::json!(image_url);
     }
+    apply_live_tv_program_runtime_ticks(&mut program);
     apply_live_tv_image_metadata(&mut program);
     for key in [
         "Genres",
@@ -29328,6 +29346,7 @@ fn live_tv_program_item(
         .cloned()
         .or_else(|| base.get("Description").cloned())
         .unwrap_or_else(|| serde_json::json!(""));
+    apply_live_tv_program_runtime_ticks(&mut base);
     if live_tv_image_url(&base).is_none()
         && let Some(channel_image_url) = channels
             .iter()
@@ -81477,6 +81496,10 @@ done
         assert_eq!(fallback_programs["Items"][0]["ChannelName"], "News HD");
         assert_eq!(fallback_programs["Items"][0]["IsLive"], true);
         assert_eq!(fallback_programs["Items"][0]["IsNews"], true);
+        assert_eq!(
+            fallback_programs["Items"][0]["RunTimeTicks"],
+            864_000_000_000_i64
+        );
         let fallback_program_id = fallback_programs["Items"][0]["Id"].as_str().unwrap();
 
         let response = app
