@@ -40355,6 +40355,24 @@ fn apply_plugin_vod_stream_selection_hls_policy(
         return;
     }
     options.plugin_vod_selection_hls = true;
+    // Wholphin only installs a text-track selection listener for an explicitly external
+    // subtitle. For a transcoded source it otherwise trusts Media3's default HLS rendition,
+    // while the app's previously disabled text-track state wins and the selected rendition is
+    // never requested. Plugin VOD subtitles are independent JIT-resolved resources, so expose
+    // them through Jellyfin's ordinary authenticated WebVTT contract for this client. A/V still
+    // uses HLS to apply the requested audio track; the provider URL remains behind the internal
+    // relay and the subtitle reference is resolved only by the authenticated subtitle route.
+    if client.trim().eq_ignore_ascii_case("Wholphin")
+        && options
+            .subtitle_stream_index
+            .is_some_and(|subtitle_stream_index| subtitle_stream_index >= 0)
+    {
+        options.subtitle_profiles = Some(vec![SubtitleProfileMatcher {
+            format: Some("webvtt".to_string()),
+            method: Some("external".to_string()),
+        }]);
+        options.hls_subtitles_as_embedded = false;
+    }
     if !playback_profile_video_codec_compatible(item, options) {
         return;
     }
@@ -110233,6 +110251,11 @@ done
             "Wholphin",
             &mut selected_native,
         );
+        assert!(super::selected_text_subtitle_can_use_external(
+            &selected_native_item,
+            &selected_native,
+        ));
+        assert!(!super::selected_text_subtitle_prefers_hls(&selected_native,));
         let selected_native_decision = playback_delivery_decision_with_ffmpeg_mode(
             &selected_native_item,
             Some(&metadata),
@@ -110245,6 +110268,29 @@ done
         );
         assert_eq!(selected_native_decision.video, HlsStreamMode::Copy);
         assert_eq!(selected_native_decision.audio, HlsStreamMode::Encode);
+
+        let mut selected_native_source = json!({
+            "IsRemote": true,
+            "MediaStreams": selected_native_item.media_streams.clone(),
+        });
+        super::apply_hls_transcode_stream_contract(
+            selected_native_source.as_object_mut().unwrap(),
+            "Video",
+            "secret-token",
+            "movie-id",
+            "play-session",
+            &selected_native,
+            &selected_native_decision,
+        );
+        let selected_subtitle = &selected_native_source["MediaStreams"][3];
+        assert_eq!(selected_subtitle["DeliveryMethod"], "External");
+        assert_eq!(selected_subtitle["IsExternal"], true);
+        assert_eq!(selected_subtitle["SupportsExternalStream"], true);
+        assert!(
+            selected_subtitle["DeliveryUrl"]
+                .as_str()
+                .is_some_and(|url| url.contains("/Subtitles/3/Stream.vtt?"))
+        );
 
         let mut initial_native_source = json!({ "MediaStreams": item.media_streams.clone() });
         if super::text_subtitle_profile_supports_external(&item, &native) {
