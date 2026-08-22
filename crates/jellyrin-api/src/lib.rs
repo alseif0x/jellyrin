@@ -34475,7 +34475,8 @@ async fn parent_virtual_items(
         let series_id = summary.id();
         let series_name = summary.source_name.clone();
         values.push(tv_series_json(server_id, summary));
-        if let Some(seasons) = seasons_by_series.remove(&series_name) {
+        if let Some(mut seasons) = seasons_by_series.remove(&series_name) {
+            present_unnumbered_season_as_first(&mut seasons);
             for season in seasons.into_values() {
                 values.push(tv_season_json(server_id, &series_name, &series_id, season));
             }
@@ -49576,6 +49577,7 @@ async fn series_seasons(
             entry.merge_episode_metadata(metadata);
         }
     }
+    present_unnumbered_season_as_first(&mut seasons);
     let server_id = state.db.server_state().await?.server_id.to_string();
     let mut season_items = seasons
         .into_values()
@@ -60153,6 +60155,24 @@ impl TvSeasonSummary {
             }
         }
     }
+}
+
+/// Presents a series whose provider ships no season numbering as a single season one.
+///
+/// An unnumbered episode is not the same as an episode in an unknown season. When a provider omits
+/// numbering entirely — 3,610 of the series in a real imported catalogue — every episode parses as
+/// unnumbered and the series showed one "Season Unknown" folder, which is wrong for the shape it
+/// actually has: a flat run of episodes that is season one. A series that mixes numbered and
+/// unnumbered episodes keeps its unknown bucket, because there the gap is real information.
+fn present_unnumbered_season_as_first(seasons: &mut BTreeMap<Option<i32>, TvSeasonSummary>) {
+    if seasons.len() != 1 || !seasons.contains_key(&None) {
+        return;
+    }
+    let Some(mut summary) = seasons.remove(&None) else {
+        return;
+    };
+    summary.season_number = Some(1);
+    seasons.insert(Some(1), summary);
 }
 
 fn tv_season_json(
