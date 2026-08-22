@@ -33888,6 +33888,86 @@ async fn random_movie_series_items_result(
     ))))
 }
 
+/// Resolve the direct `Series -> Season` `/Items` shape used by Wholphin without loading the
+/// complete media catalogue. Jellyfin's own clients normally use `/Shows/{id}/Seasons`, while
+/// Wholphin asks for the same projection through `/Items?ParentId=...&IncludeItemTypes=Season`.
+fn direct_parent_seasons_series_id(query: &ItemsQuery) -> Option<&str> {
+    let include_types = csv_values_lowercase(&query.include_item_types)?;
+    if include_types != ["season"]
+        || query.recursive == Some(true)
+        || query.ids.is_some()
+        || query.season_id.is_some()
+        || query.series_id.is_some()
+        || !query.exclude_item_types.is_empty()
+        || !query.media_types.is_empty()
+        || !query.containers.is_empty()
+        || !query.video_types.is_empty()
+        || !query.audio_languages.is_empty()
+        || !query.subtitle_languages.is_empty()
+        || !query.person_ids.is_empty()
+        || !query.genre_ids.is_empty()
+        || !query.studio_ids.is_empty()
+        || !query.official_ratings.is_empty()
+        || !query.tags.is_empty()
+        || !query.series_status.is_empty()
+        || !query.years.is_empty()
+        || !query.filters.is_empty()
+        || query.search_term.is_some()
+        || query.is_played.is_some()
+        || query.is_favorite.is_some()
+        || query.is_airing.is_some()
+        || query.is_folder.is_some()
+        || query.has_subtitles.is_some()
+        || query.has_trailer.is_some()
+        || query.has_overview.is_some()
+        || query.has_imdb_id.is_some()
+        || query.has_tmdb_id.is_some()
+        || query.has_tvdb_id.is_some()
+        || query.is_hd.is_some()
+        || query.is_4k.is_some()
+        || query.min_width.is_some()
+        || query.max_width.is_some()
+        || query.min_height.is_some()
+        || query.max_height.is_some()
+        || query.is_missing.is_some()
+        || query.is_unaired.is_some()
+        || query.has_official_rating.is_some()
+        || query.is_locked.is_some()
+        || query.min_community_rating.is_some()
+        || query.max_community_rating.is_some()
+        || query.min_critic_rating.is_some()
+        || query.max_critic_rating.is_some()
+        || query.min_premiere_date.is_some()
+        || query.max_premiere_date.is_some()
+        || query.min_date_created.is_some()
+        || query.max_date_created.is_some()
+        || query.min_date_last_saved.is_some()
+        || query.max_date_last_saved.is_some()
+        || query.name_starts_with.is_some()
+        || query.name_starts_with_or_greater.is_some()
+        || query.name_less_than.is_some()
+        || !query.location_types.is_empty()
+        || !query.exclude_location_types.is_empty()
+    {
+        return None;
+    }
+    query.parent_id.as_deref()
+}
+
+async fn parent_series_seasons_items_result(
+    db: &Database,
+    query: &ItemsQuery,
+    user_id: Uuid,
+    server_id: &str,
+) -> Result<Option<Json<serde_json::Value>>, ApiError> {
+    let Some(series_id) = direct_parent_seasons_series_id(query) else {
+        return Ok(None);
+    };
+    Ok(Some(
+        series_seasons_result(db, query, series_id, user_id, server_id).await?,
+    ))
+}
+
 async fn items_result(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -33948,6 +34028,16 @@ async fn items_result(
     }
     if let Some(result) =
         exact_id_items_result(&state.db, &query, &server_id, requested_user_id).await?
+    {
+        return Ok(result);
+    }
+    if let Some(result) = parent_series_seasons_items_result(
+        &state.db,
+        &query,
+        requested_user_id.unwrap_or(auth_user.id),
+        &server_id,
+    )
+    .await?
     {
         return Ok(result);
     }
@@ -34067,6 +34157,11 @@ async fn user_items_result(
         || query_requests_only_item_type(&query, "TvChannel")
     {
         return live_tv_channel_items_result(&state.db, &query, &server_id, None).await;
+    }
+    if let Some(result) =
+        parent_series_seasons_items_result(&state.db, &query, requested_user_id, &server_id).await?
+    {
+        return Ok(result);
     }
     if let Some(result) =
         media_catalog_items_result(&state.db, &query, &server_id, Some(requested_user_id)).await?
@@ -49665,13 +49760,39 @@ async fn series_seasons(
         .unwrap_or(auth_user.id);
     ensure_user_access(&auth_user, requested_user_id)?;
 
+    let server_id = state.db.server_state().await?.server_id.to_string();
+    series_seasons_result(&state.db, &query, &series_id, requested_user_id, &server_id).await
+}
+
+async fn series_seasons_result(
+    db: &Database,
+    query: &ItemsQuery,
+    series_id: &str,
+    requested_user_id: Uuid,
+    server_id: &str,
+) -> Result<Json<serde_json::Value>, ApiError> {
     let TvEpisodeCatalogSnapshot {
-        items: candidate_episodes,
+        mut items,
         metadata_by_item,
-    } = tv_episode_catalog_snapshot_scoped_to_series(&state.db, &series_id).await?;
-    let episodes = candidate_episodes
+    } = tv_episode_catalog_snapshot_scoped_to_series(db, series_id).await?;
+    if let Some(allowed_tuner_ids) = query.allowed_plugin_tuner_ids.as_ref() {
+        items.retain(|item| {
+            if !is_plugin_vod_virtual_item(item) {
+                return true;
+            }
+            metadata_by_item
+                .get(&item.id)
+                .and_then(|metadata| json_string_field(metadata, "TunerId"))
+                .is_some_and(|tuner_id| {
+                    allowed_tuner_ids
+                        .iter()
+                        .any(|allowed| allowed.eq_ignore_ascii_case(&tuner_id))
+                })
+        });
+    }
+    let episodes = items
         .into_iter()
-        .filter(|item| tv_episode_matches_series(item, metadata_by_item.get(&item.id), &series_id))
+        .filter(|item| tv_episode_matches_series(item, metadata_by_item.get(&item.id), series_id))
         .collect::<Vec<_>>();
     let series_name = episodes
         .iter()
@@ -49690,7 +49811,7 @@ async fn series_seasons(
         .map(|episode| episode.id)
         .collect::<Vec<_>>();
     let playback_by_item =
-        MediaCatalogStore::playback_states_for_items(&state.db, requested_user_id, &episode_ids)
+        MediaCatalogStore::playback_states_for_items(db, requested_user_id, &episode_ids)
             .await?
             .into_iter()
             .map(|state| (state.item_id, state))
@@ -49713,10 +49834,9 @@ async fn series_seasons(
         }
     }
     present_unnumbered_season_as_first(&mut seasons);
-    let server_id = state.db.server_state().await?.server_id.to_string();
     let mut season_items = seasons
         .into_values()
-        .map(|summary| tv_season_json(&server_id, &series_name, &series_id, summary))
+        .map(|summary| tv_season_json(server_id, &series_name, &series_id, summary))
         .collect::<Vec<_>>();
     season_items.sort_by(|left, right| {
         let left_index = left
@@ -100415,6 +100535,27 @@ done
         assert_eq!(seasons["Items"][0]["IndexNumber"], 1);
         assert_eq!(seasons["Items"][0]["ChildCount"], 3);
         let season_id = seasons["Items"][0]["Id"].as_str().unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items?ParentId={series_id}&Recursive=false&IncludeItemTypes=Season&StartIndex=0&Limit=20&SortBy=IndexNumber&EnableUserData=false&EnableTotalRecordCount=true&EnableImages=true"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let item_seasons: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(item_seasons["TotalRecordCount"], 1);
+        assert_eq!(item_seasons["Items"][0]["Id"], season_id);
+        assert_eq!(item_seasons["Items"][0]["Type"], "Season");
+        assert_eq!(item_seasons["Items"][0]["ChildCount"], 3);
 
         let response = app
             .clone()
