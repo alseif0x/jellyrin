@@ -62,7 +62,9 @@ Para catálogos grandes, el perfil medido usa 128 MiB de datos dentro de un cont
 regenerables, nunca tokens, credenciales, URLs firmadas, progreso o asignaciones de usuario.
 El despliegue Compose debe añadir `docker-compose.redis-cache.yml`, definir
 `JELLYRIN_REDIS_URL_HOST_FILE` con un fichero `root:10001` modo `0440` y activar el profile
-`cache`/`distributed-cache`. Sin ese overlay, Redis puede ejecutarse pero Jellyrin no lo consume.
+`cache`/`distributed-cache`. Si el overlay se fija en `COMPOSE_FILE`, también debe fijarse
+`COMPOSE_PROFILES=cache`; así los comandos Compose normales resuelven siempre la dependencia.
+Sin ese overlay, Redis puede ejecutarse pero Jellyrin no lo consume.
 
 ## Software y arquitecturas
 

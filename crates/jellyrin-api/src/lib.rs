@@ -50360,13 +50360,18 @@ async fn metadata_collection_keys(
         ensure_user_access(&auth_user, user_id)?;
     }
     let facet_query = metadata_facet_query_with_redundant_types_removed(&state.db, &query).await?;
-    if metadata_facet_query_is_supported(&facet_query)
+    let effective_item_types = metadata_facet_effective_item_types(&facet_query);
+    let mut supported_facet_query = facet_query.clone();
+    supported_facet_query.include_item_types.clear();
+    if effective_item_types.is_some()
+        && metadata_facet_query_is_supported(&supported_facet_query)
         && let Some(folder_ids) = metadata_facet_folder_scope(&state.db, &facet_query).await?
     {
         let values = catalog_cache::cached_media_item_facet_display_values(
             &state.db,
             facet_kind,
             &folder_ids,
+            effective_item_types.as_deref().unwrap_or_default(),
         )
         .await?;
         let server_id = state.db.server_state().await?.server_id.to_string();
@@ -50398,6 +50403,24 @@ async fn metadata_collection_keys(
     Ok(Json(metadata_values_response(
         values, &server_id, item_type, &query,
     )))
+}
+
+/// Maps synthetic Series/Season catalogue types to their persisted episode rows. Returning
+/// `None` keeps uncommon synthetic types on the exact legacy path rather than broadening scope.
+fn metadata_facet_effective_item_types(query: &ItemsQuery) -> Option<Vec<String>> {
+    let mut item_types = Vec::new();
+    for item_type in csv_values_lowercase(&query.include_item_types).unwrap_or_default() {
+        let item_type = match item_type.as_str() {
+            "series" | "season" => "episode".to_string(),
+            "movie" | "episode" | "video" | "musicvideo" | "audio" | "photo" | "book"
+            | "baseitem" => item_type,
+            _ => return None,
+        };
+        item_types.push(item_type);
+    }
+    item_types.sort_unstable();
+    item_types.dedup();
+    Some(item_types)
 }
 
 /// Jellyfin Web repeats the folder's own media type on Genres/Studios requests. Once a request is
@@ -100898,6 +100921,7 @@ done
         );
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/Items/Filters2?IncludeItemTypes=Movie,Series")
@@ -100926,6 +100950,24 @@ done
                 { "Name": "French", "Value": "fra" }
             ])
         );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/Genres?IncludeItemTypes=Movie,Series")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let genres: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(genres["TotalRecordCount"], 2);
+        assert_eq!(genres["Items"][0]["Name"], "Movie Genre");
+        assert_eq!(genres["Items"][1]["Name"], "Series Genre");
     }
 
     #[tokio::test]

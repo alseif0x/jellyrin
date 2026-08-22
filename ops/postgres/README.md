@@ -43,6 +43,7 @@ thresholds:
 
 ```bash
 COMPOSE_FILE=docker-compose.yml:docker-compose.redis-cache.yml \
+COMPOSE_PROFILES=cache \
   docker compose --profile distributed-cache up -d
 ```
 

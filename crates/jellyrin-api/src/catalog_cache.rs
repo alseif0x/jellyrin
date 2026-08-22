@@ -162,15 +162,23 @@ pub(crate) async fn cached_media_item_facet_display_values(
     db: &Database,
     kind: MediaItemFacetKind,
     virtual_folder_ids: &[Uuid],
+    effective_item_types: &[String],
 ) -> anyhow::Result<Vec<String>> {
     let Some(cache) = SHARED_CATALOG_CACHE.get() else {
-        return database_facet_display_values(db, kind, virtual_folder_ids).await;
+        return database_facet_display_values(db, kind, virtual_folder_ids, effective_item_types)
+            .await;
     };
-    let key = facet_cache_key(kind, virtual_folder_ids);
+    let key = facet_cache_key(kind, virtual_folder_ids, effective_item_types);
     match cache.get::<Vec<String>>(&key).await {
         CacheLookup::Hit(values) => return Ok(values),
         CacheLookup::Unavailable => {
-            return database_facet_display_values(db, kind, virtual_folder_ids).await;
+            return database_facet_display_values(
+                db,
+                kind,
+                virtual_folder_ids,
+                effective_item_types,
+            )
+            .await;
         }
         CacheLookup::Miss => {}
     }
@@ -182,11 +190,18 @@ pub(crate) async fn cached_media_item_facet_display_values(
     match cache.get::<Vec<String>>(&key).await {
         CacheLookup::Hit(values) => return Ok(values),
         CacheLookup::Unavailable => {
-            return database_facet_display_values(db, kind, virtual_folder_ids).await;
+            return database_facet_display_values(
+                db,
+                kind,
+                virtual_folder_ids,
+                effective_item_types,
+            )
+            .await;
         }
         CacheLookup::Miss => {}
     }
-    let values = database_facet_display_values(db, kind, virtual_folder_ids).await?;
+    let values =
+        database_facet_display_values(db, kind, virtual_folder_ids, effective_item_types).await?;
     cache.put(&key, &values).await;
     Ok(values)
 }
@@ -234,23 +249,40 @@ async fn database_facet_display_values(
     db: &Database,
     kind: MediaItemFacetKind,
     virtual_folder_ids: &[Uuid],
+    effective_item_types: &[String],
 ) -> anyhow::Result<Vec<String>> {
     Ok(
-        MediaCatalogStore::media_item_facet_values(db, kind, virtual_folder_ids)
-            .await?
-            .into_iter()
-            .map(|facet| facet.display_value)
-            .collect(),
+        MediaCatalogStore::media_item_facet_values_for_effective_types(
+            db,
+            kind,
+            virtual_folder_ids,
+            effective_item_types,
+        )
+        .await?
+        .into_iter()
+        .map(|facet| facet.display_value)
+        .collect(),
     )
 }
 
-fn facet_cache_key(kind: MediaItemFacetKind, virtual_folder_ids: &[Uuid]) -> String {
+fn facet_cache_key(
+    kind: MediaItemFacetKind,
+    virtual_folder_ids: &[Uuid],
+    effective_item_types: &[String],
+) -> String {
     let mut folder_ids = virtual_folder_ids.to_vec();
     folder_ids.sort_unstable();
     folder_ids.dedup();
     let mut digest = Sha256::new();
     for folder_id in folder_ids {
         digest.update(folder_id.as_bytes());
+    }
+    let mut item_types = effective_item_types.to_vec();
+    item_types.sort_unstable();
+    item_types.dedup();
+    for item_type in item_types {
+        digest.update([0]);
+        digest.update(item_type.as_bytes());
     }
     format!(
         "{CACHE_NAMESPACE}:facet:{}:{:x}",
@@ -271,17 +303,23 @@ mod tests {
     fn facet_keys_are_order_independent_scoped_and_do_not_expose_folder_ids() {
         let first = Uuid::from_u128(1);
         let second = Uuid::from_u128(2);
-        let genre = facet_cache_key(MediaItemFacetKind::Genre, &[first, second]);
+        let genre = facet_cache_key(MediaItemFacetKind::Genre, &[first, second], &[]);
         assert_eq!(
             genre,
-            facet_cache_key(MediaItemFacetKind::Genre, &[second, first, first])
+            facet_cache_key(MediaItemFacetKind::Genre, &[second, first, first], &[])
         );
         assert_ne!(
             genre,
-            facet_cache_key(MediaItemFacetKind::Studio, &[first, second])
+            facet_cache_key(MediaItemFacetKind::Studio, &[first, second], &[])
         );
         assert!(!genre.contains(&first.to_string()));
         assert!(!genre.contains(&second.to_string()));
+        let movies = vec!["movie".to_string()];
+        let episodes = vec!["episode".to_string()];
+        assert_ne!(
+            facet_cache_key(MediaItemFacetKind::Genre, &[first, second], &movies),
+            facet_cache_key(MediaItemFacetKind::Genre, &[first, second], &episodes)
+        );
     }
 
     #[test]

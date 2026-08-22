@@ -3389,6 +3389,16 @@ impl PostgresDatabase {
         kind: MediaItemFacetKind,
         virtual_folder_ids: &[Uuid],
     ) -> anyhow::Result<Vec<MediaItemFacetValue>> {
+        self.media_item_facet_values_for_effective_types(kind, virtual_folder_ids, &[])
+            .await
+    }
+
+    pub async fn media_item_facet_values_for_effective_types(
+        &self,
+        kind: MediaItemFacetKind,
+        virtual_folder_ids: &[Uuid],
+        effective_item_types: &[String],
+    ) -> anyhow::Result<Vec<MediaItemFacetValue>> {
         let mut query = QueryBuilder::<Postgres>::new(
             r#"
             SELECT normalized_value, display_value, stable_id, payload
@@ -3412,6 +3422,14 @@ impl PostgresDatabase {
                 separated.push_bind(*folder_id);
             }
             separated.push_unseparated(")");
+        }
+        if !effective_item_types.is_empty() {
+            query
+                .push(" AND (")
+                .push(POSTGRES_MEDIA_ITEM_TYPE_SQL)
+                .push(") = ANY(")
+                .push_bind(effective_item_types)
+                .push(")");
         }
         query.push(
             ") AS ranked WHERE facet_rank = 1 ORDER BY normalized_value, display_value, stable_id",

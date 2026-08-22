@@ -1940,6 +1940,15 @@ pub trait MediaCatalogStore: DatabaseBackend {
         virtual_folder_ids: &'a [Uuid],
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemFacetValue>>> + Send + 'a;
 
+    /// Facet values restricted to the catalogue's public effective item types. An empty type
+    /// list has the same meaning as `media_item_facet_values`: every visible item.
+    fn media_item_facet_values_for_effective_types<'a>(
+        &'a self,
+        kind: MediaItemFacetKind,
+        virtual_folder_ids: &'a [Uuid],
+        effective_item_types: &'a [String],
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemFacetValue>>> + Send + 'a;
+
     fn media_item_facet_by_entity_id<'a>(
         &'a self,
         kind: MediaItemFacetKind,
@@ -2136,6 +2145,21 @@ impl MediaCatalogStore for PostgresDatabase {
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemFacetValue>>> + Send + 'a
     {
         PostgresDatabase::media_item_facet_values(self, kind, virtual_folder_ids)
+    }
+
+    fn media_item_facet_values_for_effective_types<'a>(
+        &'a self,
+        kind: MediaItemFacetKind,
+        virtual_folder_ids: &'a [Uuid],
+        effective_item_types: &'a [String],
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemFacetValue>>> + Send + 'a
+    {
+        PostgresDatabase::media_item_facet_values_for_effective_types(
+            self,
+            kind,
+            virtual_folder_ids,
+            effective_item_types,
+        )
     }
 
     fn media_item_facet_by_entity_id<'a>(
@@ -2350,6 +2374,21 @@ impl MediaCatalogStore for SqliteDatabase {
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemFacetValue>>> + Send + 'a
     {
         SqliteDatabase::media_item_facet_values(self, kind, virtual_folder_ids)
+    }
+
+    fn media_item_facet_values_for_effective_types<'a>(
+        &'a self,
+        kind: MediaItemFacetKind,
+        virtual_folder_ids: &'a [Uuid],
+        effective_item_types: &'a [String],
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemFacetValue>>> + Send + 'a
+    {
+        SqliteDatabase::media_item_facet_values_for_effective_types(
+            self,
+            kind,
+            virtual_folder_ids,
+            effective_item_types,
+        )
     }
 
     fn media_item_facet_by_entity_id<'a>(
@@ -10609,6 +10648,16 @@ impl SqliteDatabase {
         kind: MediaItemFacetKind,
         virtual_folder_ids: &[Uuid],
     ) -> anyhow::Result<Vec<MediaItemFacetValue>> {
+        self.media_item_facet_values_for_effective_types(kind, virtual_folder_ids, &[])
+            .await
+    }
+
+    pub async fn media_item_facet_values_for_effective_types(
+        &self,
+        kind: MediaItemFacetKind,
+        virtual_folder_ids: &[Uuid],
+        effective_item_types: &[String],
+    ) -> anyhow::Result<Vec<MediaItemFacetValue>> {
         let mut query = QueryBuilder::<Sqlite>::new(
             r#"
             SELECT normalized_value, display_value, stable_id, payload_json
@@ -10630,6 +10679,17 @@ impl SqliteDatabase {
             let mut separated = query.separated(", ");
             for folder_id in virtual_folder_ids {
                 separated.push_bind(folder_id.to_string());
+            }
+            separated.push_unseparated(")");
+        }
+        if !effective_item_types.is_empty() {
+            query
+                .push(" AND (")
+                .push(SQLITE_MEDIA_ITEM_TYPE_SQL)
+                .push(") IN (");
+            let mut separated = query.separated(", ");
+            for item_type in effective_item_types {
+                separated.push_bind(item_type);
             }
             separated.push_unseparated(")");
         }
