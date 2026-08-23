@@ -34987,6 +34987,68 @@ fn should_include_parent_virtual_items(query: &ItemsQuery) -> bool {
         && query.is_favorite.is_none()
 }
 
+/// How much of a library to answer when the client asks for no particular page.
+///
+/// The page is hydrated, and hydration is linear in its size: measured against a real catalogue,
+/// a page of 500 costs over a second while a page of this size answers in tens of milliseconds.
+/// Clients that care about more receive the real `TotalRecordCount` and can page for it.
+const PARENT_BROWSE_DEFAULT_PAGE_SIZE: usize = 100;
+
+/// One page of a folder's persisted rows, read and counted by the repository.
+///
+/// Reading the folder to sort and count it in memory costs the same half second whether the client
+/// asked for fifty rows or five hundred, because the cost is the folder rather than the page. The
+/// catalogue repository pages and counts in SQL, and returns each row's metadata and playback state
+/// with it, so nothing further has to be fetched to serialize the page.
+async fn folder_rows_catalog_page(
+    state: &AppState,
+    query: &ItemsQuery,
+    requested_user_id: Uuid,
+    folder_ids: &[Uuid],
+    start_index: usize,
+    limit: usize,
+) -> Result<Option<(Vec<serde_json::Value>, usize)>, ApiError> {
+    let mut scoped_query = query.clone();
+    scoped_query.parent_id = None;
+    scoped_query.start_index = Some(start_index);
+    scoped_query.limit = Some(limit);
+    let Some(mut db_query) = media_catalog_query_for_items(&scoped_query, Some(requested_user_id))?
+    else {
+        return Ok(None);
+    };
+    db_query.virtual_folder_ids = folder_ids.to_vec();
+    db_query.include_total_record_count = true;
+    let page = MediaCatalogStore::media_item_catalog_page(&state.db, &db_query).await?;
+    let server_id = state.db.server_state().await?.server_id.to_string();
+    let compact = should_use_compact_items_result(query);
+    queue_plugin_vod_artwork_prefetch_ids(
+        state,
+        &page
+            .items
+            .iter()
+            .map(|entry| entry.item.id)
+            .collect::<Vec<_>>(),
+    );
+    let items = page
+        .items
+        .iter()
+        .map(|entry| {
+            let item = if compact {
+                compact_media_item_to_json(&entry.item, &server_id, entry.playback_state.as_ref())
+            } else {
+                media_item_to_json_with_playback_and_metadata(
+                    &entry.item,
+                    &server_id,
+                    entry.playback_state.as_ref(),
+                    Some(&entry.metadata),
+                )
+            };
+            shape_catalog_item_for_query(item, query)
+        })
+        .collect();
+    Ok(Some((items, page.total_record_count)))
+}
+
 /// Bounded listing for a bare `ParentId` browse of a real library folder.
 ///
 /// The legacy path hydrated every row the folder holds and paged the JSON afterwards, so a library
@@ -35029,9 +35091,12 @@ async fn parent_browse_items_result(
         return Ok(None);
     };
     let child_folders = child_virtual_folders(folder, &folders);
+    let folder_ids = std::iter::once(folder.id)
+        .chain(child_folders.iter().map(|child| child.id))
+        .collect::<Vec<_>>();
 
     let start_index = query.start_index.unwrap_or(0);
-    let limit = query.limit.unwrap_or(MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE);
+    let limit = query.limit.unwrap_or(PARENT_BROWSE_DEFAULT_PAGE_SIZE);
     // The folder nodes sort among the rows, so each one can displace a row out of the requested
     // window. Reading that many extra rows on both ends keeps the merged page exact.
     let node_count = 1 + child_folders.len();
@@ -35053,7 +35118,20 @@ async fn parent_browse_items_result(
         let total = page.0["TotalRecordCount"].as_u64().unwrap_or_default() as usize;
         let items = page.0["Items"].as_array().cloned().unwrap_or_default();
         (items, total)
+    } else if let Some(page) = folder_rows_catalog_page(
+        state,
+        query,
+        requested_user_id,
+        &folder_ids,
+        source_start,
+        source_limit,
+    )
+    .await?
+    {
+        page
     } else {
+        // The repository cannot express every predicate. Those requests still read the folder and
+        // page in memory, which is affordable because they are rare and still bounded by the folder.
         let mut rows = filtered_media_items(
             media_items_source_for_query(&state.db, query).await?,
             query,
