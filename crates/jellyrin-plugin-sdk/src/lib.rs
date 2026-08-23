@@ -568,12 +568,28 @@ impl LiveTvProviderRequest {
 
 /// Provider-neutral identity derived by Jellyrin from an authenticated device
 /// token. Clients cannot supply or override this object.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase", deny_unknown_fields)]
 pub struct PluginUserContext {
     pub user_id: String,
     pub device_id: String,
     pub is_administrator: bool,
+}
+
+/// Redact the identity at its source so no container can log it by deriving `Debug`.
+///
+/// The provider request types keep their own manual formatters, but this type travels inside
+/// several request bodies and plugin hosts log those freely; keeping the identifiers out of the
+/// formatter is what makes that safe by default rather than per call site.
+impl std::fmt::Debug for PluginUserContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PluginUserContext")
+            .field("user_id", &"[REDACTED]")
+            .field("device_id", &"[REDACTED]")
+            .field("is_administrator", &self.is_administrator)
+            .finish()
+    }
 }
 
 /// Provider-neutral discovery decision returned by a plugin for one authenticated user and
@@ -585,12 +601,23 @@ pub struct PluginUserAuthorizationResult {
     pub allowed: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase", deny_unknown_fields)]
 pub struct PluginUserAuthorizationRequest {
     pub action: String,
     pub provider_config: Value,
     pub user_context: PluginUserContext,
+}
+
+impl std::fmt::Debug for PluginUserAuthorizationRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PluginUserAuthorizationRequest")
+            .field("action", &self.action)
+            .field("provider_config", &"[REDACTED]")
+            .field("user_context", &self.user_context)
+            .finish()
+    }
 }
 
 impl PluginUserAuthorizationRequest {
@@ -1504,6 +1531,47 @@ mod tests {
                 .unwrap()
                 .get("UserContext")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn user_context_debug_redacts_identity_but_keeps_it_on_the_wire() {
+        let context = PluginUserContext {
+            user_id: "user-a".to_string(),
+            device_id: "device-a".to_string(),
+            is_administrator: true,
+        };
+        let rendered = format!("{context:?}");
+        assert!(!rendered.contains("user-a"), "{rendered}");
+        assert!(!rendered.contains("device-a"), "{rendered}");
+        assert!(rendered.contains("is_administrator: true"), "{rendered}");
+
+        // Redaction is a logging concern only: the plugin still receives the identity.
+        let wire = serde_json::to_value(&context).unwrap();
+        assert_eq!(wire["UserId"], "user-a");
+        assert_eq!(wire["DeviceId"], "device-a");
+        assert_eq!(wire["IsAdministrator"], true);
+    }
+
+    #[test]
+    fn user_authorization_request_debug_redacts_config_and_identity() {
+        let request = PluginUserAuthorizationRequest::authorize_catalog(
+            json!({ "Host": "provider.example", "Token": "super-secret" }),
+            PluginUserContext {
+                user_id: "user-a".to_string(),
+                device_id: "device-a".to_string(),
+                is_administrator: false,
+            },
+        );
+        let rendered = format!("{request:?}");
+        assert!(!rendered.contains("super-secret"), "{rendered}");
+        assert!(!rendered.contains("provider.example"), "{rendered}");
+        assert!(!rendered.contains("user-a"), "{rendered}");
+        assert!(!rendered.contains("device-a"), "{rendered}");
+        // The action stays visible: it is what makes a redacted log line useful at all.
+        assert!(
+            rendered.contains(USER_CATALOG_ACTION_AUTHORIZE),
+            "{rendered}"
         );
     }
 

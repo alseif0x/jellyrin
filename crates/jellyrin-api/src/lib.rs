@@ -172,7 +172,7 @@ use jellyrin_plugin_sdk::{
     CAPABILITY_VOD_LIBRARY_PROVIDER, LiveTvDeliveryCapabilities, LiveTvPlaybackContext,
     LiveTvPlaybackDelivery, LiveTvPlaybackResult, LiveTvProviderRequest, LiveTvProviderSecretGrant,
     PERMISSION_PROVIDER_SECRETS, PluginUserAuthorizationRequest, PluginUserAuthorizationResult,
-    SensitiveString, SensitiveUrl, VOD_ITEM_TYPE_EPISODE, VOD_ITEM_TYPE_MOVIE,
+    PluginUserContext, SensitiveString, SensitiveUrl, VOD_ITEM_TYPE_EPISODE, VOD_ITEM_TYPE_MOVIE,
     VOD_ITEM_TYPE_SERIES, VodLibraryProviderRequest, VodMediaItem, VodPlaybackContext,
     VodPlaybackResult,
 };
@@ -12013,14 +12013,8 @@ async fn plugin_user_may_access_tuner_catalog(
     let provider_config = redacted_live_tv_plugin_tuner_config(configuration)?;
     let config_bytes = serde_json::to_vec(&provider_config)
         .map_err(|_| ApiError::internal("Invalid plugin tuner configuration"))?;
-    let cache_key = format!(
-        "{}:{}:{}:{}:{:016x}",
-        plugin_id.to_ascii_lowercase(),
-        tuner_id.to_ascii_lowercase(),
-        user_context.user_id,
-        user_context.is_administrator,
-        fnv1a64(&config_bytes, 0x82a2_b175_229d_6a5b),
-    );
+    let cache_key =
+        plugin_catalog_authorization_cache_key(plugin_id, tuner_id, &user_context, &config_bytes);
     let now = StdInstant::now();
     {
         let mut cache = plugin_catalog_authorization_cache().lock().await;
@@ -12060,6 +12054,32 @@ async fn plugin_user_may_access_tuner_catalog(
         },
     );
     Ok(decision.allowed)
+}
+
+/// Cache key for one plugin catalogue authorization decision.
+///
+/// The decision is keyed by device as well as user: the request carries the device id and the
+/// contract defines a `ReleaseDevice` action, so a plugin may legitimately answer differently per
+/// device, and a user-only key would serve one device's verdict to another until the entry expires.
+/// Both identifiers are length-prefixed because a client chooses its own device id, and a bare
+/// separator would let one device craft an id that collides with another device's key.
+fn plugin_catalog_authorization_cache_key(
+    plugin_id: &str,
+    tuner_id: &str,
+    user_context: &PluginUserContext,
+    config_bytes: &[u8],
+) -> String {
+    format!(
+        "{}:{}:{}:{}:{}:{}:{}:{:016x}",
+        plugin_id.to_ascii_lowercase(),
+        tuner_id.to_ascii_lowercase(),
+        user_context.user_id.len(),
+        user_context.user_id,
+        user_context.device_id.len(),
+        user_context.device_id,
+        user_context.is_administrator,
+        fnv1a64(config_bytes, 0x82a2_b175_229d_6a5b),
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -51091,8 +51111,8 @@ async fn metadata_collection_keys(
     facet_kind: MediaItemFacetKind,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let query = parse_items_query(raw_query.as_deref());
-    let auth_user =
-        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let (auth_user, token) =
+        require_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
     let requested_user_id = query.user_id.as_deref().map(resolve_user_id).transpose()?;
     if let Some(user_id) = requested_user_id {
         ensure_user_access(&auth_user, user_id)?;
@@ -51100,6 +51120,18 @@ async fn metadata_collection_keys(
     let mut facet_query =
         metadata_facet_query_with_redundant_types_removed(&state.db, &query).await?;
     normalize_series_filter_catalog_query(&mut facet_query);
+    // Resolve this caller's plugin-catalogue visibility before any shared lookup below. The cached
+    // facet page is keyed by folder and item type alone, so serving it to a user whose plugin
+    // catalogues are restricted would let them enumerate values from a catalogue the item
+    // endpoints refuse to list for them.
+    scope_items_query_for_plugin_catalogs(
+        &state.db,
+        &mut facet_query,
+        &auth_user,
+        &token,
+        requested_user_id,
+    )
+    .await?;
     if facet_kind == MediaItemFacetKind::Genre
         && !facet_query.include_item_types.is_empty()
         && let Some(values) = media_catalog_filter_values_result(
@@ -51235,8 +51267,15 @@ async fn metadata_facet_query_with_redundant_types_removed(
     Ok(normalized)
 }
 
+/// Whether the shared cached facet page can answer this query.
+///
+/// The cached page is keyed by folder and effective item type alone, so a query carrying the
+/// caller's plugin-catalogue visibility is deliberately unsupported: answering it from that cache
+/// would let a user enumerate facet values from a catalogue the item endpoints refuse to list for
+/// them. Those requests fall through to the per-user path instead.
 fn metadata_facet_query_is_supported(query: &ItemsQuery) -> bool {
-    query.ids.is_none()
+    query.allowed_plugin_tuner_ids.is_none()
+        && query.ids.is_none()
         && query.season_id.is_none()
         && query.series_id.is_none()
         && query.include_item_types.is_empty()
@@ -95190,6 +95229,9 @@ done
     /// narrowing the source alone cannot make it affordable. Any future redesign has to page the
     /// union of persisted rows and synthesized nodes; this test is the baseline it must preserve.
     #[tokio::test]
+    // Creating a library bumps the process-wide DLNA content-directory counter, which other tests
+    // assert on exactly. Share the serialization key the neighbouring library tests already use.
+    #[serial(playback_events)]
     async fn bare_parent_browse_on_tv_library_returns_every_episode_and_synthesized_nodes() {
         let tmp = tempfile::tempdir().unwrap();
         let storage_root = tempfile::tempdir().unwrap();
@@ -105848,6 +105890,62 @@ done
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn cached_facet_page_declines_plugin_scoped_queries() {
+        // The shared facet page is keyed by folder and item type only. A caller whose plugin
+        // catalogues are restricted must fall through to the per-user path, or it could enumerate
+        // facet values from a catalogue the item endpoints refuse to list for it.
+        let mut query = ItemsQuery::default();
+        assert!(super::metadata_facet_query_is_supported(&query));
+        query.allowed_plugin_tuner_ids = Some(vec!["tuner-a".to_string()]);
+        assert!(!super::metadata_facet_query_is_supported(&query));
+        query.allowed_plugin_tuner_ids = Some(Vec::new());
+        assert!(!super::metadata_facet_query_is_supported(&query));
+    }
+
+    #[test]
+    fn plugin_catalog_authorization_cache_key_separates_users_and_devices() {
+        let context = |user: &str, device: &str| jellyrin_plugin_sdk::PluginUserContext {
+            user_id: user.to_string(),
+            device_id: device.to_string(),
+            is_administrator: false,
+        };
+        let key = |user: &str, device: &str| {
+            super::plugin_catalog_authorization_cache_key(
+                "plugin",
+                "tuner",
+                &context(user, device),
+                b"{}",
+            )
+        };
+
+        // A plugin may answer per device, so one device's verdict must not be reused for another.
+        assert_ne!(key("user-a", "device-a"), key("user-a", "device-b"));
+        assert_ne!(key("user-a", "device-a"), key("user-b", "device-a"));
+        assert_eq!(key("user-a", "device-a"), key("user-a", "device-a"));
+
+        // A client picks its own device id. Length prefixes keep it from shifting the separator to
+        // land on another identity's key: "a:b" + "c" must not collide with "a" + "b:c".
+        assert_ne!(key("a:b", "c"), key("a", "b:c"));
+
+        // Administrator state and the provider configuration stay part of the identity.
+        let mut elevated = context("user-a", "device-a");
+        elevated.is_administrator = true;
+        assert_ne!(
+            super::plugin_catalog_authorization_cache_key("plugin", "tuner", &elevated, b"{}"),
+            key("user-a", "device-a")
+        );
+        assert_ne!(
+            super::plugin_catalog_authorization_cache_key(
+                "plugin",
+                "tuner",
+                &context("user-a", "device-a"),
+                b"{\"Host\":\"other\"}",
+            ),
+            key("user-a", "device-a")
+        );
     }
 
     #[test]
