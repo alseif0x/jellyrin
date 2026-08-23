@@ -2715,21 +2715,30 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn transcode_process_exposes_linux_resource_samples() {
-        let command = FfmpegCommandSpec::new("sh", vec!["-c".to_string(), "sleep 1".to_string()]);
+        let command = FfmpegCommandSpec::new("sh", vec!["-c".to_string(), "sleep 2".to_string()]);
         let mut process = spawn_transcode_process(&command).unwrap();
         let mut resources = process.subscribe_resources();
 
-        timeout(Duration::from_secs(1), resources.changed())
-            .await
-            .unwrap()
-            .unwrap();
-        let sample = resources
-            .borrow_and_update()
-            .expect("Linux resource sample");
-        assert!(sample.rss_bytes > 0);
+        // Linux can expose a freshly exec'd process with zero resident pages for one observation.
+        // Wait for the first meaningful sample instead of making that scheduler race a failure.
+        let sample = timeout(Duration::from_secs(1), async {
+            loop {
+                resources.changed().await.unwrap();
+                if let Some(sample) = *resources.borrow_and_update()
+                    && sample.rss_bytes > 0
+                {
+                    return sample;
+                }
+            }
+        })
+        .await
+        .unwrap();
         assert_eq!(process.latest_resource_sample(), Some(sample));
         assert!(process.wait().await.unwrap().success);
         assert!(process.resource_task.is_none());
+        // Consume any later sample produced while the process was still running; the next change
+        // must then report that the sampler sender was closed.
+        let _ = resources.borrow_and_update();
         assert!(resources.changed().await.is_err());
     }
 

@@ -18,6 +18,11 @@ pub const CAPABILITY_LIVE_TV_PROVIDER: &str = "LiveTvProvider";
 /// Capability implemented by plugins that import an on-demand media library (movies, series
 /// and episodes) and resolve ephemeral playback URLs for opaque catalog references.
 pub const CAPABILITY_VOD_LIBRARY_PROVIDER: &str = "VodLibraryProvider";
+/// Optional capability used to hide one provider instance's catalog from users that the plugin
+/// has not assigned. Jellyrin supplies only public provider configuration and trusted identity.
+pub const CAPABILITY_USER_CATALOG_AUTHORIZATION: &str = "UserCatalogAuthorization";
+pub const USER_CATALOG_ACTION_AUTHORIZE: &str = "AuthorizeCatalog";
+pub const USER_CATALOG_ACTION_RELEASE_DEVICE: &str = "ReleaseDevice";
 /// Permission a plugin must request in its manifest, and an administrator must grant, before
 /// Jellyrin may issue ephemeral provider-secret grants to it.
 pub const PERMISSION_PROVIDER_SECRETS: &str = "ProviderSecrets";
@@ -466,6 +471,8 @@ pub struct LiveTvProviderRequest {
     pub arguments: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_grant: Option<LiveTvProviderSecretGrant>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_context: Option<PluginUserContext>,
 }
 
 impl std::fmt::Debug for LiveTvProviderRequest {
@@ -476,6 +483,7 @@ impl std::fmt::Debug for LiveTvProviderRequest {
             .field("tuner_config", &"[REDACTED]")
             .field("arguments", &"[REDACTED]")
             .field("secret_grant", &self.secret_grant)
+            .field("user_context_present", &self.user_context.is_some())
             .finish()
     }
 }
@@ -487,6 +495,7 @@ impl LiveTvProviderRequest {
             tuner_config,
             arguments: json!({}),
             secret_grant: None,
+            user_context: None,
         }
     }
 
@@ -496,6 +505,7 @@ impl LiveTvProviderRequest {
             tuner_config,
             arguments: json!({}),
             secret_grant: None,
+            user_context: None,
         }
     }
 
@@ -505,6 +515,7 @@ impl LiveTvProviderRequest {
             tuner_config,
             arguments: json!({}),
             secret_grant: None,
+            user_context: None,
         }
     }
 
@@ -528,12 +539,90 @@ impl LiveTvProviderRequest {
             tuner_config,
             arguments,
             secret_grant: None,
+            user_context: None,
         }
     }
 
     pub fn with_secret_grant(mut self, secret_grant: LiveTvProviderSecretGrant) -> Self {
         self.secret_grant = Some(secret_grant);
         self
+    }
+
+    pub fn with_user_context(mut self, user_context: PluginUserContext) -> Self {
+        self.user_context = Some(user_context);
+        self
+    }
+}
+
+/// Provider-neutral identity derived by Jellyrin from an authenticated device
+/// token. Clients cannot supply or override this object.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase", deny_unknown_fields)]
+pub struct PluginUserContext {
+    pub user_id: String,
+    pub device_id: String,
+    pub is_administrator: bool,
+}
+
+/// Redact the identity at its source so no container can log it by deriving `Debug`.
+///
+/// The provider request types keep their own manual formatters, but this type travels inside
+/// several request bodies and plugin hosts log those freely; keeping the identifiers out of the
+/// formatter is what makes that safe by default rather than per call site.
+impl std::fmt::Debug for PluginUserContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PluginUserContext")
+            .field("user_id", &"[REDACTED]")
+            .field("device_id", &"[REDACTED]")
+            .field("is_administrator", &self.is_administrator)
+            .finish()
+    }
+}
+
+/// Provider-neutral discovery decision returned by a plugin for one authenticated user and
+/// one configured provider instance. The plugin owns the assignment semantics; Jellyrin only
+/// enforces the boolean result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase", deny_unknown_fields)]
+pub struct PluginUserAuthorizationResult {
+    pub allowed: bool,
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase", deny_unknown_fields)]
+pub struct PluginUserAuthorizationRequest {
+    pub action: String,
+    pub provider_config: Value,
+    pub user_context: PluginUserContext,
+}
+
+impl std::fmt::Debug for PluginUserAuthorizationRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PluginUserAuthorizationRequest")
+            .field("action", &self.action)
+            .field("provider_config", &"[REDACTED]")
+            .field("user_context", &self.user_context)
+            .finish()
+    }
+}
+
+impl PluginUserAuthorizationRequest {
+    pub fn authorize_catalog(provider_config: Value, user_context: PluginUserContext) -> Self {
+        Self {
+            action: USER_CATALOG_ACTION_AUTHORIZE.to_string(),
+            provider_config,
+            user_context,
+        }
+    }
+
+    pub fn release_device(provider_config: Value, user_context: PluginUserContext) -> Self {
+        Self {
+            action: USER_CATALOG_ACTION_RELEASE_DEVICE.to_string(),
+            provider_config,
+            user_context,
+        }
     }
 }
 
@@ -767,6 +856,8 @@ pub struct VodLibraryProviderRequest {
     pub arguments: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_grant: Option<VodLibraryProviderSecretGrant>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_context: Option<PluginUserContext>,
 }
 
 impl std::fmt::Debug for VodLibraryProviderRequest {
@@ -777,6 +868,7 @@ impl std::fmt::Debug for VodLibraryProviderRequest {
             .field("provider_config", &"[REDACTED]")
             .field("arguments", &"[REDACTED]")
             .field("secret_grant", &self.secret_grant)
+            .field("user_context_present", &self.user_context.is_some())
             .finish()
     }
 }
@@ -790,6 +882,7 @@ impl VodLibraryProviderRequest {
             provider_config,
             arguments: json!({}),
             secret_grant: None,
+            user_context: None,
         }
     }
 
@@ -823,11 +916,17 @@ impl VodLibraryProviderRequest {
             provider_config,
             arguments,
             secret_grant: None,
+            user_context: None,
         }
     }
 
     pub fn with_secret_grant(mut self, secret_grant: VodLibraryProviderSecretGrant) -> Self {
         self.secret_grant = Some(secret_grant);
+        self
+    }
+
+    pub fn with_user_context(mut self, user_context: PluginUserContext) -> Self {
+        self.user_context = Some(user_context);
         self
     }
 }
@@ -1112,6 +1211,16 @@ impl std::fmt::Debug for CapabilityResponse {
 }
 
 impl CapabilityResponse {
+    pub fn user_authorization(
+        capability: impl Into<String>,
+        result: PluginUserAuthorizationResult,
+    ) -> Self {
+        Self::executed(
+            capability,
+            serde_json::to_value(result).expect("PluginUserAuthorizationResult must serialize"),
+        )
+    }
+
     pub fn executed(capability: impl Into<String>, result: Value) -> Self {
         Self {
             status: "Executed".to_string(),
@@ -1364,6 +1473,117 @@ mod tests {
         assert_eq!(grant.username.expose_secret(), "provider-user");
         assert_eq!(grant.password.expose_secret(), "provider-password");
         assert_eq!(grant.fields["DeviceId"].expose_secret(), "device-secret");
+    }
+
+    #[test]
+    fn authenticated_user_context_is_optional_and_provider_neutral() {
+        let context = PluginUserContext {
+            user_id: "user-a".to_string(),
+            device_id: "device-a".to_string(),
+            is_administrator: false,
+        };
+        let request =
+            LiveTvProviderRequest::import_channels(json!({})).with_user_context(context.clone());
+        let wire = serde_json::to_value(&request).unwrap();
+        assert_eq!(wire["UserContext"]["UserId"], "user-a");
+        assert_eq!(wire["UserContext"]["DeviceId"], "device-a");
+        assert_eq!(wire["UserContext"]["IsAdministrator"], false);
+        assert_eq!(
+            serde_json::from_value::<LiveTvProviderRequest>(wire)
+                .unwrap()
+                .user_context,
+            Some(context.clone())
+        );
+
+        let vod = VodLibraryProviderRequest::import_media(json!({})).with_user_context(context);
+        assert!(
+            serde_json::to_value(vod)
+                .unwrap()
+                .get("UserContext")
+                .is_some()
+        );
+        assert!(
+            serde_json::to_value(LiveTvProviderRequest::import_channels(json!({})))
+                .unwrap()
+                .get("UserContext")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn user_context_debug_redacts_identity_but_keeps_it_on_the_wire() {
+        let context = PluginUserContext {
+            user_id: "user-a".to_string(),
+            device_id: "device-a".to_string(),
+            is_administrator: true,
+        };
+        let rendered = format!("{context:?}");
+        assert!(!rendered.contains("user-a"), "{rendered}");
+        assert!(!rendered.contains("device-a"), "{rendered}");
+        assert!(rendered.contains("is_administrator: true"), "{rendered}");
+
+        // Redaction is a logging concern only: the plugin still receives the identity.
+        let wire = serde_json::to_value(&context).unwrap();
+        assert_eq!(wire["UserId"], "user-a");
+        assert_eq!(wire["DeviceId"], "device-a");
+        assert_eq!(wire["IsAdministrator"], true);
+    }
+
+    #[test]
+    fn user_authorization_request_debug_redacts_config_and_identity() {
+        let request = PluginUserAuthorizationRequest::authorize_catalog(
+            json!({ "Host": "provider.example", "Token": "super-secret" }),
+            PluginUserContext {
+                user_id: "user-a".to_string(),
+                device_id: "device-a".to_string(),
+                is_administrator: false,
+            },
+        );
+        let rendered = format!("{request:?}");
+        assert!(!rendered.contains("super-secret"), "{rendered}");
+        assert!(!rendered.contains("provider.example"), "{rendered}");
+        assert!(!rendered.contains("user-a"), "{rendered}");
+        assert!(!rendered.contains("device-a"), "{rendered}");
+        // The action stays visible: it is what makes a redacted log line useful at all.
+        assert!(
+            rendered.contains(USER_CATALOG_ACTION_AUTHORIZE),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn user_authorization_requests_never_carry_secret_grants() {
+        let context = PluginUserContext {
+            user_id: "user-a".to_string(),
+            device_id: "device-a".to_string(),
+            is_administrator: false,
+        };
+        // One protocol only: the host asks for catalogue authorization through
+        // CAPABILITY_USER_CATALOG_AUTHORIZATION. The provider requests used to expose a second,
+        // never-invoked "AuthorizeUser" action, which led a plugin author to implement a handler the
+        // host never calls -- and the host fails closed, so every user lost that catalogue.
+        for wire in [
+            serde_json::to_value(PluginUserAuthorizationRequest::authorize_catalog(
+                json!({ "Id": "tuner-a" }),
+                context.clone(),
+            ))
+            .unwrap(),
+            serde_json::to_value(PluginUserAuthorizationRequest::release_device(
+                json!({ "Id": "tuner-a" }),
+                context,
+            ))
+            .unwrap(),
+        ] {
+            assert!(wire.get("SecretGrant").is_none());
+            assert_eq!(wire["UserContext"]["UserId"], "user-a");
+        }
+
+        let response = CapabilityResponse::user_authorization(
+            CAPABILITY_VOD_LIBRARY_PROVIDER,
+            PluginUserAuthorizationResult { allowed: true },
+        )
+        .into_host_value();
+        assert_eq!(response["Allowed"], true);
     }
 
     #[test]

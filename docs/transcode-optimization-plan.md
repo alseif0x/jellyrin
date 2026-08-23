@@ -363,12 +363,11 @@ histórica y no debe confundirse con este estado vigente.
   journal/logs/argv también quedó limpio. Cualquier import legacy futuro debe
   repetir ambos gates y reimportar el catálogo afectado —no editar filas
   manualmente— antes de abrir ingress.
-- Redis queda en **no-go**: no hay cliente, caché ni servicio Redis activo en la
-  topología objetivo. Compose conserva solo scaffolding dormido bajo profiles
-  para repetir el benchmark o una reevaluación futura; no debe habilitarse con
-  la decisión actual. En el benchmark comparable dio 37.665 lecturas/s frente a 37.757 de
-  PostgreSQL y añadió memoria. Solo se reabre ante un caso multinodo o una caché
-  concreta que supere los gates medidos de `docs/redis-decision.md`.
+- Redis queda habilitado únicamente como caché-aside opcional de facetas públicas y conteos
+  compartidos por biblioteca. PostgreSQL sigue siendo fuente de verdad; TTL, tamaño, timeout,
+  single-flight y circuit breaker están acotados y la caída de Redis hace bypass.
+  No se usa para coordinación, sesiones, progreso, permisos ni playback. Los
+  gates y el benchmark histórico permanecen en `docs/redis-decision.md`.
 - Supply chain fija imágenes base por digest, snapshot Debian, FFmpeg, Syft,
   cargo-audit/RustSec y Trivy, usa `cargo --locked`, verifica checksums y conserva
   un registro gobernado de excepciones actualmente vacío. La evidencia de
@@ -921,7 +920,7 @@ se marcará completo solo después de su validación y rollout correspondiente.
 | Xtream integrado y vault | Referencias JIT, relay loopback, XOR Live TV, AEAD; VOD/Series por streaming acotado a staging durable, fallback Series por categoría, publicación conjunta y `0 = todo`; probe media+metadata agrupado; métricas counts-only y límites efectivos | Xtream 27/27; sync real completo en 4.969 s con 39.093 películas, 455.520 episodios, 3 series omitidas, 0 duplicadas, pico 158.728.192 bytes y 0 stages residuales; Live TV direct/remux real verde; audits DB/logs/argv 0 findings | Repetición periódica del audit y matriz de clientes reales |
 | Catálogo general | Pushdown SQL paginado con total exacto, playback join y ParentId; Series usa una proyección durable/atómica por driver, página claves canónicas y conserva fallback legacy fail-closed; NextUp pliega el stream a un ganador por serie con clave/orden compartidos en core | API 356/0/3, DB 174/0/4, core 19/19 y Clippy estricto; migrador 38/38. PostgreSQL real: 455.585 episodios/22.201 series; tras el rollout 124, Series exacto en 129 ms y NextUp 22.034 exactos en 2,78–2,88 s, con memoria acotada por series e hidratación de solo la página | E2E visual/reproducción y caminos legacy poco frecuentes |
 | Facetas y filtros | Proyección item-level 117, resumen exacto 118, revisiones/CAS 119 y frontera de publicación 120 por carpeta/tipo; ganador determinista, coverage revisionada e invalidación fail-closed; 124 serializa publicación e invalidación de Series | 494.613 items/989.226 contribuciones → 96 filas; 124 aplicada en 742 ms. PostgreSQL aislado valida la carrera publication/write; staging conserva coverage de Series (455.585/22.201), resumen `1567/1567` y `2004/2004`, cero revisiones sucias | Scope padre+hijos/múltiple, coalescer de grandes lotes y E2E cliente real |
-| Redis | **No-go** y apagado | Benchmark reproducible: sin mejora frente a PG y con memoria adicional | Solo reabrir por caso multinodo o caché medida concreta |
+| Redis | Opcional, cache-aside de facetas públicas y conteos por biblioteca | Round-trip real, límites y fallback; benchmark reproducible conservado | Medir hit ratio/p95/evictions antes de ampliar el scope |
 | Supply chain | Pins, SBOM/scanners/excepciones gobernadas; runtime distroless sin shell/package manager; SQLx 0.9 sin `rsa`; FFmpeg por commit con 16 fixes oficiales verificados y NVD fail-closed; Jellyfin Web endurecido | Sobre HEAD `630a430`: supply-chain 46/46, packaging 47/47, security-hardening 16/16, systemd 14/14, performance/recovery 37/37; imagen Docker AArch64 nativa `e561d9fe178a` de 88.538.826 bytes con healthcheck de imagen, corpus y runtime smokes verdes, Compose real hasta esquema 117, SBOM verificado y RustSec/Trivy/NVD `passed=true` | Repetir todo en AMD64 nativo; después firma/provenance y pull por digest |
 | Staging bare-metal | PostgreSQL/runtime separados, loopback, TLS, renovación, logs proxy sin query, keyring por `LoadCredential`; FFmpeg software habilitado con un job, dos threads, niceness 10 y techo físico de 150% de CPU | Núcleo `b06b648`; esquema 124 desplegado el 2026-08-11 a las 16:17 UTC en 742 ms; health/readiness local y health HTTPS verdes, 0 reinicios/warnings, ~32 MiB actuales. 757 canales, 39.113 películas, 22.201 series y 455.585 episodios. Series exacto en 129 ms; `/Shows/NextUp` 22.034 exactos en 2,78–2,88 s; transcodes sustituidos se aíslan y serializan por usuario/dispositivo | E2E visual autenticado; worker externo/hardware para 4K; resolver egress/secretos operativos y ejecutar E2E MAGSTV; backups off-host |
 
@@ -1139,9 +1138,8 @@ rollout probado:
    los commits locales del core, incluidos `506c878` y `585468d`, aún no se han
    enviado a `origin`.
 
-Redis no está en esta lista: el resultado medido fue **no-go** para este nodo y
-permanece apagado. Sólo vuelve a evaluación si aparece coordinación multinodo o
-una caché concreta que supere los gates de
+Redis no es gate del cutover: su caché de facetas es opcional y PostgreSQL cubre
+todo el servicio si está apagado. Su rollout y umbrales se documentan en
 [`redis-decision.md`](redis-decision.md).
 
 ## 1. Contexto y objetivo
@@ -1168,9 +1166,9 @@ Las decisiones de arquitectura son:
 4. MySQL queda reconocido como selector reservado. Para habilitarlo deberá
    aportar adaptador, SQL, migraciones y suite de conformidad nativos; no se
    introducirá `AnyPool` ni un mínimo común de consultas.
-5. Redis no se integra en la topología actual tras su resultado no-go. Solo se
-   reconsiderará para una caché o coordinación multinodo medida; nunca será
-   fuente de verdad ni propietario de un FFmpeg.
+5. Redis se integra solo como caché opcional de facetas públicas y conteos compartidos por
+   biblioteca;
+   nunca será fuente de verdad, coordinación crítica ni propietario de FFmpeg.
 6. Los catálogos externos son reconstruibles; usuarios, configuración,
    credenciales, progreso y listas son datos irremplazables y se migrarán con
    verificación estricta.
@@ -1451,7 +1449,8 @@ symlink falla cerrado; un path inexistente es un no-op silencioso.
 | --- | --- | --- |
 | Usuarios, catálogo, configuración, listas y progreso | PostgreSQL | Duradera |
 | Historial y resultado de transcodes | PostgreSQL | Duradera y acotada por retención |
-| Caché/rate limits distribuidos futuros | Redis solo si se reabre el no-go | Efímera, con TTL |
+| Facetas públicas compartidas | Redis opcional cache-aside | Efímera, con TTL; PostgreSQL autoritativo |
+| Rate limits distribuidos futuros | Sin implementar | Requieren diseño y evidencia separados |
 | PID, `Child`, canales de stop y emisor live | Nodo Jellyrin propietario | Memoria local |
 | Segmentos HLS | Nodo propietario | Filesystem temporal con cuota |
 | Contenido multimedia | Proveedor externo | No se duplica en Jellyrin |
@@ -1573,8 +1572,8 @@ Registrar, sin incluir URLs ni credenciales:
 - Latencia de consulta por operación lógica, no el SQL ni sus parámetros.
 - Tiempo esperando conexión, conexiones activas/idle y errores SQLSTATE.
 - Filas recibidas/escritas y duración de cada sincronización de proveedor.
-- Hit/miss, bytes y errores de Redis únicamente si se reabre el no-go y se
-  integra una caché concreta.
+- Hit/miss, bytes, evictions y errores de Redis para la caché concreta de
+  facetas; nunca claves ni valores.
 
 Añadir contadores a `/System/Diagnostics` o a un endpoint interno equivalente.
 Nunca registrar `RemoteSourceUrl`, porque las URLs Xtream contienen usuario y
@@ -2137,13 +2136,12 @@ Las garantías de persistencia también son transaccionales:
   id.
 - Usar un rol PostgreSQL propietario solo para migraciones y otro rol de runtime
   sin permisos DDL. Exigir TLS si la conexión sale de la red local de Compose.
-- No publicar el puerto de PostgreSQL. Si se reabre Redis en el futuro, tampoco
-  publicar su puerto. Cargar secretos desde archivos protegidos o un secret
-  manager, no desde el repo.
+- No publicar el puerto de PostgreSQL ni Redis. Cargar secretos desde archivos
+  protegidos o un secret manager, no desde el repo.
 - Establecer `statement_timeout`, `lock_timeout` y límites de conexión para que
   una consulta o cliente defectuoso no agote el servidor.
-- Redactar DSN y SQL bind values. Si se integra Redis en el futuro, sus claves y
-  valores tampoco deben contener tokens, usuarios Xtream ni URLs.
+- Redactar DSN y SQL bind values. Las claves/valores Redis no contienen tokens,
+  usuarios Xtream ni URLs.
 - El tracing HTTP registra método y path, no la URI completa: las queries
   `api_key` usadas por clientes Jellyfin no llegan a spans ni access logs.
 
@@ -2155,16 +2153,15 @@ logs, y rotar credenciales si detecta una exposición.
 ## 12. Despliegue para este caso de uso
 
 Docker Compose es la opción recomendada para este servidor. El perfil base
-contiene Jellyrin y PostgreSQL. Los profiles Redis son scaffolding dormido para
-repetir benchmarks o una reevaluación futura; no forman parte de la topología
-objetivo ni deben activarse con el no-go vigente.
+contiene Jellyrin y PostgreSQL. Redis permanece bajo profiles explícitos porque
+es una optimización opcional, no una dependencia de disponibilidad.
 
 ### 12.1 Servicios y red
 
 - `jellyrin`: API, proxy, coordinador y procesos FFmpeg.
 - `postgres`: volumen duradero, healthcheck y sin puerto publicado.
-- `redis`: scaffolding bajo profiles `cache`/`distributed-cache`, apagado y sin
-  consumidor en la aplicación.
+- `redis`: caché-aside opcional bajo profiles `cache`/`distributed-cache`,
+  autenticado, sin persistencia ni puerto publicado.
 - `migrate`: job one-shot que ejecuta migraciones con el rol DDL antes de
   arrancar o actualizar Jellyrin.
 
@@ -2172,7 +2169,7 @@ Usar una red interna para datos y publicar únicamente Jellyrin detrás de HTTPS
 `/health` comprueba que el proceso responde; `/readyz` verifica PostgreSQL y el
 historial/checksum de esquema. FFmpeg/ffprobe se validan una vez antes de abrir
 el listener y un fallo aborta startup, no se refleja como una sonda dinámica de
-readiness. Redis está apagado y no participa en health/readiness.
+readiness. Redis no participa en health/readiness y su caída activa fallback a PostgreSQL.
 
 ### 12.2 Recursos y volúmenes
 
@@ -2199,8 +2196,8 @@ Separar:
 
 - `DATABASE_URL` de runtime y DSN de migración.
 - Límites del pool API y del worker de importación.
-- Sin URL Redis en el runtime actual; añadirla solo si se reabre el no-go con un
-  consumidor concreto.
+- URL Redis opcional, preferentemente desde credencial systemd; TTL y timeout
+  del consumidor concreto de facetas.
 - Root/cuota/retención de transcode.
 - Preset, threads, cupos y timeouts FFmpeg.
 - Clave de cifrado de credenciales del proveedor.
@@ -2862,33 +2859,25 @@ dataset representativo posterior a la importación real.
 Antes de cada migración de esquema, crear un backup restaurable y documentar si
 la migración es reversible. Usar patrón expand/contract para cambios online.
 
-### 13.11 Redis: no-go actual y umbral de reapertura
+### 13.11 Redis: caché opcional y umbral de ampliación
 
-No introducir Redis durante el primer cutover PostgreSQL. Activarlo únicamente
-si una métrica o despliegue multinodo lo justifica.
+Redis implementa únicamente cache-aside de facetas públicas y conteos compartidos por biblioteca.
+PostgreSQL aporta persistencia/coordinación; FFmpeg, broadcasts, leases y canales
+de cancelación conservan ownership local. La caché tiene namespace versionado,
+claves de scope hasheadas, TTL 30 s, valor máximo 64 KiB, timeout 20 ms,
+single-flight local y bypass de cinco segundos ante fallo. El análisis completo
+y runner reproducible están en `docs/redis-decision.md` y
+`qa/redis-cache-benchmark.sh`.
 
-**Decisión medida para la topología actual:** no integrar Redis. No hay cliente
-Redis ni consumidor de caché en el runtime. El servicio que conserva Compose
-bajo profiles existe solo como scaffolding dormido para reproducir el benchmark
-o evaluar un caso nuevo; no debe activarse. PostgreSQL ya aporta persistencia y
-coordinación compartida, mientras que FFmpeg, broadcasts, leases y canales de
-cancelación requieren ownership local. En el benchmark aislado de 50.000
-valores de 1 KiB, Redis añadió unos 12 MiB de RSS vacío y unos 80 MiB cargado;
-PostgreSQL caliente sostuvo la misma escala de decenas de miles de lecturas por
-segundo. El análisis completo y el runner reproducible están en
-`docs/redis-decision.md` y `qa/redis-cache-benchmark.sh`.
+Antes de ampliar el scope, una prueba A/B debe mejorar materialmente el p95 o
+reducir al menos 30 % la carga PostgreSQL, mantener hit ratio de 80 %, evictions
+menores al 1 % y caber en menos del 5 % de la RAM del host.
 
-La decisión solo se reabre con un endpoint o necesidad multinodo concreta. La
-prueba A/B debe mejorar el p95 end-to-end al menos 25 % y 10 ms o reducir al
-menos 30 % la carga PostgreSQL, mantener un hit ratio de 80 % y caber en menos
-del 5 % de la RAM del host. Sin esos umbrales, el profile permanece apagado.
+Usos candidatos solo con nueva evidencia:
 
-Usos candidatos únicamente si se reabre la decisión:
-
-- Cache-aside de respuestas de catálogo costosas y no sensibles.
+- Otra proyección de catálogo costosa, no sensible y realmente compartida.
 - Rate limit de autenticación compartido entre nodos.
-- Presencia e invalidaciones best-effort.
-- Single-flight distribuido para evitar stampede de una caché cara.
+- Invalidaciones best-effort.
 
 Usos excluidos:
 
@@ -2946,8 +2935,7 @@ Exponer o recopilar:
 - Sync: parse/copy/merge/commit por separado, items nuevos/cambiados/missing.
 - PostgreSQL: locks, deadlocks, cache hit, temp bytes, WAL, checkpoints,
   autovacuum, bloat y slow queries.
-- Redis futuro, solo si se reabre el no-go: hit ratio, evictions, expirations,
-  used memory y fallbacks.
+- Redis opcional: hit ratio, evictions, expirations, used memory y fallbacks.
 
 No activar logging SQL con bind values en producción. `EXPLAIN ANALYZE` ejecuta
 la consulta: usarlo en staging o con extremo cuidado para escrituras.
@@ -3273,10 +3261,10 @@ y con procesos/fuentes reales, no escribir ese control de ciclo de vida.
   el core y ejecutar el E2E actualmente diferido. Los audits actuales de
   DB/logs/argv están completos y limpios; cualquier catálogo legacy futuro
   obliga a reimportar y repetirlos antes de declarar completado el rollout.
-- [x] PostgreSQL no publica puerto y usa roles/secretos separados; Redis está
-  apagado y su scaffolding bajo profiles tampoco publica puerto.
-- Redis no es una dependencia actual. La degradación a PostgreSQL solo será un
-  criterio si se reabre e integra una caché concreta.
+- [x] PostgreSQL no publica puerto y usa roles/secretos separados; Redis es
+  opcional, autenticado y tampoco publica puerto.
+- [x] La degradación de Redis a PostgreSQL está acotada por timeout y circuit
+  breaker; readiness no depende de la caché.
 - [~] Una caída de PostgreSQL produce errores controlados y readiness false; no se
   sirven respuestas como si fueran válidas con estado parcial.
 - [~] Cuota HLS llena, provider lento y FFmpeg fallido tienen errores observables y
@@ -3422,8 +3410,8 @@ Después de instrumentación, este track puede desarrollarse en paralelo:
 2. Ejecutar carga, caos, seguridad y restore end-to-end.
 3. Ajustar recursos con datos del host, documentar dashboards y alertas.
 4. Activar cada política FFmpeg con feature flag y cohortes/clientes conocidos.
-5. `[x]` Redis fue evaluado y dio no-go; permanece sin desplegar mientras no
-   exista un caso multinodo o benchmark nuevo que supere los gates.
+5. `[~]` Redis se limita a facetas públicas y conteos por biblioteca; medir hit ratio/p95/evictions en el
+   rollout antes de ampliar su alcance.
 
 Cada fase debe tener migración, métricas, criterio de salida y rollback. Mantener
 defaults conservadores hasta que Jellyfin Web, Android TV y los golden tests
@@ -3439,8 +3427,8 @@ confirmen compatibilidad.
 | Port SQL cambia NULL/cascade/boolean/time | Tipos nativos y tests por repositorio | CI PostgreSQL y auditoría de FKs | Restaurar dump o rollback antes de abrir escrituras |
 | Migración tarda demasiado | Dry run con snapshot real y reconstrucción de datos externos | Tiempos por fase y ETA en reporte | Cancelar antes de cutover; SQLite queda intacto |
 | PostgreSQL compite con FFmpeg por CPU/RAM | Pools pequeños, cupo FFmpeg agregado, un encode y dos threads para encoder/filtros | CPU, RSS, pool waits y `speed` | Reducir worker/encode; pausar sync durante encode si se mide necesario |
-| Redis futuro devuelve caché obsoleta si se reabre el no-go | Invalidación post-commit, versionado y TTL | Comparación muestreada con PostgreSQL | Bump de namespace o flush solo del prefijo Jellyrin |
-| Redis futuro bloquea Jellyrin si se reabre la decisión | Timeouts cortos, circuit breaker y cache-aside | Métricas de fallback y health Redis | Bypass de caché; PostgreSQL sigue operativo |
+| Redis devuelve una faceta obsoleta | Namespace versionado y TTL corto | Comparación muestreada con PostgreSQL | Bump de namespace o flush solo del prefijo Jellyrin |
+| Redis se cae o satura | Timeout corto, circuit breaker y cache-aside | Métricas de fallback y health Redis | Bypass automático; PostgreSQL sigue operativo |
 | Cambio direct/remux rompe un cliente | Decision engine, perfiles y feature flags por cliente | Matriz Jellyfin Web/TV y razones | Desactivar modo nuevo para ese perfil |
 | FFmpeg queda huérfano o duplica sesión | Coordinador, RAII, dedupe, process groups y cierre graceful con escalado | Reconciliación, tests de grupo y métrica de procesos en staging | Kill/cleanup y reconstrucción del registro |
 | HLS llena disco | Rolling window, admisión serializada, reserva RAII, monitor único, cuota y retención | Bytes usados/reservados por sesión y filesystem alerts | Cancelar productor, limpiar sesiones antiguas y aplicar límite físico al volumen |

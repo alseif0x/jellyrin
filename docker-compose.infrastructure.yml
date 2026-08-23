@@ -17,13 +17,19 @@ services:
       - -c
       - password_encryption=scram-sha-256
       - -c
-      - shared_buffers=128MB
+      - shared_buffers=${POSTGRES_SHARED_BUFFERS:-128MB}
       - -c
-      - effective_cache_size=256MB
+      - effective_cache_size=${POSTGRES_EFFECTIVE_CACHE_SIZE:-256MB}
       - -c
-      - work_mem=4MB
+      - work_mem=${POSTGRES_WORK_MEM:-4MB}
       - -c
-      - maintenance_work_mem=64MB
+      - maintenance_work_mem=${POSTGRES_MAINTENANCE_WORK_MEM:-64MB}
+      - -c
+      - random_page_cost=${POSTGRES_RANDOM_PAGE_COST:-4}
+      - -c
+      - effective_io_concurrency=${POSTGRES_EFFECTIVE_IO_CONCURRENCY:-1}
+      - -c
+      - track_io_timing=${POSTGRES_TRACK_IO_TIMING:-off}
       - -c
       - max_wal_size=4GB
       - -c
@@ -40,9 +46,9 @@ services:
       - pg_stat_statements.max=5000
       - -c
       - pg_stat_statements.save=on
-    shm_size: 128mb
-    mem_limit: 512m
-    cpus: 0.75
+    shm_size: ${POSTGRES_SHM_SIZE:-128mb}
+    mem_limit: ${POSTGRES_MEMORY_LIMIT:-512m}
+    cpus: ${POSTGRES_CPU_LIMIT:-0.75}
     pids_limit: 128
     volumes:
       - jellyrin-postgres:/var/lib/postgresql/data
@@ -68,12 +74,12 @@ services:
       - jellyrin-backend
 
   redis:
-    image: ${REDIS_IMAGE:-docker.io/library/redis:7.2.14-bookworm@sha256:f0707c78ea880b293ccdeb410c9c0a8ccae93fe7128799b751333a698b0a39a7}
+    image: ${REDIS_IMAGE:-docker.io/library/redis:8.2.8-bookworm@sha256:2f7462b9e93e0a7ae2edf3a0a0babc8a4d29f8bfc50849b906b7caaef925edc1}
     profiles: ["cache", "distributed-cache"]
     restart: unless-stopped
     environment:
-      # Dormant benchmark/future-reevaluation scaffold. It is not part of the current topology and
-      # fails closed if an operator deliberately enables a profile without a secret.
+      # Optional cache-aside service. It is never a source of truth and fails closed if an operator
+      # deliberately enables a profile without a secret.
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
     command:
       - /bin/sh
@@ -83,11 +89,11 @@ services:
         exec redis-server \
           --save "" \
           --appendonly no \
-          --maxmemory 64mb \
+          --maxmemory ${REDIS_MAXMEMORY:-64mb} \
           --maxmemory-policy allkeys-lru \
           --maxclients 64 \
           --requirepass "$${REDIS_PASSWORD}"
-    mem_limit: 96m
+    mem_limit: ${REDIS_MEMORY_LIMIT:-96m}
     cpus: 0.25
     pids_limit: 64
     healthcheck:

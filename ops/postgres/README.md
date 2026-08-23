@@ -36,15 +36,19 @@ not rotate roles in an existing cluster. For an existing volume, back it up and 
 explicitly as an administrator; recreate the volume only when its contents are known to be
 disposable.
 
-Redis is an optional cache scaffold and is not part of durable storage. The current single-node
-decision is to leave it stopped; `docs/redis-decision.md` records the benchmark and activation
-thresholds. Start it only after the application has a measured use for it:
+Redis is an optional cache and is not part of durable storage. Small installations should leave it
+stopped; large shared catalogues may enable it for the measured facet and folder-count
+projections. `docs/redis-decision.md` records the benchmark, fail-open contract and activation
+thresholds:
 
 ```bash
-docker compose --profile distributed-cache up -d
+COMPOSE_FILE=docker-compose.yml:docker-compose.redis-cache.yml \
+COMPOSE_PROFILES=cache \
+  docker compose --profile distributed-cache up -d
 ```
 
-The profile fails closed unless `REDIS_PASSWORD` is set.
+The profile fails closed unless `REDIS_PASSWORD` and `JELLYRIN_REDIS_URL_HOST_FILE` are set. The URL
+file is mounted read-only and Jellyrin waits for Redis health before reading it.
 
 ## External or systemd deployment
 
@@ -81,6 +85,12 @@ Install `jellyrin-postgres-backup-local-peer.conf.example` as a systemd drop-in
 in that topology; it removes the unused `pgpass` credential. For a remote
 database, keep the generic unit, replace the socket with a TLS hostname,
 require full certificate verification, and provision a dedicated password.
+
+For the measured dedicated 24 GiB host, `performance-24gb.conf.example` records the conservative
+catalogue profile and `../jellyrin-database-performance.conf` records the matching API/worker pool
+split. These are host-sized examples, not universal defaults: validate RAM, concurrent query count
+and `pg_stat_statements` before installing them. In particular, `work_mem` is per sort/hash node and
+`shared_buffers` requires a PostgreSQL restart.
 
 Do not reuse the runtime role. Create a non-superuser login dedicated to backup, grant it
 `CONNECT` on the database and membership in PostgreSQL's `pg_read_all_data` predefined role.

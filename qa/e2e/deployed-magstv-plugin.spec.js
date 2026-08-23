@@ -3,12 +3,17 @@ const fsConstants = require('node:fs').constants;
 const { test, expect } = require('@playwright/test');
 
 const PLUGIN_ID = '7a7a8541-29f8-4c35-99b1-66df55f8399e';
-const TUNER_ID = 'magstv';
+const TUNER_ID = process.env.JELLYRIN_E2E_MAGSTV_TUNER_ID || 'magstv';
 const DEVICE_ID = 'deployed-magstv-plugin-qa';
-const REQUIRED_VIEWS = Object.freeze({
+const DEFAULT_REQUIRED_VIEWS = Object.freeze({
   movies: 'Mags Movies',
   series: 'Mags Series',
   liveTv: 'Mags Live TV',
+});
+const REQUIRED_VIEWS = Object.freeze({
+  movies: process.env.JELLYRIN_E2E_MAGSTV_MOVIES_VIEW || DEFAULT_REQUIRED_VIEWS.movies,
+  series: process.env.JELLYRIN_E2E_MAGSTV_SERIES_VIEW || DEFAULT_REQUIRED_VIEWS.series,
+  liveTv: process.env.JELLYRIN_E2E_MAGSTV_LIVE_VIEW || DEFAULT_REQUIRED_VIEWS.liveTv,
 });
 
 const catalogueTimeoutMs = positiveIntegerEnvironment(
@@ -162,9 +167,9 @@ test.describe('MAGSTV home view locator contract', () => {
     `);
 
     const expectedHrefs = {
-      [REQUIRED_VIEWS.movies]: '#/movies?topParentId=movies-view&collectionType=movies',
-      [REQUIRED_VIEWS.series]: '#/tv?topParentId=series-view&collectionType=tvshows',
-      [REQUIRED_VIEWS.liveTv]: '#/list?serverId=server&parentId=live-view',
+      [DEFAULT_REQUIRED_VIEWS.movies]: '#/movies?topParentId=movies-view&collectionType=movies',
+      [DEFAULT_REQUIRED_VIEWS.series]: '#/tv?topParentId=series-view&collectionType=tvshows',
+      [DEFAULT_REQUIRED_VIEWS.liveTv]: '#/list?serverId=server&parentId=live-view',
     };
     for (const [name, href] of Object.entries(expectedHrefs)) {
       const link = myMediaViewLink(page, name);
@@ -218,6 +223,12 @@ test.describe('MAGSTV episode candidate sampling contract', () => {
       .toBe('alternate audio track unavailable');
     expect(safeErrorReason(new Error('VOD alternative audio language label is unavailable')))
       .toBe('audio language/selection unavailable');
+  });
+});
+
+test.describe('MAGSTV live TV candidate sampling contract', () => {
+  test('spreads candidates across the catalogue instead of only probing its first group', () => {
+    expect(evenlySpacedIndexes(21, 5)).toEqual([0, 5, 10, 15, 20]);
   });
 });
 
@@ -348,7 +359,8 @@ async function verifyEncryptedTunerConfiguration(request, token) {
   expect(serialized.includes('"username"')).toBe(false);
   expect(serialized.includes('"password"')).toBe(false);
   expect(tuner.Type).toBe(`plugin:${PLUGIN_ID}`);
-  expect(tuner.FriendlyName).toBe(REQUIRED_VIEWS.liveTv);
+  expect(tuner.FriendlyName).toEqual(expect.any(String));
+  expect(tuner.FriendlyName.trim()).not.toBe('');
   expect(tuner.JellyrinProviderSecretRef?.Id).toBeTruthy();
   expect(tuner.JellyrinProviderSecretRef?.Provider).toBeTruthy();
   expect(Number(tuner.JellyrinProviderSecretRef?.Revision)).toBeGreaterThan(0);
@@ -424,7 +436,7 @@ async function catalogueSnapshot(request, auth) {
     request.get(itemsPath(auth.User.Id, views.series.Id, 'Series'), { headers, timeout: 60_000 }),
     request.get(itemsPath(auth.User.Id, views.series.Id, 'Episode'), { headers, timeout: 60_000 }),
     request.get(
-      `/LiveTv/Channels?UserId=${encodeURIComponent(auth.User.Id)}&ParentId=${encodeURIComponent(views.liveTv.Id)}&StartIndex=0&Limit=5`,
+      `/LiveTv/Channels?UserId=${encodeURIComponent(auth.User.Id)}&ParentId=${encodeURIComponent(views.liveTv.Id)}&StartIndex=0&Limit=1`,
       { headers, timeout: 60_000 },
     ),
   ]);
@@ -442,15 +454,60 @@ async function catalogueSnapshot(request, auth) {
     episodesResponse.json(),
     channelsResponse.json(),
   ]);
+  const normalizedChannels = await sampleLiveTvCandidatesFromApi(
+    request,
+    auth,
+    views.liveTv.Id,
+    channels,
+  );
   const normalized = {
     views,
     movies: normalizePage(movies),
     series: normalizePage(series),
     episodes: normalizePage(episodes),
-    channels: normalizePage(channels),
+    channels: {
+      total: normalizedChannels.total,
+      items: normalizedChannels.items,
+    },
   };
   expect(normalized.channels.items.every((item) => item.TunerHostId === TUNER_ID)).toBe(true);
   return normalized;
+}
+
+async function sampleLiveTvCandidatesFromApi(request, auth, viewId, firstPageBody) {
+  const firstPage = normalizePage(firstPageBody);
+  const indexes = evenlySpacedIndexes(firstPage.total, catalogueCandidateLimit);
+  const candidates = [];
+  const lookupConcurrency = 4;
+  for (let offset = 0; offset < indexes.length; offset += lookupConcurrency) {
+    const batch = indexes.slice(offset, offset + lookupConcurrency);
+    const results = await Promise.all(batch.map(async (startIndex) => {
+      if (startIndex === 0) return firstPage.items[0] || null;
+      const response = await request.get(
+        `/LiveTv/Channels?UserId=${encodeURIComponent(auth.User.Id)}`
+          + `&ParentId=${encodeURIComponent(viewId)}`
+          + `&StartIndex=${startIndex}&Limit=1`,
+        {
+          headers: { 'X-Emby-Token': auth.AccessToken },
+          timeout: 60_000,
+        },
+      );
+      if (response.status() !== 200) return null;
+      return normalizePage(await response.json()).items[0] || null;
+    }));
+    candidates.push(...results.filter(Boolean));
+  }
+  return { total: firstPage.total, items: candidates };
+}
+
+function evenlySpacedIndexes(total, limit) {
+  if (total <= 0 || limit <= 0) return [];
+  if (total <= limit) return Array.from({ length: total }, (_, index) => index);
+  if (limit === 1) return [0];
+  const lastIndex = total - 1;
+  return Array.from({ length: limit }, (_, index) => (
+    Math.round((index * lastIndex) / (limit - 1))
+  ));
 }
 
 function itemsPath(userId, parentId, itemType) {

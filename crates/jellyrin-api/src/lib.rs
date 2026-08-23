@@ -8,6 +8,7 @@ mod auxiliary_ffmpeg_telemetry;
 mod backup;
 mod builtin_metadata;
 mod capabilities;
+mod catalog_cache;
 mod configuration_service;
 mod dlna;
 mod errors;
@@ -51,6 +52,7 @@ pub(crate) use auth_handlers::{
 };
 pub(crate) use backup::{backup_manifest, backups, create_backup, restore_backup};
 pub(crate) use capabilities::{parse_bool_query_value, update_session_capabilities};
+pub use catalog_cache::configure_shared_catalog_cache;
 pub(crate) use configuration_service::ConfigurationService;
 pub use errors::ApiError;
 pub(crate) use file_service::FileService;
@@ -141,8 +143,8 @@ use jellyrin_db::{
     LiveTvChannelUpsert, LiveTvStreamProbeOutcome, LiveTvStreamProbeUpsert, LiveTvTunerUpsert,
     MEDIA_ITEM_CATALOG_MAX_FACET_SELECTORS, MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE, MediaCatalogStore,
     MediaItemCatalogCounts, MediaItemCatalogEntry, MediaItemCatalogQuery,
-    MediaItemCatalogSearchScope, MediaItemCatalogSortField, MediaItemFacetKind,
-    MediaItemFavoriteFilter, MediaItemMetadata, MediaItemQueryFilterSelection,
+    MediaItemCatalogSearchScope, MediaItemCatalogSortField, MediaItemFacetCandidateQuery,
+    MediaItemFacetKind, MediaItemFavoriteFilter, MediaItemMetadata, MediaItemQueryFilterSelection,
     MediaItemQueryFilterValues, MediaList, MediaListItem, MediaListUserPermission,
     NamedConfigurationPayload, PLUGIN_VOD_MEDIA_RUNTIME_PROBE_FIELD,
     PROVIDER_SECRET_REFERENCE_FIELD, PluginRuntimeInstanceUpsert, ProviderSecretReference,
@@ -166,11 +168,13 @@ use jellyrin_plugin_rpc::{
     PluginRpcErrorCode, PluginRpcMethod, PluginRuntime, PluginWebPage, UpdateConfigurationRequest,
 };
 use jellyrin_plugin_sdk::{
-    CAPABILITY_LIVE_TV_PROVIDER, CAPABILITY_VOD_LIBRARY_PROVIDER, LiveTvDeliveryCapabilities,
-    LiveTvPlaybackContext, LiveTvPlaybackDelivery, LiveTvPlaybackResult, LiveTvProviderRequest,
-    LiveTvProviderSecretGrant, PERMISSION_PROVIDER_SECRETS, SensitiveString, SensitiveUrl,
-    VOD_ITEM_TYPE_EPISODE, VOD_ITEM_TYPE_MOVIE, VOD_ITEM_TYPE_SERIES, VodLibraryProviderRequest,
-    VodMediaItem, VodPlaybackContext, VodPlaybackResult,
+    CAPABILITY_LIVE_TV_PROVIDER, CAPABILITY_USER_CATALOG_AUTHORIZATION,
+    CAPABILITY_VOD_LIBRARY_PROVIDER, LiveTvDeliveryCapabilities, LiveTvPlaybackContext,
+    LiveTvPlaybackDelivery, LiveTvPlaybackResult, LiveTvProviderRequest, LiveTvProviderSecretGrant,
+    PERMISSION_PROVIDER_SECRETS, PluginUserAuthorizationRequest, PluginUserAuthorizationResult,
+    PluginUserContext, SensitiveString, SensitiveUrl, VOD_ITEM_TYPE_EPISODE, VOD_ITEM_TYPE_MOVIE,
+    VOD_ITEM_TYPE_SERIES, VodLibraryProviderRequest, VodMediaItem, VodPlaybackContext,
+    VodPlaybackResult,
 };
 use jellyrin_transcode::{
     BoundedCommandOutputError, BoundedCommandOutputOptions,
@@ -194,6 +198,7 @@ use tokio::sync::{Mutex, RwLock, Semaphore, broadcast, oneshot, watch};
 use tokio_util::io::ReaderStream;
 use tower_http::{
     LatencyUnit,
+    compression::CompressionLayer,
     services::ServeDir,
     trace::{DefaultOnRequest, DefaultOnResponse, TraceLayer},
 };
@@ -214,6 +219,64 @@ const SYNCPLAY_DRIFT_THRESHOLD_TICKS: i64 = 5_000_000;
 const IMAGE_UPLOAD_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 const REMOTE_IMAGE_CLIENT_CACHE_MAX_ENTRIES: usize = 64;
 const REMOTE_IMAGE_CLIENT_CACHE_TTL: StdDuration = StdDuration::from_secs(10 * 60);
+/// Candidate cap for the trailer endpoints. Trailers are derived from item metadata rather than a
+/// projection, so the SQL predicate narrows the source and this bounds what reaches Rust.
+const REMOTE_TRAILER_SOURCE_MAX_ITEMS: usize = MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE;
+/// Long-edge bound applied to provider artwork before it is cached on disk. Storing the provider's
+/// originals verbatim projected to roughly 316 GiB for this catalogue. 900px keeps the detail-page
+/// poster sharp on a HiDPI client while still being a small fraction of a multi-megabyte original;
+/// grid cards request far smaller derivatives from this same entry.
+const PROVIDER_ARTWORK_STORED_MAX_EDGE: u32 = 900;
+/// JPEG quality for stored artwork and derivatives. High enough that downscaled posters keep clean
+/// text and gradients; the remaining size comes from the dimension bound rather than the quantiser.
+const STORED_ARTWORK_JPEG_QUALITY: u8 = 90;
+/// Only cached artwork above this size is re-encoded, so a repeat compaction pass is a stat-only
+/// walk over an already-bounded cache.
+const ARTWORK_COMPACTION_MIN_BYTES: u64 = 128 * 1024;
+/// Disk budget for on-demand artwork. At the measured ~45 KiB per bounded entry this holds roughly
+/// 180,000 posters, far more than a library's browsed working set, while leaving the volume room
+/// for transcodes and the database. Override with `JELLYRIN_ARTWORK_CACHE_MAX_BYTES`.
+const DEFAULT_ARTWORK_CACHE_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// Ceiling on entries held in memory during one eviction pass. A pass that hits this reclaims from
+/// what it tracked and reports itself as truncated rather than silently appearing complete.
+const ARTWORK_CACHE_MAX_TRACKED_ENTRIES: usize = 500_000;
+/// How often the artwork cache is measured against its budget.
+const ARTWORK_CACHE_QUOTA_INTERVAL: StdDuration = StdDuration::from_secs(15 * 60);
+/// Provider artwork scopes eligible for compaction. User and branding uploads are excluded: those
+/// are operator-supplied originals, not a regenerable provider cache.
+const ARTWORK_COMPACTION_SCOPES: [&str; 2] = ["items", "livetv"];
+/// Bounded candidate page used to pick one representative item for a by-name image. A popular
+/// genre matches a large share of the catalogue, so only the first candidates are probed on disk.
+const NAMED_ENTITY_IMAGE_CANDIDATE_LIMIT: usize = 64;
+/// Facet families a by-name image may be resolved from, in the order the previous metadata scan
+/// inspected them: genres, music genres, artists, album artists, people and studios.
+const NAMED_ENTITY_IMAGE_FACET_KINDS: [MediaItemFacetKind; 6] = [
+    MediaItemFacetKind::Genre,
+    MediaItemFacetKind::MusicGenre,
+    MediaItemFacetKind::MusicArtist,
+    MediaItemFacetKind::MusicAlbumArtist,
+    MediaItemFacetKind::Person,
+    MediaItemFacetKind::Studio,
+];
+const PLUGIN_VOD_GRID_IMAGE_MAX_IN_FLIGHT: usize = 8;
+/// Concurrency for listing-driven artwork warming. Each fill is one credentialed provider call of
+/// roughly three seconds, so this sets how fast a freshly browsed page becomes complete while
+/// leaving provider and CPU headroom for playback.
+const PLUGIN_VOD_ARTWORK_PREFETCH_MAX_IN_FLIGHT: usize = 12;
+/// Upper bound on how many items a single listing may queue, so an unusually large page cannot fan
+/// out beyond one screen's worth of provider work.
+const PLUGIN_VOD_ARTWORK_PREFETCH_MAX_PER_PAGE: usize = 120;
+/// How long an image request will wait for a fill the listing already queued. A browser waits far
+/// longer than this for an image, and one page of queued fills completes well inside it.
+const PLUGIN_VOD_ARTWORK_FILL_MAX_WAIT: StdDuration = StdDuration::from_secs(45);
+/// Poll step while waiting. Coarse enough to be free, fine enough to be invisible.
+const PLUGIN_VOD_ARTWORK_FILL_POLL_INTERVAL: StdDuration = StdDuration::from_millis(200);
+/// Bound on remembered claims. Reached only by a long browsing session; the oldest are dropped.
+const PLUGIN_VOD_ARTWORK_PREFETCH_MAX_CLAIMS: usize = 8_192;
+/// How long a claim suppresses re-queueing the same item. Long enough that scrolling back over a
+/// page does not repeat work, short enough that a transient provider failure is retried.
+const PLUGIN_VOD_ARTWORK_PREFETCH_CLAIM_TTL: StdDuration = StdDuration::from_secs(10 * 60);
+const PLUGIN_VOD_GRID_IMAGE_WAIT_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 const ISO_639_2_DATA: &str = include_str!("localization/iso6392.txt");
 const COUNTRIES_DATA: &str = include_str!("localization/countries.json");
 const TERMINAL_TRANSCODE_CLEANUP_INTERVAL_SECONDS: u64 = 60 * 60;
@@ -229,6 +292,12 @@ const INTERNAL_REMOTE_RELAY_MAX_ENTRIES: usize = 4_096;
 const INTERNAL_REMOTE_RELAY_TOKEN_BYTES: usize = 32;
 const INTERNAL_REMOTE_RELAY_PROBE_TTL: StdDuration = StdDuration::from_secs(2 * 60);
 const INTERNAL_REMOTE_RELAY_TRANSCODE_TTL: StdDuration = StdDuration::from_secs(12 * 60 * 60);
+// FFmpeg commonly opens the same seekable MPEG-TS input several times (HEAD plus byte ranges)
+// while locating a timestamp. Resolving a fresh provider grant for every one of those loopback
+// requests makes an otherwise fast seek exceed Android TV's source timeout. Keep the signed URL
+// only inside the unguessable relay lease, briefly and in memory; public proxy requests still
+// resolve independently, and an authorization rejection evicts it immediately.
+const INTERNAL_PLUGIN_VOD_PLAYBACK_CACHE_TTL: StdDuration = StdDuration::from_secs(90);
 const REMOTE_MEDIA_RESPONSE_HEADER_TIMEOUT: StdDuration = StdDuration::from_secs(15);
 const REMOTE_MEDIA_CHUNK_IDLE_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 const REMOTE_MEDIA_DNS_TIMEOUT: StdDuration = StdDuration::from_secs(10);
@@ -332,7 +401,17 @@ static TRANSCODE_LAST_ACCESS: OnceLock<Mutex<HashMap<String, tokio::time::Instan
 static SYNCPLAY_GROUPS: OnceLock<Mutex<HashMap<String, SyncPlayGroup>>> = OnceLock::new();
 static AUTH_FAILURES: OnceLock<Mutex<AuthFailureRegistry>> = OnceLock::new();
 static REMOTE_IMAGE_HTTP_CLIENTS: OnceLock<Mutex<RemoteImageClientCache>> = OnceLock::new();
+static PLUGIN_VOD_GRID_IMAGE_ADMISSION: OnceLock<Arc<Semaphore>> = OnceLock::new();
+static PLUGIN_VOD_ARTWORK_PREFETCH_ADMISSION: OnceLock<Arc<Semaphore>> = OnceLock::new();
+type PluginVodArtworkFillKey = (PathBuf, Uuid);
+static PLUGIN_VOD_ARTWORK_PREFETCH_CLAIMS: OnceLock<
+    StdMutex<HashMap<PluginVodArtworkFillKey, StdInstant>>,
+> = OnceLock::new();
+static PLUGIN_VOD_ARTWORK_FILL_PENDING: OnceLock<StdMutex<HashSet<PluginVodArtworkFillKey>>> =
+    OnceLock::new();
 static INTERNAL_REMOTE_RELAYS: OnceLock<StdMutex<HashMap<String, InternalRemoteRelayEntry>>> =
+    OnceLock::new();
+static RECENT_METADATA_ENTITIES: OnceLock<StdMutex<HashMap<String, MetadataEntityMatch>>> =
     OnceLock::new();
 static CONFIGURED_PLUGIN_PACKAGES_ROOT: OnceLock<PathBuf> = OnceLock::new();
 static CONFIGURED_API_CACHE_ROOT: OnceLock<PathBuf> = OnceLock::new();
@@ -998,6 +1077,8 @@ static LIVE_TUNER_LEASES: OnceLock<StdMutex<HashMap<LiveTunerLeaseKey, LiveTuner
 static TEST_RUST_WASI_HOST_BINARY_PATH: OnceLock<StdMutex<Option<PathBuf>>> = OnceLock::new();
 #[cfg(test)]
 static TEST_DOTNET_HOST_BINARY_PATH: OnceLock<StdMutex<Option<PathBuf>>> = OnceLock::new();
+#[cfg(test)]
+static TEST_PROVIDER_EGRESS_PROXY: OnceLock<StdMutex<Option<String>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 struct LiveTunerLeaseKey {
@@ -4497,7 +4578,46 @@ pub fn router(state: AppState) -> Router {
                         .latency_unit(LatencyUnit::Millis),
                 ),
         )
+        // Compress ordinary JSON/web responses even when Jellyrin is exposed directly without an
+        // optional reverse proxy.
+        .layer(CompressionLayer::new().compress_when(response_compression_predicate()))
         .with_state(state)
+}
+
+/// Never compress a byte-range response.
+///
+/// Gzipping a `206 Partial Content` body leaves its `Content-Range` describing the original bytes
+/// rather than the bytes on the wire, so a client seeking inside a stream reads the wrong offsets.
+#[derive(Clone, Copy)]
+struct NotForByteRanges;
+
+impl tower_http::compression::predicate::Predicate for NotForByteRanges {
+    fn should_compress<B>(&self, response: &axum::http::Response<B>) -> bool
+    where
+        B: http_body::Body,
+    {
+        response.status() != StatusCode::PARTIAL_CONTENT
+            && !response.headers().contains_key(header::CONTENT_RANGE)
+    }
+}
+
+/// Which responses the public router may gzip.
+///
+/// tower-http's default predicate skips only gRPC, images and server-sent events. Media is neither,
+/// so the default would spend CPU recompressing already compressed audio and video on every byte
+/// served, and would corrupt byte-range responses. Exclude both, and keep the default size and
+/// content-encoding rules for everything else.
+fn response_compression_predicate() -> impl tower_http::compression::predicate::Predicate {
+    use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
+
+    DefaultPredicate::new()
+        .and(NotForByteRanges)
+        .and(NotForContentType::const_new("video/"))
+        .and(NotForContentType::const_new("audio/"))
+        .and(NotForContentType::const_new(
+            "application/vnd.apple.mpegurl",
+        ))
+        .and(NotForContentType::const_new("application/x-mpegurl"))
 }
 
 fn safe_http_request_trace_span<B>(request: &axum::http::Request<B>) -> tracing::Span {
@@ -11890,6 +12010,260 @@ async fn invoke_installed_plugin_capability_via_runtime_host(
     invoke_plugin_capability_via_runtime_host(&plugin, capability, arguments).await
 }
 
+/// Delegates per-user catalog visibility to plugins that explicitly advertise the optional
+/// authorization capability. Plugins without it preserve the historical visible-to-all behavior.
+/// A declared capability is fail-closed: malformed, unavailable or missing decisions deny access.
+async fn plugin_user_may_access_tuner_catalog(
+    db: &Database,
+    plugin_id: &str,
+    tuner_id: &str,
+    user_context: jellyrin_plugin_sdk::PluginUserContext,
+) -> Result<bool, ApiError> {
+    let Some(plugin) = db.installed_plugin_json(plugin_id).await? else {
+        return Ok(false);
+    };
+    if !json_string_field(&plugin, "Status")
+        .is_some_and(|status| status.eq_ignore_ascii_case("Active"))
+    {
+        return Ok(false);
+    }
+    if !plugin_string_array(plugin.get("Capabilities"))
+        .iter()
+        .any(|capability| capability.eq_ignore_ascii_case(CAPABILITY_USER_CATALOG_AUTHORIZATION))
+    {
+        return Ok(true);
+    }
+    let Some(configuration) = db.live_tv_tuner_configuration_by_id(tuner_id).await? else {
+        return Ok(false);
+    };
+    let provider_type = json_string_field(&configuration, "Type")
+        .ok_or_else(|| ApiError::service_unavailable("Plugin tuner route is unavailable"))?;
+    let Some(routed_plugin_id) = live_tv_plugin_id_from_payload(&configuration, &provider_type)
+    else {
+        return Ok(false);
+    };
+    if !routed_plugin_id.eq_ignore_ascii_case(plugin_id) {
+        return Ok(false);
+    }
+    let provider_config = redacted_live_tv_plugin_tuner_config(configuration)?;
+    let config_bytes = serde_json::to_vec(&provider_config)
+        .map_err(|_| ApiError::internal("Invalid plugin tuner configuration"))?;
+    let cache_key =
+        plugin_catalog_authorization_cache_key(plugin_id, tuner_id, &user_context, &config_bytes);
+    let now = StdInstant::now();
+    {
+        let mut cache = plugin_catalog_authorization_cache().lock().await;
+        cache.retain(|_, entry| entry.expires_at > now);
+        if let Some(entry) = cache.get(&cache_key) {
+            return Ok(entry.allowed);
+        }
+    }
+    let request = PluginUserAuthorizationRequest::authorize_catalog(provider_config, user_context);
+    let arguments = serde_json::to_value(request)
+        .map_err(|_| ApiError::internal("Invalid plugin catalog authorization request"))?;
+    let Some(result) = invoke_installed_plugin_capability_via_runtime_host(
+        db,
+        &plugin,
+        CAPABILITY_USER_CATALOG_AUTHORIZATION,
+        arguments,
+    )
+    .await?
+    else {
+        return Ok(false);
+    };
+    let decision = serde_json::from_value::<PluginUserAuthorizationResult>(serde_json::json!({
+        "Allowed": json_field_case_insensitive(&result.value, "Allowed")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    }))
+    .map_err(|_| ApiError::service_unavailable("Plugin catalog authorization is invalid"))?;
+    let mut cache = plugin_catalog_authorization_cache().lock().await;
+    if cache.len() >= 4_096 {
+        cache.clear();
+    }
+    cache.insert(
+        cache_key,
+        PluginCatalogAuthorizationCacheEntry {
+            allowed: decision.allowed,
+            expires_at: StdInstant::now() + StdDuration::from_secs(15),
+        },
+    );
+    Ok(decision.allowed)
+}
+
+/// Cache key for one plugin catalogue authorization decision.
+///
+/// The decision is keyed by device as well as user: the request carries the device id and the
+/// contract defines a `ReleaseDevice` action, so a plugin may legitimately answer differently per
+/// device, and a user-only key would serve one device's verdict to another until the entry expires.
+/// Both identifiers are length-prefixed because a client chooses its own device id, and a bare
+/// separator would let one device craft an id that collides with another device's key.
+fn plugin_catalog_authorization_cache_key(
+    plugin_id: &str,
+    tuner_id: &str,
+    user_context: &PluginUserContext,
+    config_bytes: &[u8],
+) -> String {
+    format!(
+        "{}:{}:{}:{}:{}:{}:{}:{:016x}",
+        plugin_id.to_ascii_lowercase(),
+        tuner_id.to_ascii_lowercase(),
+        user_context.user_id.len(),
+        user_context.user_id,
+        user_context.device_id.len(),
+        user_context.device_id,
+        user_context.is_administrator,
+        fnv1a64(config_bytes, 0x82a2_b175_229d_6a5b),
+    )
+}
+
+#[derive(Clone, Copy)]
+struct PluginCatalogAuthorizationCacheEntry {
+    allowed: bool,
+    expires_at: StdInstant,
+}
+
+fn plugin_catalog_authorization_cache()
+-> &'static tokio::sync::Mutex<HashMap<String, PluginCatalogAuthorizationCacheEntry>> {
+    static CACHE: OnceLock<
+        tokio::sync::Mutex<HashMap<String, PluginCatalogAuthorizationCacheEntry>>,
+    > = OnceLock::new();
+    CACHE.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+}
+
+async fn release_plugin_user_device_lease(
+    db: &Database,
+    plugin_id: &str,
+    tuner_id: &str,
+    user_context: jellyrin_plugin_sdk::PluginUserContext,
+) -> Result<(), ApiError> {
+    let Some(plugin) = db.installed_plugin_json(plugin_id).await? else {
+        return Ok(());
+    };
+    if !json_string_field(&plugin, "Status")
+        .is_some_and(|status| status.eq_ignore_ascii_case("Active"))
+        || !plugin_string_array(plugin.get("Capabilities"))
+            .iter()
+            .any(|capability| {
+                capability.eq_ignore_ascii_case(CAPABILITY_USER_CATALOG_AUTHORIZATION)
+            })
+    {
+        return Ok(());
+    }
+    let Some(configuration) = db.live_tv_tuner_configuration_by_id(tuner_id).await? else {
+        return Ok(());
+    };
+    let provider_type = json_string_field(&configuration, "Type")
+        .ok_or_else(|| ApiError::service_unavailable("Plugin tuner route is unavailable"))?;
+    if !live_tv_plugin_id_from_payload(&configuration, &provider_type)
+        .is_some_and(|routed| routed.eq_ignore_ascii_case(plugin_id))
+    {
+        return Ok(());
+    }
+    let request = PluginUserAuthorizationRequest::release_device(
+        redacted_live_tv_plugin_tuner_config(configuration)?,
+        user_context,
+    );
+    let arguments = serde_json::to_value(request)
+        .map_err(|_| ApiError::internal("Invalid plugin device release request"))?;
+    let _ = invoke_installed_plugin_capability_via_runtime_host(
+        db,
+        &plugin,
+        CAPABILITY_USER_CATALOG_AUTHORIZATION,
+        arguments,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn authorized_live_tv_tuner_ids(
+    db: &Database,
+    user_context: &jellyrin_plugin_sdk::PluginUserContext,
+) -> Result<Option<Vec<String>>, ApiError> {
+    let configuration = db
+        .named_configuration("livetv")
+        .await?
+        .unwrap_or_else(default_live_tv_configuration);
+    let tuners = configuration
+        .get("TunerHosts")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut filtered = false;
+    let mut allowed = Vec::new();
+    for tuner in tuners {
+        let Some(tuner_id) = json_string_field(&tuner, "Id") else {
+            continue;
+        };
+        let Some(provider_type) = json_string_field(&tuner, "Type") else {
+            allowed.push(tuner_id);
+            continue;
+        };
+        let Some(plugin_id) = live_tv_plugin_id_from_payload(&tuner, &provider_type) else {
+            allowed.push(tuner_id);
+            continue;
+        };
+        let plugin = db.installed_plugin_json(&plugin_id).await?;
+        let declares_authorization = plugin.as_ref().is_some_and(|plugin| {
+            plugin_string_array(plugin.get("Capabilities"))
+                .iter()
+                .any(|capability| {
+                    capability.eq_ignore_ascii_case(CAPABILITY_USER_CATALOG_AUTHORIZATION)
+                })
+        });
+        if !declares_authorization {
+            allowed.push(tuner_id);
+            continue;
+        }
+        filtered = true;
+        if plugin_user_may_access_tuner_catalog(db, &plugin_id, &tuner_id, user_context.clone())
+            .await?
+        {
+            allowed.push(tuner_id);
+        }
+    }
+    Ok(filtered.then_some(allowed))
+}
+
+async fn ensure_plugin_catalog_item_visible(
+    db: &Database,
+    metadata: &serde_json::Value,
+    user_context: &jellyrin_plugin_sdk::PluginUserContext,
+) -> Result<(), ApiError> {
+    let Some(plugin_id) = json_string_field(metadata, "PluginProviderId") else {
+        return Ok(());
+    };
+    let Some(tuner_id) = json_string_field(metadata, "TunerId") else {
+        return Err(ApiError::not_found("Item not found"));
+    };
+    if plugin_user_may_access_tuner_catalog(db, &plugin_id, &tuner_id, user_context.clone()).await?
+    {
+        Ok(())
+    } else {
+        Err(ApiError::not_found("Item not found"))
+    }
+}
+
+async fn scope_items_query_for_plugin_catalogs(
+    db: &Database,
+    query: &mut ItemsQuery,
+    authenticated_user: &User,
+    token: &DeviceToken,
+    requested_user_id: Option<Uuid>,
+) -> Result<(), ApiError> {
+    let user_id = requested_user_id.unwrap_or(authenticated_user.id);
+    query.allowed_plugin_tuner_ids = authorized_live_tv_tuner_ids(
+        db,
+        &jellyrin_plugin_sdk::PluginUserContext {
+            user_id: user_id.to_string(),
+            device_id: token.device_id.clone(),
+            is_administrator: authenticated_user.is_administrator,
+        },
+    )
+    .await?;
+    Ok(())
+}
+
 async fn invoke_plugin_capability_via_runtime_host_path(
     plugin: &serde_json::Value,
     capability: &str,
@@ -12036,6 +12410,7 @@ async fn invoke_plugin_capability_via_runtime_host_path_with_timeout(
 struct LiveTvPluginCatalogPages {
     channels: Vec<serde_json::Value>,
     categories: Vec<serde_json::Value>,
+    programs: Vec<serde_json::Value>,
     continuation_tokens: HashSet<String>,
     page_count: usize,
     accumulated_bytes: usize,
@@ -12053,6 +12428,7 @@ impl LiveTvPluginCatalogPages {
         Self {
             channels: Vec::new(),
             categories: Vec::new(),
+            programs: Vec::new(),
             continuation_tokens: HashSet::new(),
             page_count: 0,
             accumulated_bytes: 0,
@@ -12092,8 +12468,15 @@ impl LiveTvPluginCatalogPages {
                 "Live TV provider catalogue exceeded the category limit",
             ));
         }
+        let programs = live_tv_plugin_catalog_array(&value, &["Programs"], "programs")?;
+        if programs.len() > LIVE_TV_CONFIG_MAX_PROGRAMS.saturating_sub(self.programs.len()) {
+            return Err(ApiError::internal(
+                "Live TV provider catalogue exceeded the program limit",
+            ));
+        }
         self.channels.extend(channels);
         self.categories.extend(categories);
+        self.programs.extend(programs);
 
         let continuation_token = live_tv_plugin_catalog_continuation_token(&value)?;
         let has_more = match json_field_case_insensitive(&value, "HasMore") {
@@ -12132,7 +12515,8 @@ impl LiveTvPluginCatalogPages {
         CapabilityResult {
             value: serde_json::json!({
                 "Channels": self.channels,
-                "Categories": self.categories
+                "Categories": self.categories,
+                "Programs": self.programs
             }),
         }
     }
@@ -13303,6 +13687,7 @@ const EXTERNAL_PROCESS_PROTECTED_ENV_PREFIXES: &[&str] = &[
     "REDIS_",
     "JELLYRIN_DB_",
     "JELLYRIN_E2E_",
+    "JELLYRIN_REDIS_",
     "JELLYRIN_PROVIDER_EGRESS_",
     "JELLYRIN_PROVIDER_SECRET_",
     "JELLYRIN_TEST_",
@@ -17224,9 +17609,8 @@ async fn report_playback(
 ) -> Result<StatusCode, ApiError> {
     let (user, token) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
     let service = SessionService::new(&state.db);
-    if live_tv_channel_json_for_playable_item(&state.db, &payload.item_id)
-        .await?
-        .is_some()
+    if let Some(channel) =
+        live_tv_channel_json_for_playable_item(&state.db, &payload.item_id).await?
     {
         if !playback_active {
             if let Some(play_session_id) = payload
@@ -17238,6 +17622,20 @@ async fn report_playback(
                 stop_live_hls_session_by_id(play_session_id).await;
             }
             service.clear_active_playback(&token.access_token).await?;
+            if let (Some(plugin_id), Some(tuner_id)) = (
+                json_string_field(&channel, "PluginProviderId"),
+                json_string_field(&channel, "TunerHostId"),
+            ) && release_plugin_user_device_lease(
+                &state.db,
+                &plugin_id,
+                &tuner_id,
+                plugin_user_context(&user, &token),
+            )
+            .await
+            .is_err()
+            {
+                tracing::warn!("plugin device lease release was unavailable");
+            }
         }
         broadcast_sessions_message(&state.db, &token.access_token, &user).await?;
         return Ok(StatusCode::NO_CONTENT);
@@ -17286,6 +17684,21 @@ async fn report_playback(
             .await?;
     } else {
         service.clear_active_playback(&token.access_token).await?;
+        if is_plugin_vod_virtual_item(&item) {
+            let metadata = media_metadata_by_item_id(&state.db, HashSet::from([item.id])).await?;
+            if let Some(reference) = metadata.get(&item.id).and_then(plugin_vod_remote_reference)
+                && release_plugin_user_device_lease(
+                    &state.db,
+                    &reference.plugin_id,
+                    &reference.tuner_id,
+                    plugin_user_context(&user, &token),
+                )
+                .await
+                .is_err()
+            {
+                tracing::warn!("plugin device lease release was unavailable");
+            }
+        }
     }
     broadcast_sessions_message(&state.db, &token.access_token, &user).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -19429,6 +19842,7 @@ type LiveTvProviderProgramsFuture<'a> =
 struct LiveTvProviderImport {
     channels: Vec<serde_json::Value>,
     categories: Vec<serde_json::Value>,
+    programs: Vec<serde_json::Value>,
     channel_upserts: Vec<LiveTvChannelUpsert>,
     category_upserts: Vec<LiveTvCategoryUpsert>,
 }
@@ -19480,6 +19894,7 @@ impl LiveTvProvider for XtreamLiveTvProvider {
                 .map(|import| LiveTvProviderImport {
                     channels: import.channels,
                     categories: import.categories,
+                    programs: Vec::new(),
                     channel_upserts: Vec::new(),
                     category_upserts: Vec::new(),
                 }))
@@ -20685,6 +21100,7 @@ async fn live_tv_plugin_provider_request(
         tuner_config,
         arguments,
         secret_grant: None,
+        user_context: None,
     };
     if let Some((reference, credentials)) = previous {
         let (username, password) = credentials.into_parts();
@@ -20719,6 +21135,7 @@ async fn vod_library_plugin_provider_request(
         provider_config: request.tuner_config,
         arguments: request.arguments,
         secret_grant: request.secret_grant,
+        user_context: request.user_context,
     })
 }
 
@@ -20810,10 +21227,10 @@ async fn live_tv_plugin_channel_provider_import(
             &plugin,
             capability,
             arguments,
-            runtime,
+            runtime.clone(),
             runtime_name,
             error_prefix,
-            host_path,
+            host_path.clone(),
             LIVE_TV_PROVIDER_CATALOG_TIMEOUT,
         )
         .await?
@@ -20822,10 +21239,10 @@ async fn live_tv_plugin_channel_provider_import(
             &plugin,
             capability,
             arguments,
-            runtime,
+            runtime.clone(),
             runtime_name,
             error_prefix,
-            host_path,
+            host_path.clone(),
             LIVE_TV_PROVIDER_CATALOG_TIMEOUT,
         )
         .await?
@@ -20834,6 +21251,34 @@ async fn live_tv_plugin_channel_provider_import(
         return Err(ApiError::internal(
             "Live TV plugin provider runtime is unavailable",
         ));
+    };
+    let program_result = if uses_live_tv_provider && json_string_field(payload, "EpgUrl").is_some()
+    {
+        let persisted = persisted_live_tv_tuner_configuration(db, &tuner_id).await?;
+        let request_configuration = persisted.as_ref().unwrap_or(payload);
+        let request = live_tv_plugin_provider_request(
+            db,
+            &plugin,
+            request_configuration,
+            "ImportPrograms",
+            serde_json::json!({}),
+        )
+        .await?;
+        let arguments = serde_json::to_value(request)
+            .map_err(|_| ApiError::internal("invalid Live TV provider request"))?;
+        invoke_live_tv_provider_catalog_via_runtime_host_path(
+            &plugin,
+            CAPABILITY_LIVE_TV_PROVIDER,
+            arguments,
+            runtime,
+            runtime_name,
+            error_prefix,
+            host_path,
+            LIVE_TV_PROVIDER_CATALOG_TIMEOUT,
+        )
+        .await?
+    } else {
+        None
     };
     let channels = result
         .value
@@ -20862,10 +21307,49 @@ async fn live_tv_plugin_channel_provider_import(
                 .collect()
         })
         .unwrap_or_default();
+    let mut programs: Vec<serde_json::Value> = program_result
+        .as_ref()
+        .and_then(|result| result.value.get("Programs"))
+        .and_then(serde_json::Value::as_array)
+        .map(|programs| {
+            programs
+                .iter()
+                .filter_map(safe_live_tv_plugin_program)
+                .collect()
+        })
+        .unwrap_or_default();
+    // Resolve the remote channel id through a map rather than scanning the channel list for every
+    // program: a provider shipping a full guide sends hundreds of thousands of programs, and the
+    // scan made the import quadratic in channels times programs. `or_insert` keeps the first
+    // matching channel, which is what the scan returned.
+    let channel_ids_by_remote_id = channels
+        .iter()
+        .filter_map(|channel| {
+            let remote_id = json_string_field(channel, "RemoteId")?;
+            let id = json_string_field(channel, "Id")?;
+            Some((remote_id.to_ascii_lowercase(), id))
+        })
+        .fold(HashMap::new(), |mut ids, (remote_id, id)| {
+            ids.entry(remote_id).or_insert(id);
+            ids
+        });
+    programs.retain_mut(|program| {
+        let Some(remote_channel_id) = json_string_field(program, "ChannelId") else {
+            return false;
+        };
+        let Some(channel_id) =
+            channel_ids_by_remote_id.get(&remote_channel_id.to_ascii_lowercase())
+        else {
+            return false;
+        };
+        program["ChannelId"] = serde_json::Value::String(channel_id.clone());
+        true
+    });
     Ok((!channels.is_empty()).then_some(LiveTvProviderImportLease {
         import: LiveTvProviderImport {
             channels,
             categories,
+            programs,
             channel_upserts: Vec::new(),
             category_upserts: Vec::new(),
         },
@@ -20873,6 +21357,51 @@ async fn live_tv_plugin_channel_provider_import(
         plugin_admission_guard: Some(admission_guard),
         plugin_provider_session_guard: Some(provider_session_guard),
     }))
+}
+
+fn safe_live_tv_plugin_program(program: &serde_json::Value) -> Option<serde_json::Value> {
+    if contains_plaintext_provider_secret(program) {
+        return None;
+    }
+    let id = safe_live_tv_plugin_string_field(program, "Id", 1_024).ok()??;
+    let name = safe_live_tv_plugin_string_field(program, "Name", 4 * 1_024).ok()??;
+    let channel_id = safe_live_tv_plugin_string_field(program, "ChannelId", 1_024).ok()??;
+    let start = safe_live_tv_plugin_string_field(program, "StartDate", 128).ok()??;
+    let end = safe_live_tv_plugin_string_field(program, "EndDate", 128).ok()??;
+    if OffsetDateTime::parse(&start, &Rfc3339).is_err()
+        || OffsetDateTime::parse(&end, &Rfc3339).is_err()
+    {
+        return None;
+    }
+    let mut safe = serde_json::json!({
+        "Id": id,
+        "Name": name,
+        "ChannelId": channel_id,
+        "StartDate": start,
+        "EndDate": end,
+    });
+    if let Ok(Some(overview)) = safe_live_tv_plugin_string_field(program, "Overview", 16 * 1_024) {
+        safe["Overview"] = serde_json::Value::String(overview);
+    }
+    if let Some(genres) = json_string_list_field(program, "Genres") {
+        safe["Genres"] = serde_json::json!(
+            genres
+                .into_iter()
+                .filter_map(|genre| safe_live_tv_plugin_text(&genre, 1_024))
+                .take(32)
+                .collect::<Vec<_>>()
+        );
+    }
+    if let Some(image_url) = json_string_field(program, "ImageUrl")
+        && reqwest::Url::parse(&image_url).is_ok_and(|url| {
+            matches!(url.scheme(), "http" | "https")
+                && url.username().is_empty()
+                && url.password().is_none()
+        })
+    {
+        safe["ImageUrl"] = serde_json::Value::String(image_url);
+    }
+    Some(safe)
 }
 
 fn safe_live_tv_plugin_category(category: &serde_json::Value) -> Option<serde_json::Value> {
@@ -21120,6 +21649,14 @@ async fn persist_live_tv_provider_import(
         .ok_or_else(|| ApiError::bad_request("Live TV tuner configuration must be an object"))?;
     object.remove("Channels");
     object.remove("Categories");
+    if import.programs.is_empty() {
+        object.remove("Programs");
+    } else {
+        object.insert(
+            "Programs".to_string(),
+            serde_json::Value::Array(import.programs.clone()),
+        );
+    }
     object.insert(
         "PersistedChannelCount".to_string(),
         serde_json::json!(channels.len()),
@@ -21734,25 +22271,37 @@ impl Drop for VodPluginCatalogStageAbortGuard {
     }
 }
 
-async fn vod_library_plugin_tuner_configuration(
+async fn vod_library_plugin_tuner_configurations(
     db: &Database,
     plugin_id: &str,
-) -> Result<Option<serde_json::Value>, ApiError> {
+) -> Result<Vec<serde_json::Value>, ApiError> {
     let Some(configuration) = db.named_configuration("livetv").await? else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
-    Ok(configuration
+    let mut tuners = configuration
         .get("TunerHosts")
         .and_then(serde_json::Value::as_array)
         .into_iter()
         .flatten()
-        .find(|tuner| {
+        .filter(|tuner| {
             json_string_field(tuner, "Type").is_some_and(|tuner_type| {
                 live_tv_plugin_id_from_payload(tuner, &tuner_type)
                     .is_some_and(|candidate| candidate.eq_ignore_ascii_case(plugin_id))
             })
         })
-        .cloned())
+        .cloned()
+        .collect::<Vec<_>>();
+    tuners.sort_by(|left, right| {
+        json_string_field(left, "Id")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .cmp(
+                &json_string_field(right, "Id")
+                    .unwrap_or_default()
+                    .to_ascii_lowercase(),
+            )
+    });
+    Ok(tuners)
 }
 
 /// Runs one complete `ImportMedia` exchange against an active `VodLibraryProvider` plugin and
@@ -21778,17 +22327,35 @@ async fn vod_library_plugin_media_import_admitted(
     db: &Database,
     plugin_id: &str,
 ) -> Result<Option<VodLibraryPluginImportCounts>, ApiError> {
-    let Some(preflight_tuner) = vod_library_plugin_tuner_configuration(db, plugin_id).await? else {
+    let preflight_tuners = vod_library_plugin_tuner_configurations(db, plugin_id).await?;
+    if preflight_tuners.is_empty() {
         return Ok(None);
-    };
-    let preflight_tuner_id = json_string_field(&preflight_tuner, "Id")
-        .ok_or_else(|| ApiError::bad_request("Live TV tuner Id is required"))?;
-    let jit_lane = external_provider_jit_lane(&preflight_tuner_id)
-        .ok_or_else(|| ApiError::bad_request("Live TV tuner Id is required"))?;
-    let _provider_session_guard = external_provider_session_slot(plugin_id, &preflight_tuner_id)
-        .await
-        .write_owned()
-        .await;
+    }
+    let preflight_tuner_ids = preflight_tuners
+        .iter()
+        .map(|tuner| {
+            json_string_field(tuner, "Id")
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| ApiError::bad_request("Live TV tuner Id is required"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if preflight_tuner_ids
+        .windows(2)
+        .any(|pair| pair[0].eq_ignore_ascii_case(&pair[1]))
+    {
+        return Err(ApiError::bad_request(
+            "VOD provider tuner Ids must be unique",
+        ));
+    }
+    let mut provider_session_guards = Vec::with_capacity(preflight_tuner_ids.len());
+    for tuner_id in &preflight_tuner_ids {
+        provider_session_guards.push(
+            external_provider_session_slot(plugin_id, tuner_id)
+                .await
+                .write_owned()
+                .await,
+        );
+    }
     let security_slot = external_plugin_security_slot(plugin_id).await;
     let _security_guard = security_slot.read_owned().await;
     let Some(plugin) = db.installed_plugin_json(plugin_id).await? else {
@@ -21804,27 +22371,25 @@ async fn vod_library_plugin_media_import_admitted(
             "VOD library plugin must be active and expose VodLibraryProvider",
         ));
     }
-    let Some(tuner) = vod_library_plugin_tuner_configuration(db, plugin_id).await? else {
-        return Ok(None);
-    };
-    let tuner_id = json_string_field(&tuner, "Id")
-        .ok_or_else(|| ApiError::bad_request("Live TV tuner Id is required"))?;
-    if !tuner_id.eq_ignore_ascii_case(&preflight_tuner_id) {
+    let tuners = vod_library_plugin_tuner_configurations(db, plugin_id).await?;
+    let tuner_ids = tuners
+        .iter()
+        .map(|tuner| {
+            json_string_field(tuner, "Id")
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| ApiError::bad_request("Live TV tuner Id is required"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if tuner_ids != preflight_tuner_ids {
         return Err(ApiError::service_unavailable(
-            "VOD provider tuner changed before catalogue synchronization",
+            "VOD provider tuners changed before catalogue synchronization",
         ));
     }
-    stop_external_plugin_host_in_lane(plugin_id, &jit_lane).await;
-    let request = vod_library_plugin_provider_request(
-        db,
-        &plugin,
-        &tuner,
-        "ImportMedia",
-        serde_json::json!({}),
-    )
-    .await?;
-    let arguments = serde_json::to_value(request)
-        .map_err(|_| ApiError::internal("invalid VOD library provider request"))?;
+    for tuner_id in &tuner_ids {
+        let jit_lane = external_provider_jit_lane(tuner_id)
+            .ok_or_else(|| ApiError::bad_request("Live TV tuner Id is required"))?;
+        stop_external_plugin_host_in_lane(plugin_id, &jit_lane).await;
+    }
     let Some((runtime, runtime_name, error_prefix, host_path)) = plugin_runtime_host_path(&plugin)
     else {
         return Err(ApiError::internal(
@@ -21838,24 +22403,44 @@ async fn vod_library_plugin_media_import_admitted(
         .map_err(ApiError::from)?;
     let mut abort_guard = VodPluginCatalogStageAbortGuard::new(db.clone(), stage.clone());
 
-    // One isolated runtime process owns the provider snapshot while each validated page is
-    // projected into the durable stage. The old visible libraries remain untouched until both
-    // stage libraries are complete and published by one database transaction.
+    // One isolated runtime process owns all provider-instance snapshots while each validated
+    // page is projected into the shared durable stage. The old visible libraries remain
+    // untouched until every tuner is complete and both libraries publish in one transaction.
     let import_result = async {
-        let mut writer = VodPluginCatalogStageWriter::new(db, &stage, plugin_id, &tuner_id);
-        let counts = invoke_vod_library_provider_via_runtime_host_path(
-            &plugin,
-            CAPABILITY_VOD_LIBRARY_PROVIDER,
-            arguments,
-            runtime,
-            runtime_name,
-            error_prefix,
-            host_path,
-            vod_library_provider_catalog_timeout(),
-            &mut writer,
-        )
-        .await?
-        .ok_or_else(|| ApiError::internal("VOD library plugin runtime is unavailable"))?;
+        let mut counts = VodLibraryPluginImportCounts::default();
+        for (tuner, tuner_id) in tuners.iter().zip(&tuner_ids) {
+            let request = vod_library_plugin_provider_request(
+                db,
+                &plugin,
+                tuner,
+                "ImportMedia",
+                serde_json::json!({}),
+            )
+            .await?;
+            let arguments = serde_json::to_value(request)
+                .map_err(|_| ApiError::internal("invalid VOD library provider request"))?;
+            let mut writer = VodPluginCatalogStageWriter::new(db, &stage, plugin_id, tuner_id);
+            let tuner_counts = invoke_vod_library_provider_via_runtime_host_path(
+                &plugin,
+                CAPABILITY_VOD_LIBRARY_PROVIDER,
+                arguments,
+                runtime.clone(),
+                runtime_name,
+                error_prefix,
+                host_path.clone(),
+                vod_library_provider_catalog_timeout(),
+                &mut writer,
+            )
+            .await?
+            .ok_or_else(|| ApiError::internal("VOD library plugin runtime is unavailable"))?;
+            counts.movie_count = counts.movie_count.saturating_add(tuner_counts.movie_count);
+            counts.series_count = counts
+                .series_count
+                .saturating_add(tuner_counts.series_count);
+            counts.episode_count = counts
+                .episode_count
+                .saturating_add(tuner_counts.episode_count);
+        }
         db.complete_remote_media_catalog_stage(&stage)
             .await
             .map_err(ApiError::from)?;
@@ -21869,6 +22454,7 @@ async fn vod_library_plugin_media_import_admitted(
     match import_result {
         Ok(counts) => {
             abort_guard.disarm();
+            drop(provider_session_guards);
             Ok(Some(counts))
         }
         Err(error) => {
@@ -22447,10 +23033,7 @@ async fn live_tv_discover_hdhomerun_tuners_with_socket(
 
     let deadline = tokio::time::Instant::now() + discovery_duration;
     let mut buffer = [0u8; 8192];
-    loop {
-        let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) else {
-            break;
-        };
+    while let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) {
         match tokio::time::timeout(remaining, socket.recv_from(&mut buffer)).await {
             Ok(Ok((received, remote))) => {
                 if received <= 13 || buffer[1] != 3 {
@@ -23597,7 +24180,13 @@ async fn live_tv_channels(
     Query(query): Query<LiveTvChannelsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let service = LiveTvService::new(&state.db);
-    let user = require_request_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
+    let (user, token) = require_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
+    let user_context = jellyrin_plugin_sdk::PluginUserContext {
+        user_id: user.id.to_string(),
+        device_id: token.device_id,
+        is_administrator: user.is_administrator,
+    };
+    let authorized_tuner_ids = authorized_live_tv_tuner_ids(&state.db, &user_context).await?;
     let favorite_ids = live_tv_favorite_ids(&state.db, user.id).await?;
     let favorite_filter = live_tv_favorite_filter(&query);
     // Cap explicit limits at 500, and apply a sane default page size when the
@@ -23616,6 +24205,25 @@ async fn live_tv_channels(
     };
     let category_ids = live_tv_channel_category_filter(&state.db, &query).await?;
     let requested_start_index = query.start_index.unwrap_or(0);
+    let tuner_ids = match (&authorized_tuner_ids, tuner_id.as_ref()) {
+        (Some(allowed), Some(requested))
+            if !allowed.iter().any(|id| id.eq_ignore_ascii_case(requested)) =>
+        {
+            return Ok(Json(query_result_with_total(Vec::new(), 0, 0)));
+        }
+        (Some(allowed), Some(requested)) => allowed
+            .iter()
+            .find(|id| id.eq_ignore_ascii_case(requested))
+            .cloned()
+            .into_iter()
+            .collect(),
+        (Some(allowed), None) if allowed.is_empty() => {
+            return Ok(Json(query_result_with_total(Vec::new(), 0, 0)));
+        }
+        (Some(allowed), None) => allowed.clone(),
+        (None, Some(requested)) => vec![requested.clone()],
+        (None, None) => Vec::new(),
+    };
     let db_query = LiveTvChannelQuery {
         start_index: favorite_filter.map_or(requested_start_index, |_| 0),
         limit: if favorite_filter.is_some() {
@@ -23624,7 +24232,7 @@ async fn live_tv_channels(
             Some(limit)
         },
         search_term: query.search_term.clone(),
-        tuner_ids: tuner_id.clone().into_iter().collect(),
+        tuner_ids,
         category_ids,
     };
     let page = service.channel_page(db_query).await?;
@@ -23662,6 +24270,15 @@ async fn live_tv_channels(
         .unwrap_or_else(default_live_tv_configuration);
     let server_id = state.db.server_state().await?.server_id.to_string();
     let mut channels = live_tv_channel_items(&config, &server_id);
+    if let Some(allowed) = authorized_tuner_ids.as_ref() {
+        channels.retain(|channel| {
+            json_string_field(channel, "TunerHostId").is_some_and(|id| {
+                allowed
+                    .iter()
+                    .any(|allowed| allowed.eq_ignore_ascii_case(&id))
+            })
+        });
+    }
     if let Some(tuner_id) = tuner_id.as_deref() {
         channels.retain(|channel| {
             json_string_field(channel, "TunerHostId")
@@ -23786,9 +24403,21 @@ async fn live_tv_channel(
     Query(query): Query<AuthQuery>,
     Path(channel_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let (user, token) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let allowed_tuners = authorized_live_tv_tuner_ids(
+        &state.db,
+        &jellyrin_plugin_sdk::PluginUserContext {
+            user_id: user.id.to_string(),
+            device_id: token.device_id,
+            is_administrator: user.is_administrator,
+        },
+    )
+    .await?;
     let favorite_ids = live_tv_favorite_ids(&state.db, user.id).await?;
     if let Some(mut channel) = live_tv_channel_json_by_id(&state.db, &channel_id).await? {
+        if !live_tv_item_is_visible_to_tuners(&channel, allowed_tuners.as_deref()) {
+            return Err(ApiError::not_found("Live TV item not found"));
+        }
         apply_live_tv_favorite_state(&mut channel, &favorite_ids);
         return Ok(Json(channel));
     }
@@ -23807,8 +24436,24 @@ async fn live_tv_channel(
                 .any(|id| jellyfin_id_matches(&id, channel_id.trim()))
         })
         .ok_or_else(|| ApiError::not_found("Live TV item not found"))?;
+    if !live_tv_item_is_visible_to_tuners(&channel, allowed_tuners.as_deref()) {
+        return Err(ApiError::not_found("Live TV item not found"));
+    }
     apply_live_tv_favorite_state(&mut channel, &favorite_ids);
     Ok(Json(channel))
+}
+
+fn live_tv_item_is_visible_to_tuners(
+    item: &serde_json::Value,
+    allowed_tuner_ids: Option<&[String]>,
+) -> bool {
+    allowed_tuner_ids.is_none_or(|allowed| {
+        json_string_field(item, "TunerHostId").is_some_and(|tuner_id| {
+            allowed
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(&tuner_id))
+        })
+    })
 }
 
 async fn live_tv_channel_by_id(
@@ -23965,20 +24610,34 @@ async fn live_tv_programs(
     Query(auth_query): Query<AuthQuery>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let (user, token) = require_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let allowed_tuners = authorized_live_tv_tuner_ids(
+        &state.db,
+        &jellyrin_plugin_sdk::PluginUserContext {
+            user_id: user.id.to_string(),
+            device_id: token.device_id,
+            is_administrator: user.is_administrator,
+        },
+    )
+    .await?;
     let query = parse_live_tv_programs_query(raw_query.as_deref());
     let channel_ids = query.channel_ids;
     let requested =
         live_tv_category_filter_values(query.genre_ids.as_deref(), query.tags.as_deref());
     // Resolve genre-hash / name selectors to real category ids (same as channels).
     let category_ids = resolve_live_tv_category_ids(&state.db, &requested).await?;
+    let series_scope = live_tv_series_scope(&state.db, query.library_series_id.as_deref()).await?;
     live_tv_program_result(
         &state.db,
         &channel_ids,
         &category_ids,
         query.start_index,
         query.limit,
-        query.filters,
+        LiveTvProgramScope {
+            filters: query.filters,
+            allowed_tuner_ids: allowed_tuners.as_deref(),
+            series: &series_scope,
+        },
     )
     .await
 }
@@ -23988,9 +24647,23 @@ struct ParsedLiveTvProgramsQuery {
     channel_ids: Vec<String>,
     genre_ids: Option<String>,
     tags: Option<String>,
+    library_series_id: Option<String>,
     start_index: Option<usize>,
     limit: Option<usize>,
     filters: LiveTvProgramFilters,
+}
+
+/// Scope requested by Jellyfin's `LibrarySeriesId`, which asks for the upcoming broadcasts of one
+/// library series. Ignoring it made the series detail page show unrelated channels under
+/// "Upcoming on TV", because the client only reveals that section when the response is non-empty.
+enum LiveTvSeriesScope {
+    /// No `LibrarySeriesId` was requested.
+    Unscoped,
+    /// A series was requested that has no electronic-programme-guide identity, so no broadcast can
+    /// belong to it. An imported on-demand series is always this case.
+    NoBroadcasts,
+    /// Retain only programmes belonging to this guide series identity.
+    ExternalSeriesId(String),
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -24032,6 +24705,7 @@ fn parse_live_tv_programs_query(raw_query: Option<&str>) -> ParsedLiveTvPrograms
             "channelids" | "channelid" => query.channel_ids.extend(comma_delimited_values(&value)),
             "genreids" | "genreid" => set_query_scalar(&mut query.genre_ids, value),
             "tags" | "tag" => set_query_scalar(&mut query.tags, value),
+            "libraryseriesid" => set_query_scalar(&mut query.library_series_id, value),
             "startindex" => query.start_index = value.parse().ok(),
             "limit" => query.limit = value.parse().ok(),
             "isairing" => query.filters.is_airing = parse_bool_query_value(&value),
@@ -24053,7 +24727,16 @@ async fn live_tv_programs_post(
     Query(query): Query<AuthQuery>,
     body: Body,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let (user, token) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let allowed_tuners = authorized_live_tv_tuner_ids(
+        &state.db,
+        &jellyrin_plugin_sdk::PluginUserContext {
+            user_id: user.id.to_string(),
+            device_id: token.device_id,
+            is_administrator: user.is_administrator,
+        },
+    )
+    .await?;
     let payload = optional_json_body(body).await?;
     let channel_ids = json_string_list_field(&payload, "ChannelIds").unwrap_or_default();
     let requested = json_string_list_field(&payload, "GenreIds")
@@ -24064,15 +24747,52 @@ async fn live_tv_programs_post(
     let start_index = live_tv_u64_field(&payload, "StartIndex").map(|value| value as usize);
     let limit = live_tv_u64_field(&payload, "Limit").map(|value| value as usize);
     let filters = live_tv_program_filters_from_body(&payload);
+    let series_scope = live_tv_series_scope(
+        &state.db,
+        json_string_field(&payload, "LibrarySeriesId").as_deref(),
+    )
+    .await?;
     live_tv_program_result(
         &state.db,
         &channel_ids,
         &category_ids,
         start_index,
         limit,
-        filters,
+        LiveTvProgramScope {
+            filters,
+            allowed_tuner_ids: allowed_tuners.as_deref(),
+            series: &series_scope,
+        },
     )
     .await
+}
+
+/// Resolves Jellyfin's `LibrarySeriesId` into the scope its upcoming-broadcast section expects.
+///
+/// A guide series is identified by `ExternalSeriesId`. A library series that has none — every
+/// series imported from an on-demand provider — can have no upcoming broadcast, so the correct
+/// answer is an empty page, which is what keeps the client's section hidden.
+async fn live_tv_series_scope(
+    db: &Database,
+    library_series_id: Option<&str>,
+) -> Result<LiveTvSeriesScope, ApiError> {
+    let Some(library_series_id) = library_series_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("null"))
+    else {
+        return Ok(LiveTvSeriesScope::Unscoped);
+    };
+    let Ok(series_uuid) = parse_jellyfin_uuid(library_series_id) else {
+        return Ok(LiveTvSeriesScope::NoBroadcasts);
+    };
+    let metadata = metadata_payload_for_item(db, series_uuid).await?;
+    let external_series_id = first_metadata_value_from_json(&metadata, &["ExternalSeriesId"])
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    Ok(match external_series_id {
+        Some(external_series_id) => LiveTvSeriesScope::ExternalSeriesId(external_series_id),
+        None => LiveTvSeriesScope::NoBroadcasts,
+    })
 }
 
 fn live_tv_program_filters_from_body(payload: &serde_json::Value) -> LiveTvProgramFilters {
@@ -24102,10 +24822,22 @@ async fn live_tv_program(
     Query(query): Query<AuthQuery>,
     Path(program_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let (user, token) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let allowed_tuners = authorized_live_tv_tuner_ids(
+        &state.db,
+        &jellyrin_plugin_sdk::PluginUserContext {
+            user_id: user.id.to_string(),
+            device_id: token.device_id,
+            is_administrator: user.is_administrator,
+        },
+    )
+    .await?;
     let program = live_tv_program_by_id(&state.db, &program_id)
         .await?
         .ok_or_else(|| ApiError::not_found("Live TV item not found"))?;
+    if !live_tv_item_is_visible_to_tuners(&program, allowed_tuners.as_deref()) {
+        return Err(ApiError::not_found("Live TV item not found"));
+    }
     Ok(Json(program))
 }
 
@@ -24199,20 +24931,50 @@ fn looks_like_live_tv_program_id(item_id: &str) -> bool {
         || item_id.starts_with("fallback-program-")
 }
 
+/// Everything that narrows a programme page beyond channel, category and paging.
+struct LiveTvProgramScope<'a> {
+    filters: LiveTvProgramFilters,
+    allowed_tuner_ids: Option<&'a [String]>,
+    series: &'a LiveTvSeriesScope,
+}
+
 async fn live_tv_program_result(
     db: &Database,
     channel_ids: &[String],
     category_ids: &[String],
     start_index: Option<usize>,
     limit: Option<usize>,
-    filters: LiveTvProgramFilters,
+    scope: LiveTvProgramScope<'_>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let LiveTvProgramScope {
+        filters,
+        allowed_tuner_ids,
+        series: series_scope,
+    } = scope;
+    if matches!(series_scope, LiveTvSeriesScope::NoBroadcasts) {
+        return Ok(Json(query_result_with_total(Vec::new(), 0, 0)));
+    }
     let config = db
         .named_configuration("livetv")
         .await?
         .unwrap_or_else(default_live_tv_configuration);
     let server_id = db.server_state().await?.server_id.to_string();
     let mut programs = live_tv_program_items(&config, &server_id);
+    if let LiveTvSeriesScope::ExternalSeriesId(series_id) = series_scope {
+        programs.retain(|program| {
+            ["ExternalSeriesId", "SeriesId"].iter().any(|key| {
+                json_string_field(program, key)
+                    .is_some_and(|value| value.eq_ignore_ascii_case(series_id))
+            })
+        });
+    }
+    if let Some(allowed) = allowed_tuner_ids {
+        retain_authorized_live_tv_programs(
+            &mut programs,
+            &live_tv_channel_items(&config, &server_id),
+            allowed,
+        );
+    }
     if !channel_ids.is_empty() {
         let channel_ids = channel_ids
             .iter()
@@ -24269,8 +25031,15 @@ async fn live_tv_program_result(
         if !channel_ids.is_empty() {
             let channels = live_tv_channel_records_by_any_ids(db, channel_ids)
                 .await?
-                .iter()
-                .map(|record| live_tv_channel_record_to_json(record, &server_id))
+                .into_iter()
+                .filter(|record| {
+                    allowed_tuner_ids.is_none_or(|allowed| {
+                        allowed
+                            .iter()
+                            .any(|id| id.eq_ignore_ascii_case(&record.tuner_id))
+                    })
+                })
+                .map(|record| live_tv_channel_record_to_json(&record, &server_id))
                 .collect::<Vec<_>>();
             if !channels.is_empty() {
                 programs = live_tv_fallback_program_items(&channels, &[], &server_id);
@@ -24290,8 +25059,14 @@ async fn live_tv_program_result(
                 )));
             }
         }
+        let tuner_ids = allowed_tuner_ids
+            .map(<[String]>::to_vec)
+            .unwrap_or_default();
         let persisted_count = db
-            .live_tv_channel_count(&LiveTvChannelQuery::default())
+            .live_tv_channel_count(&LiveTvChannelQuery {
+                tuner_ids: tuner_ids.clone(),
+                ..LiveTvChannelQuery::default()
+            })
             .await?;
         if persisted_count > 0 {
             let category_ids_filter = category_ids.to_vec();
@@ -24300,7 +25075,7 @@ async fn live_tv_program_result(
                     start_index: 0,
                     limit: None,
                     search_term: None,
-                    tuner_ids: Vec::new(),
+                    tuner_ids: tuner_ids.clone(),
                     category_ids: category_ids_filter.clone(),
                 })
                 .await?;
@@ -24310,7 +25085,7 @@ async fn live_tv_program_result(
                         start_index: 0,
                         limit: Some(persisted_count.min(LIVE_TV_XTREAM_MAX_IMPORT_LIMIT)),
                         search_term: None,
-                        tuner_ids: Vec::new(),
+                        tuner_ids: tuner_ids.clone(),
                         category_ids: category_ids_filter,
                     })
                     .await?;
@@ -24346,7 +25121,7 @@ async fn live_tv_program_result(
                     start_index,
                     limit: Some(limit),
                     search_term: None,
-                    tuner_ids: Vec::new(),
+                    tuner_ids,
                     category_ids: category_ids.to_vec(),
                 })
                 .await?;
@@ -24449,6 +25224,22 @@ fn live_tv_program_datetime(program: &serde_json::Value, field: &str) -> Option<
     json_string_field(program, field).and_then(|value| OffsetDateTime::parse(&value, &Rfc3339).ok())
 }
 
+fn apply_live_tv_program_runtime_ticks(program: &mut serde_json::Value) {
+    if json_i64_field(program, "RunTimeTicks").is_some_and(|ticks| ticks >= 0) {
+        return;
+    }
+    let Some(start) = live_tv_program_datetime(program, "StartDate") else {
+        return;
+    };
+    let Some(end) = live_tv_program_datetime(program, "EndDate") else {
+        return;
+    };
+    let ticks = (end - start).whole_nanoseconds().max(0) / 100;
+    if let Ok(ticks) = i64::try_from(ticks) {
+        program["RunTimeTicks"] = serde_json::json!(ticks);
+    }
+}
+
 async fn live_tv_recording_stream(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -24466,7 +25257,8 @@ async fn live_tv_stream_file(
     Query(query): Query<AuthQuery>,
     Path((stream_id, container)): Path<(String, String)>,
 ) -> Result<axum::response::Response, ApiError> {
-    require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let (user, token) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let user_context = Some(plugin_user_context(&user, &token));
     if let Ok(recording) = live_tv_recording_by_id(&state.db, &stream_id).await {
         let path = live_tv_recording_path(&recording)?;
         let path_container = path
@@ -24486,7 +25278,7 @@ async fn live_tv_stream_file(
         ) {
             return Err(ApiError::not_found("Live TV stream not found"));
         }
-        return stream_live_tv_channel(channel, &headers, &state.db).await;
+        return stream_live_tv_channel(channel, &headers, &state.db, user_context).await;
     }
     let path = live_tv_channel_path(&channel)?;
     if !live_tv_channel_is_remote(&path) && !live_tv_channel_is_legacy_hdhomerun_path(&path) {
@@ -24498,7 +25290,7 @@ async fn live_tv_stream_file(
             return Err(ApiError::not_found("Live TV stream not found"));
         }
     }
-    stream_live_tv_channel(channel, &headers, &state.db).await
+    stream_live_tv_channel(channel, &headers, &state.db, user_context).await
 }
 
 async fn live_tv_recordings(
@@ -24687,6 +25479,7 @@ async fn stream_live_tv_channel(
     channel: serde_json::Value,
     headers: &HeaderMap,
     db: &Database,
+    user_context: Option<jellyrin_plugin_sdk::PluginUserContext>,
 ) -> Result<axum::response::Response, ApiError> {
     if live_tv_channel_uses_opaque_provider(&channel) {
         let channel_id = live_tv_channel_playback_id(&channel).ok_or_else(|| {
@@ -24695,7 +25488,7 @@ async fn stream_live_tv_channel(
         let (tuner_host_id, tuner_count) = live_tv_channel_tuner_limit(db, &channel).await;
         let tuner_lease =
             acquire_unshared_live_tuner_lease(tuner_host_id, &channel_id, tuner_count)?;
-        let playback = resolve_opaque_live_tv_playback(db, &channel).await?;
+        let playback = resolve_opaque_live_tv_playback(db, &channel, user_context).await?;
         if !opaque_live_tv_delivery_is_safe_for_direct_proxy(&playback) {
             return Err(ApiError::service_unavailable(
                 "Live TV provider did not authorize a safe direct stream",
@@ -24760,6 +25553,7 @@ fn opaque_live_tv_delivery_is_safe_for_direct_proxy(playback: &LiveTvPlaybackRes
 async fn resolve_opaque_live_tv_playback(
     db: &Database,
     channel: &serde_json::Value,
+    user_context: Option<jellyrin_plugin_sdk::PluginUserContext>,
 ) -> Result<LiveTvPlaybackResult, ApiError> {
     let provider_reference = live_tv_channel_provider_reference(channel).ok_or_else(|| {
         ApiError::service_unavailable("Live TV provider reference is unavailable")
@@ -24872,7 +25666,7 @@ async fn resolve_opaque_live_tv_playback(
     let mut request_arguments = serde_json::to_value(context)
         .map_err(|_| ApiError::internal("invalid Live TV playback context"))?;
     request_arguments["ProviderReference"] = serde_json::Value::String(provider_reference);
-    let request = live_tv_plugin_provider_request(
+    let mut request = live_tv_plugin_provider_request(
         db,
         &plugin,
         &persisted_tuner_config,
@@ -24881,6 +25675,9 @@ async fn resolve_opaque_live_tv_playback(
     )
     .await
     .map_err(|_| ApiError::service_unavailable("Live TV provider credentials are unavailable"))?;
+    if let Some(user_context) = user_context {
+        request = request.with_user_context(user_context);
+    }
     let arguments = serde_json::to_value(request)
         .map_err(|_| ApiError::internal("invalid Live TV playback request"))?;
     let result = invoke_plugin_capability_via_runtime_host_path_with_timeout(
@@ -25303,6 +26100,7 @@ async fn invoke_plugin_vod_provider_action(
     tuner_id: &str,
     action: &str,
     mut request_arguments: serde_json::Value,
+    user_context: Option<jellyrin_plugin_sdk::PluginUserContext>,
 ) -> Result<ZeroizingJsonValue, ApiError> {
     let jit_lane = external_provider_jit_lane(tuner_id)
         .ok_or_else(|| ApiError::service_unavailable("VOD provider tuner is unavailable"))?;
@@ -25367,7 +26165,7 @@ async fn invoke_plugin_vod_provider_action(
     for (field, value) in context.as_object().into_iter().flatten() {
         request_object.insert(field.clone(), value.clone());
     }
-    let request = vod_library_plugin_provider_request(
+    let mut request = vod_library_plugin_provider_request(
         db,
         &plugin,
         &persisted_tuner_config,
@@ -25376,6 +26174,9 @@ async fn invoke_plugin_vod_provider_action(
     )
     .await
     .map_err(|_| ApiError::service_unavailable("VOD provider credentials are unavailable"))?;
+    if let Some(user_context) = user_context {
+        request = request.with_user_context(user_context);
+    }
     let arguments = serde_json::to_value(request)
         .map_err(|_| ApiError::internal("invalid VOD provider request"))?;
     let result = invoke_plugin_capability_via_runtime_host_path_with_timeout(
@@ -25407,6 +26208,7 @@ async fn resolve_plugin_vod_playback(
     plugin_id: &str,
     tuner_id: &str,
     provider_reference: &str,
+    user_context: Option<jellyrin_plugin_sdk::PluginUserContext>,
 ) -> Result<VodPlaybackResult, ApiError> {
     let result = invoke_plugin_vod_provider_action(
         db,
@@ -25414,6 +26216,7 @@ async fn resolve_plugin_vod_playback(
         tuner_id,
         "ResolvePlayback",
         serde_json::json!({ "ProviderReference": provider_reference }),
+        user_context,
     )
     .await?;
 
@@ -25455,6 +26258,14 @@ async fn resolve_plugin_vod_playback(
     Ok(playback)
 }
 
+fn plugin_user_context(user: &User, token: &DeviceToken) -> jellyrin_plugin_sdk::PluginUserContext {
+    jellyrin_plugin_sdk::PluginUserContext {
+        user_id: user.id.to_string(),
+        device_id: token.device_id.clone(),
+        is_administrator: user.is_administrator,
+    }
+}
+
 struct PluginVodSubtitleResolution {
     source_url: jellyrin_plugin_sdk::SensitiveUrl,
     format: String,
@@ -25472,6 +26283,7 @@ async fn resolve_plugin_vod_subtitle(
     tuner_id: &str,
     provider_reference: &str,
     stream_index: i64,
+    user_context: Option<jellyrin_plugin_sdk::PluginUserContext>,
 ) -> Result<PluginVodSubtitleResolution, ApiError> {
     if !(0..=PLUGIN_VOD_MAX_STREAM_INDEX).contains(&stream_index) {
         return Err(ApiError::not_found("Subtitle stream not found"));
@@ -25485,6 +26297,7 @@ async fn resolve_plugin_vod_subtitle(
             "ProviderReference": provider_reference,
             "SubtitleStreamIndex": stream_index,
         }),
+        user_context,
     )
     .await?;
     if !result
@@ -25759,7 +26572,7 @@ async fn fetch_plugin_vod_remote_image(source_url: &str) -> Result<Vec<u8>, ApiE
         log_plugin_vod_artwork_failure(PluginVodArtworkFailure::InvalidSource);
         return Err(error);
     }
-    let proxy = match std::env::var("JELLYRIN_PROVIDER_EGRESS_PROXY") {
+    let proxy = match configured_provider_egress_proxy() {
         Ok(proxy) => proxy,
         Err(_) => {
             log_plugin_vod_artwork_failure(PluginVodArtworkFailure::MissingProxy);
@@ -25815,6 +26628,19 @@ async fn fetch_plugin_vod_remote_image(source_url: &str) -> Result<Vec<u8>, ApiE
     };
     validate_plugin_vod_image_payload(&bytes, nonstandard_content_type)?;
     Ok(bytes)
+}
+
+fn configured_provider_egress_proxy() -> Result<String, std::env::VarError> {
+    #[cfg(test)]
+    if let Some(proxy) = TEST_PROVIDER_EGRESS_PROXY
+        .get_or_init(|| StdMutex::new(None))
+        .lock()
+        .expect("test provider egress proxy lock poisoned")
+        .clone()
+    {
+        return Ok(proxy);
+    }
+    std::env::var("JELLYRIN_PROVIDER_EGRESS_PROXY")
 }
 
 fn plugin_vod_image_payload_len_is_allowed(length: usize) -> bool {
@@ -26481,6 +27307,7 @@ async fn ensure_plugin_vod_metadata(
         };
         // Validate and fetch before touching the cache. A read-only/misconfigured cache is a
         // recoverable presentation failure at the caller and must never expose the source URL.
+        let bytes = bounded_provider_artwork_bytes(bytes).await;
         if let Err(error) = store_image_bytes(
             state,
             ImageOwner::Item(&target.owner_id),
@@ -26660,6 +27487,105 @@ async fn enrich_plugin_vod_item_metadata(
                 "VOD metadata enrichment was unavailable"
             );
         }
+    }
+}
+
+const PLUGIN_VOD_DETAIL_TRACK_CACHE_TTL: StdDuration = StdDuration::from_secs(5 * 60);
+const PLUGIN_VOD_DETAIL_TRACK_CACHE_MAX_ENTRIES: usize = 512;
+const PLUGIN_VOD_DETAIL_TRACK_RESOLUTION_TIMEOUT: StdDuration = StdDuration::from_secs(8);
+
+#[derive(Clone)]
+struct PluginVodDetailTrackCacheEntry {
+    expires_at: StdInstant,
+    media_streams: Vec<serde_json::Value>,
+}
+
+fn plugin_vod_detail_track_cache() -> &'static Mutex<HashMap<String, PluginVodDetailTrackCacheEntry>>
+{
+    static CACHE: OnceLock<Mutex<HashMap<String, PluginVodDetailTrackCacheEntry>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Adds the provider's safe track labels to an item detail response.
+///
+/// MAGSTV only reveals the authoritative audio/subtitle layout during playback resolution. The
+/// signed source URL remains inside the short-lived provider result and is dropped here; only the
+/// already-allowlisted descriptors are cached briefly in memory and exposed to clients. A failed
+/// or slow provider call degrades to the catalogue placeholders instead of failing the detail page.
+async fn enrich_plugin_vod_item_media_streams(
+    state: &AppState,
+    item: &mut MediaItem,
+    metadata: &serde_json::Value,
+    user_context: jellyrin_plugin_sdk::PluginUserContext,
+) {
+    if !is_plugin_vod_virtual_item(item) {
+        return;
+    }
+    let Some(reference) = plugin_vod_remote_reference(metadata) else {
+        return;
+    };
+    let cache_key = stable_entity_id(
+        "plugin-vod-detail-tracks",
+        &format!(
+            "{}:{}:{}",
+            item.id, user_context.user_id, user_context.device_id
+        ),
+    );
+    let now = StdInstant::now();
+    {
+        let mut cache = plugin_vod_detail_track_cache().lock().await;
+        cache.retain(|_, entry| entry.expires_at > now);
+        if let Some(entry) = cache.get(&cache_key) {
+            item.media_streams = entry.media_streams.clone();
+            return;
+        }
+    }
+
+    let resolved = tokio::time::timeout(
+        PLUGIN_VOD_DETAIL_TRACK_RESOLUTION_TIMEOUT,
+        resolve_plugin_vod_playback(
+            &state.db,
+            &reference.plugin_id,
+            &reference.tuner_id,
+            &reference.provider_reference,
+            Some(user_context),
+        ),
+    )
+    .await;
+    let playback = match resolved {
+        Ok(Ok(playback)) => playback,
+        Ok(Err(error)) => {
+            tracing::warn!(
+                status = %error.status(),
+                "VOD track enrichment was unavailable"
+            );
+            return;
+        }
+        Err(_) => {
+            tracing::warn!("VOD track enrichment timed out");
+            return;
+        }
+    };
+    if !opaque_live_tv_delivery_is_safe_for_direct_proxy(&playback) {
+        tracing::warn!("VOD track enrichment rejected an unsafe delivery contract");
+        return;
+    }
+    let mut media_streams = playback.media_streams.clone();
+    repair_plugin_vod_placeholder_codecs(&mut media_streams, &playback);
+    if media_streams.is_empty() {
+        return;
+    }
+    item.media_streams = media_streams.clone();
+    let mut cache = plugin_vod_detail_track_cache().lock().await;
+    if cache.len() < PLUGIN_VOD_DETAIL_TRACK_CACHE_MAX_ENTRIES {
+        cache.insert(
+            cache_key,
+            PluginVodDetailTrackCacheEntry {
+                expires_at: StdInstant::now() + PLUGIN_VOD_DETAIL_TRACK_CACHE_TTL,
+                media_streams,
+            },
+        );
     }
 }
 
@@ -28294,6 +29220,49 @@ fn live_tv_subtitle_teletext_page(
     })
 }
 
+/// Keep only the guide rows this user's authorized tuners account for.
+///
+/// A program's `TunerHostId` is the id of the configuration entry that supplied it, so rows imported
+/// from a `ListingProviders` entry never name a tuner: comparing them against the authorized tuners
+/// emptied the guide for everyone, administrators included. Authorize those through the channel they
+/// belong to, and keep denying a program whose channel this user cannot see -- including one that
+/// matches no channel at all.
+fn retain_authorized_live_tv_programs(
+    programs: &mut Vec<serde_json::Value>,
+    channels: &[serde_json::Value],
+    allowed_tuner_ids: &[String],
+) {
+    let tuner_is_allowed = |id: &str| {
+        allowed_tuner_ids
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(id))
+    };
+    let allowed_channel_ids = channels
+        .iter()
+        .filter(|channel| {
+            json_string_field(channel, "TunerHostId").is_some_and(|id| tuner_is_allowed(&id))
+        })
+        .flat_map(|channel| {
+            json_string_field(channel, "Id")
+                .into_iter()
+                .chain(json_string_field(channel, "JellyrinChannelId"))
+        })
+        .collect::<Vec<_>>();
+    programs.retain(|program| {
+        if json_string_field(program, "TunerHostId").is_some_and(|id| tuner_is_allowed(&id)) {
+            return true;
+        }
+        json_string_field(program, "ChannelId")
+            .into_iter()
+            .chain(json_string_field(program, "JellyrinChannelId"))
+            .any(|channel_id| {
+                allowed_channel_ids
+                    .iter()
+                    .any(|allowed| jellyfin_id_matches(allowed, &channel_id))
+            })
+    });
+}
+
 fn live_tv_program_items(config: &serde_json::Value, server_id: &str) -> Vec<serde_json::Value> {
     let channels = live_tv_channel_items(config, server_id);
     let mut programs = Vec::new();
@@ -28327,8 +29296,9 @@ fn live_tv_fallback_program_items(
     channel_ids: &[String],
     server_id: &str,
 ) -> Vec<serde_json::Value> {
-    let start = OffsetDateTime::now_utc() - Duration::hours(12);
-    let end = OffsetDateTime::now_utc() + Duration::hours(12);
+    let now = OffsetDateTime::now_utc();
+    let start = now - Duration::hours(12);
+    let end = now + Duration::hours(12);
     let start_date = format_time_for_json(start);
     let end_date = format_time_for_json(end);
     channels
@@ -28396,6 +29366,7 @@ fn live_tv_fallback_program_item(
     if let Some(image_url) = live_tv_image_url(channel) {
         program["ImageUrl"] = serde_json::json!(image_url);
     }
+    apply_live_tv_program_runtime_ticks(&mut program);
     apply_live_tv_image_metadata(&mut program);
     for key in [
         "Genres",
@@ -28404,6 +29375,7 @@ fn live_tv_fallback_program_item(
         "JellyrinChannelId",
         "Path",
         "MediaSources",
+        "TunerHostId",
     ] {
         if let Some(value) = json_field_case_insensitive(channel, key) {
             program[key] = value.clone();
@@ -28571,6 +29543,7 @@ fn live_tv_program_item(
     base["Type"] = serde_json::json!("Program");
     base["ServerId"] = serde_json::json!(server_id);
     base["MediaType"] = serde_json::json!("Video");
+    base["TunerHostId"] = serde_json::json!(source_id);
     base["ChannelId"] = serde_json::json!(channel_id);
     base["JellyrinChannelId"] = serde_json::json!(raw_channel_id);
     base["ChannelName"] = channel_name
@@ -28596,6 +29569,7 @@ fn live_tv_program_item(
         .cloned()
         .or_else(|| base.get("Description").cloned())
         .unwrap_or_else(|| serde_json::json!(""));
+    apply_live_tv_program_runtime_ticks(&mut base);
     if live_tv_image_url(&base).is_none()
         && let Some(channel_image_url) = channels
             .iter()
@@ -29195,7 +30169,7 @@ async fn open_opaque_live_tv_recording_stream(
     channel_id: &str,
 ) -> Result<reqwest::Response, ApiError> {
     let channel = live_tv_channel_by_id(db, channel_id).await?;
-    let playback = resolve_opaque_live_tv_playback(db, &channel).await?;
+    let playback = resolve_opaque_live_tv_playback(db, &channel, None).await?;
     if !opaque_live_tv_delivery_is_safe_for_direct_proxy(&playback) {
         return Err(ApiError::service_unavailable(
             "Live TV provider did not authorize a safe recording stream",
@@ -30305,7 +31279,7 @@ async fn client_log_document(
     headers: HeaderMap,
     Query(query): Query<AuthQuery>,
     body: Body,
-) -> Result<StatusCode, ApiError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
     let content_type = headers
         .get(header::CONTENT_TYPE)
@@ -30339,7 +31313,7 @@ async fn client_log_document(
     use tokio::io::AsyncWriteExt;
     file.write_all(line.as_bytes()).await?;
     file.write_all(b"\n").await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(Json(serde_json::json!({ "FileName": "clientlog.log" })))
 }
 
 fn content_disposition_filename(value: &str) -> Option<String> {
@@ -31424,7 +32398,7 @@ fn media_list_to_json(list: &MediaList, server_id: &str, child_count: usize) -> 
         "CollectionType": list.collection_type,
         "ChildCount": child_count,
         "RecursiveItemCount": child_count,
-        "UserData": { "PlaybackPositionTicks": 0, "PlayCount": 0, "IsFavorite": false, "Played": false },
+        "UserData": default_user_data_json(&list_id),
         "ImageTags": { "Primary": primary_image_tag },
         "PrimaryImageAspectRatio": 0.6666667,
         "BackdropImageTags": [],
@@ -31634,15 +32608,32 @@ async fn user_views_result(
     headers: HeaderMap,
     Query(query): Query<UserViewsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let auth_user =
-        require_request_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
-    if let Some(user_id) = query.user_id.as_deref().map(resolve_user_id).transpose()? {
+    let (auth_user, token) =
+        require_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
+    let requested_user_id = query.user_id.as_deref().map(resolve_user_id).transpose()?;
+    if let Some(user_id) = requested_user_id {
         ensure_user_access(&auth_user, user_id)?;
     }
     let folders = state.db.virtual_folders().await?;
     let server_id = state.db.server_state().await?.server_id.to_string();
-    let item_counts = state.db.media_item_counts_by_virtual_folder().await?;
-    let live_tv_tuners = configured_live_tv_tuner_views(&state.db).await?;
+    let item_counts = catalog_cache::cached_media_item_counts_by_virtual_folder(&state.db).await?;
+    let allowed = authorized_live_tv_tuner_ids(
+        &state.db,
+        &jellyrin_plugin_sdk::PluginUserContext {
+            user_id: requested_user_id.unwrap_or(auth_user.id).to_string(),
+            device_id: token.device_id,
+            is_administrator: auth_user.is_administrator,
+        },
+    )
+    .await?;
+    let mut live_tv_tuners = configured_live_tv_tuner_views(&state.db).await?;
+    if let Some(allowed) = allowed {
+        live_tv_tuners.retain(|tuner| {
+            allowed
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(&tuner.tuner_id))
+        });
+    }
     let items = user_views_for_query(&folders, &item_counts, &live_tv_tuners, &server_id, &query);
     Ok(Json(query_result(items)))
 }
@@ -31653,14 +32644,30 @@ async fn user_views_result_legacy(
     Query(query): Query<UserViewsQuery>,
     Path(user_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let auth_user =
-        require_request_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
+    let (auth_user, token) =
+        require_user(&state.db, &headers, query.auth.api_key.as_deref()).await?;
     let requested_user_id = resolve_user_id(&user_id)?;
     ensure_user_access(&auth_user, requested_user_id)?;
     let folders = state.db.virtual_folders().await?;
     let server_id = state.db.server_state().await?.server_id.to_string();
-    let item_counts = state.db.media_item_counts_by_virtual_folder().await?;
-    let live_tv_tuners = configured_live_tv_tuner_views(&state.db).await?;
+    let item_counts = catalog_cache::cached_media_item_counts_by_virtual_folder(&state.db).await?;
+    let allowed = authorized_live_tv_tuner_ids(
+        &state.db,
+        &jellyrin_plugin_sdk::PluginUserContext {
+            user_id: requested_user_id.to_string(),
+            device_id: token.device_id,
+            is_administrator: auth_user.is_administrator,
+        },
+    )
+    .await?;
+    let mut live_tv_tuners = configured_live_tv_tuner_views(&state.db).await?;
+    if let Some(allowed) = allowed {
+        live_tv_tuners.retain(|tuner| {
+            allowed
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(&tuner.tuner_id))
+        });
+    }
     let items = user_views_for_query(&folders, &item_counts, &live_tv_tuners, &server_id, &query);
     Ok(Json(query_result(items)))
 }
@@ -31953,10 +32960,11 @@ fn special_user_view_to_json(
     collection_type: &str,
     server_id: &str,
 ) -> serde_json::Value {
+    let id = special_user_view_id(collection_type);
     serde_json::json!({
         "Name": name,
         "ServerId": server_id,
-        "Id": special_user_view_id(collection_type),
+        "Id": id,
         "Etag": null,
         "DateCreated": null,
         "CanDelete": false,
@@ -31975,8 +32983,8 @@ fn special_user_view_to_json(
         "ParentId": null,
         "Type": "CollectionFolder",
         "CollectionType": collection_type,
-        "UserData": { "PlaybackPositionTicks": 0, "PlayCount": 0, "IsFavorite": false, "Played": false, "Key": special_user_view_id(collection_type), "ItemId": special_user_view_id(collection_type) },
-        "ImageTags": { "Primary": "placeholder" },
+        "UserData": { "PlaybackPositionTicks": 0, "PlayCount": 0, "IsFavorite": false, "Played": false, "Key": id, "ItemId": id },
+        "ImageTags": { "Primary": generated_folder_primary_image_tag(&id) },
         "PrimaryImageAspectRatio": 1.0,
         "BackdropImageTags": [],
         "LocationType": "Virtual",
@@ -32243,6 +33251,8 @@ struct ItemsQuery {
         alias = "excludeLocationType"
     )]
     exclude_location_types: Vec<String>,
+    #[serde(skip)]
+    allowed_plugin_tuner_ids: Option<Vec<String>>,
 }
 
 fn parse_items_query(raw_query: Option<&str>) -> ItemsQuery {
@@ -32334,6 +33344,9 @@ fn parse_items_query(raw_query: Option<&str>) -> ItemsQuery {
             "sortby" => set_query_scalar(&mut query.sort_by, value),
             "sortorder" => set_query_scalar(&mut query.sort_order, value),
             "fields" => set_query_scalar(&mut query.fields, value),
+            "enableimages" => query._enable_images = Some(value),
+            "enableuserdata" => query._enable_user_data = Some(value),
+            "enabletotalrecordcount" => query._enable_total_record_count = Some(value),
             "locationtypes" => query.location_types.push(value),
             "locationtype" => query.location_types.push(value),
             "excludelocationtypes" => query.exclude_location_types.push(value),
@@ -32360,6 +33373,65 @@ fn parse_query_bool(value: &str) -> Option<bool> {
         "false" => Some(false),
         _ => None,
     }
+}
+
+fn query_flag(value: &Option<String>) -> Option<bool> {
+    value.as_deref().and_then(parse_query_bool)
+}
+
+fn shape_catalog_item_for_query(
+    mut item: serde_json::Value,
+    query: &ItemsQuery,
+) -> serde_json::Value {
+    let Some(object) = item.as_object_mut() else {
+        return item;
+    };
+    if query_flag(&query._enable_images) == Some(false) {
+        for key in [
+            "ImageTags",
+            "ImageBlurHashes",
+            "BackdropImageTags",
+            "ParentBackdropImageTags",
+            "PrimaryImageAspectRatio",
+        ] {
+            object.remove(key);
+        }
+    }
+    if query_flag(&query._enable_user_data) == Some(false) {
+        object.remove("UserData");
+    }
+    let Some(fields) = query.fields.as_deref() else {
+        return item;
+    };
+    let requested = fields
+        .split(',')
+        .map(|field| field.trim().to_ascii_lowercase())
+        .filter(|field| !field.is_empty())
+        .collect::<HashSet<_>>();
+    for key in [
+        "Overview",
+        "MediaSources",
+        "MediaStreams",
+        "Path",
+        "People",
+        "Studios",
+        "Genres",
+        "Tags",
+        "Taglines",
+        "ProviderIds",
+        "DateCreated",
+        "PremiereDate",
+        "ProductionYear",
+        "OfficialRating",
+        "CommunityRating",
+        "CriticRating",
+        "PrimaryImageAspectRatio",
+    ] {
+        if !requested.contains(&key.to_ascii_lowercase()) {
+            object.remove(key);
+        }
+    }
+    item
 }
 
 fn percent_decode_query_component(value: &str) -> String {
@@ -32450,10 +33522,10 @@ fn media_catalog_query_for_items(
         return Ok(None);
     }
     let include_item_types = csv_values_lowercase(&query.include_item_types).unwrap_or_default();
-    if include_item_types
-        .iter()
-        .any(|item_type| matches!(item_type.as_str(), "series" | "tvchannel" | "livetvchannel"))
-    {
+    if include_item_types.iter().any(|item_type| {
+        matches!(item_type.as_str(), "tvchannel" | "livetvchannel")
+            || (item_type == "series" && query.allowed_plugin_tuner_ids.is_none())
+    }) {
         return Ok(None);
     }
     if !person_ids.is_empty()
@@ -32485,15 +33557,23 @@ fn media_catalog_query_for_items(
         return Ok(None);
     }
 
-    let descending = query
+    let sort_directions = query
         .sort_order
         .as_deref()
-        .is_some_and(|order| order.eq_ignore_ascii_case("Descending"));
-    let sort_direction = if descending {
-        SortDirection::Descending
-    } else {
-        SortDirection::Ascending
-    };
+        .unwrap_or_default()
+        .split(',')
+        .map(|order| {
+            if order.trim().eq_ignore_ascii_case("Descending") {
+                SortDirection::Descending
+            } else {
+                SortDirection::Ascending
+            }
+        })
+        .collect::<Vec<_>>();
+    let default_sort_direction = sort_directions
+        .first()
+        .copied()
+        .unwrap_or(SortDirection::Ascending);
     let sort = query
         .sort_by
         .as_deref()
@@ -32503,6 +33583,9 @@ fn media_catalog_query_for_items(
             "sortname" | "name" => Some(MediaItemCatalogSortField::SortName),
             "datecreated" => Some(MediaItemCatalogSortField::DateCreated),
             "datelastmediaadded" => Some(MediaItemCatalogSortField::DateLastMediaAdded),
+            "premieredate" => Some(MediaItemCatalogSortField::PremiereDate),
+            "communityrating" => Some(MediaItemCatalogSortField::CommunityRating),
+            "dateplayed" => Some(MediaItemCatalogSortField::DatePlayed),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -32541,7 +33624,9 @@ fn media_catalog_query_for_items(
     Ok(Some(MediaItemCatalogQuery {
         start_index: query.start_index.unwrap_or(0),
         limit: limit.min(MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE),
+        include_total_record_count: query_flag(&query._enable_total_record_count).unwrap_or(true),
         ids: ids.unwrap_or_default(),
+        allowed_plugin_tuner_ids: query.allowed_plugin_tuner_ids.clone(),
         include_item_types: query.include_item_types.clone(),
         exclude_item_types: query.exclude_item_types.clone(),
         media_types: query.media_types.clone(),
@@ -32614,7 +33699,16 @@ fn media_catalog_query_for_items(
         is_resumable: resumable_filter_value(&filters),
         sort: sort
             .into_iter()
-            .map(|field| (field, sort_direction))
+            .enumerate()
+            .map(|(index, field)| {
+                (
+                    field,
+                    sort_directions
+                        .get(index)
+                        .copied()
+                        .unwrap_or(default_sort_direction),
+                )
+            })
             .collect(),
         ..MediaItemCatalogQuery::default()
     }))
@@ -32656,14 +33750,6 @@ async fn resolved_media_catalog_query_for_items(
         return Ok(None);
     }
 
-    // First establish that every non-parent predicate is supported. This avoids fetching the
-    // virtual-folder list for requests that would use the fallback regardless.
-    let mut scoped_query = query.clone();
-    scoped_query.parent_id = None;
-    let Some(mut db_query) = media_catalog_query_for_items(&scoped_query, user_id)? else {
-        return Ok(None);
-    };
-
     let Ok(parent_id) = parse_jellyfin_uuid(parent_id) else {
         return Ok(None);
     };
@@ -32671,6 +33757,31 @@ async fn resolved_media_catalog_query_for_items(
     let Some(parent) = folders.iter().find(|folder| folder.id == parent_id) else {
         return Ok(None);
     };
+
+    // A plugin VOD library persists first-class Series anchors, while a physical TV library still
+    // needs the legacy episode-to-Series projection. An unfiltered plugin does not populate
+    // `allowed_plugin_tuner_ids`; use a temporary marker to pass the mapper's Series gate, then
+    // restore the original no-filter visibility before executing SQL.
+    let persisted_plugin_series = query.allowed_plugin_tuner_ids.is_none()
+        && query_requests_only_item_type(query, "Series")
+        && parent
+            .locations
+            .iter()
+            .any(|location| location.trim().starts_with("plugin-vod://"));
+
+    // First establish that every non-parent predicate is supported. This avoids enabling SQL for
+    // UUID-shaped Series/Season parents and keeps unsupported request shapes on the legacy path.
+    let mut scoped_query = query.clone();
+    scoped_query.parent_id = None;
+    if persisted_plugin_series {
+        scoped_query.allowed_plugin_tuner_ids = Some(Vec::new());
+    }
+    let Some(mut db_query) = media_catalog_query_for_items(&scoped_query, user_id)? else {
+        return Ok(None);
+    };
+    if persisted_plugin_series {
+        db_query.allowed_plugin_tuner_ids = None;
+    }
 
     db_query.virtual_folder_ids.push(parent.id);
     if query.recursive.unwrap_or(false) {
@@ -32698,7 +33809,7 @@ async fn media_catalog_items_result(
         .items
         .iter()
         .map(|entry| {
-            if compact {
+            let item = if compact {
                 compact_media_item_to_json(&entry.item, server_id, entry.playback_state.as_ref())
             } else {
                 media_item_to_json_with_playback_and_metadata(
@@ -32707,7 +33818,8 @@ async fn media_catalog_items_result(
                     entry.playback_state.as_ref(),
                     Some(&entry.metadata),
                 )
-            }
+            };
+            shape_catalog_item_for_query(item, query)
         })
         .collect();
     Ok(Some(Json(query_result_with_total(
@@ -32715,6 +33827,83 @@ async fn media_catalog_items_result(
         page.total_record_count,
         page.start_index,
     ))))
+}
+
+/// Resolve a plain `Ids=` lookup without materializing the complete media catalogue.
+///
+/// Jellyfin clients use this shape to hydrate the people attached to a detail page. Those people
+/// are metadata facets rather than rows in `media_items`, so the ordinary SQL catalogue page is
+/// not sufficient by itself. Keep the gate deliberately narrow, fetch real media rows in one
+/// bounded query, and resolve only the missing stable metadata entity ids.
+async fn exact_id_items_result(
+    db: &Database,
+    query: &ItemsQuery,
+    server_id: &str,
+    user_id: Option<Uuid>,
+) -> Result<Option<Json<serde_json::Value>>, ApiError> {
+    let Some(raw_ids) = query.ids.as_deref() else {
+        return Ok(None);
+    };
+
+    let mut unsupported = query.clone();
+    unsupported.user_id = None;
+    unsupported.ids = None;
+    unsupported.fields = None;
+    unsupported._image_type_limit = None;
+    unsupported._enable_images = None;
+    unsupported._enable_user_data = None;
+    unsupported._collapse_box_set_items = None;
+    unsupported._image_types = None;
+    unsupported._enable_image_types = None;
+    unsupported._enable_total_record_count = None;
+    unsupported.allowed_plugin_tuner_ids = None;
+    if unsupported != ItemsQuery::default() {
+        return Ok(None);
+    }
+
+    let ids = parse_uuid_list(raw_ids)?;
+    if ids.is_empty() {
+        return Ok(None);
+    }
+    if ids.len() > MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE {
+        return Err(ApiError::bad_request(format!(
+            "Ids accepts at most {MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE} values"
+        )));
+    }
+
+    let media_items =
+        filtered_media_items(db.media_items_by_ids(&ids).await?, query, user_id, db).await?;
+    let media_values = items_to_json(db, media_items, server_id, user_id, false).await?;
+    let mut values_by_id = media_values
+        .into_iter()
+        .filter_map(|value| {
+            let id = value.get("Id")?.as_str()?.to_ascii_lowercase();
+            Some((id, value))
+        })
+        .collect::<HashMap<_, _>>();
+
+    let mut items = Vec::with_capacity(ids.len());
+    for id in ids {
+        let normalized_id = id.simple().to_string();
+        let value = if let Some(value) = values_by_id.remove(&normalized_id) {
+            value
+        } else if let Some(entity) = recent_metadata_entity(&normalized_id) {
+            metadata_entity_match_json(server_id, &entity)
+        } else if let Some(entity) = metadata_entity_by_stable_id(db, &normalized_id).await? {
+            metadata_entity_match_json(server_id, &entity)
+        } else {
+            // Series, seasons, channels and other synthetic ids retain their existing handlers.
+            return Ok(None);
+        };
+        items.push(shape_catalog_item_for_query(value, query));
+    }
+
+    let total = if query_flag(&query._enable_total_record_count).unwrap_or(true) {
+        items.len()
+    } else {
+        0
+    };
+    Ok(Some(Json(query_result_with_total(items, total, 0))))
 }
 
 /// Serve Jellyfin Web/Android's library search without loading every episode into memory.
@@ -32728,6 +33917,9 @@ async fn mixed_series_episode_search_items_result(
     server_id: &str,
     user_id: Option<Uuid>,
 ) -> Result<Option<Json<serde_json::Value>>, ApiError> {
+    if query.allowed_plugin_tuner_ids.is_some() {
+        return Ok(None);
+    }
     let Some(search_term) = query
         .search_term
         .as_deref()
@@ -32829,6 +34021,9 @@ async fn random_movie_series_items_result(
     server_id: &str,
     user_id: Option<Uuid>,
 ) -> Result<Option<Json<serde_json::Value>>, ApiError> {
+    if query.allowed_plugin_tuner_ids.is_some() {
+        return Ok(None);
+    }
     let Some(limit) = query.limit.filter(|limit| *limit > 0) else {
         return Ok(None);
     };
@@ -32947,19 +34142,203 @@ async fn random_movie_series_items_result(
     ))))
 }
 
+/// Resolve the direct `Series -> Season` `/Items` shape used by Wholphin without loading the
+/// complete media catalogue. Jellyfin's own clients normally use `/Shows/{id}/Seasons`, while
+/// Wholphin asks for the same projection through `/Items?ParentId=...&IncludeItemTypes=Season`.
+fn direct_parent_seasons_series_id(query: &ItemsQuery) -> Option<&str> {
+    let include_types = csv_values_lowercase(&query.include_item_types)?;
+    if include_types != ["season"]
+        || query.recursive == Some(true)
+        || query.ids.is_some()
+        || query.season_id.is_some()
+        || query.series_id.is_some()
+        || !query.exclude_item_types.is_empty()
+        || !query.media_types.is_empty()
+        || !query.containers.is_empty()
+        || !query.video_types.is_empty()
+        || !query.audio_languages.is_empty()
+        || !query.subtitle_languages.is_empty()
+        || !query.person_ids.is_empty()
+        || !query.genre_ids.is_empty()
+        || !query.studio_ids.is_empty()
+        || !query.official_ratings.is_empty()
+        || !query.tags.is_empty()
+        || !query.series_status.is_empty()
+        || !query.years.is_empty()
+        || !query.filters.is_empty()
+        || query.search_term.is_some()
+        || query.is_played.is_some()
+        || query.is_favorite.is_some()
+        || query.is_airing.is_some()
+        || query.is_folder.is_some()
+        || query.has_subtitles.is_some()
+        || query.has_trailer.is_some()
+        || query.has_overview.is_some()
+        || query.has_imdb_id.is_some()
+        || query.has_tmdb_id.is_some()
+        || query.has_tvdb_id.is_some()
+        || query.is_hd.is_some()
+        || query.is_4k.is_some()
+        || query.min_width.is_some()
+        || query.max_width.is_some()
+        || query.min_height.is_some()
+        || query.max_height.is_some()
+        || query.is_missing.is_some()
+        || query.is_unaired.is_some()
+        || query.has_official_rating.is_some()
+        || query.is_locked.is_some()
+        || query.min_community_rating.is_some()
+        || query.max_community_rating.is_some()
+        || query.min_critic_rating.is_some()
+        || query.max_critic_rating.is_some()
+        || query.min_premiere_date.is_some()
+        || query.max_premiere_date.is_some()
+        || query.min_date_created.is_some()
+        || query.max_date_created.is_some()
+        || query.min_date_last_saved.is_some()
+        || query.max_date_last_saved.is_some()
+        || query.name_starts_with.is_some()
+        || query.name_starts_with_or_greater.is_some()
+        || query.name_less_than.is_some()
+        || !query.location_types.is_empty()
+        || !query.exclude_location_types.is_empty()
+    {
+        return None;
+    }
+    query.parent_id.as_deref()
+}
+
+async fn parent_series_seasons_items_result(
+    db: &Database,
+    query: &ItemsQuery,
+    user_id: Uuid,
+    server_id: &str,
+) -> Result<Option<Json<serde_json::Value>>, ApiError> {
+    let Some(series_id) = direct_parent_seasons_series_id(query) else {
+        return Ok(None);
+    };
+    Ok(Some(
+        series_seasons_result(db, query, series_id, user_id, server_id).await?,
+    ))
+}
+
+/// Resolve the direct `Series -> Episode` `/Items` shape used by Android TV without loading the
+/// complete media catalogue. A UUID-shaped `ParentId` can also be a real virtual folder, so leave
+/// those parents to the indexed catalogue path below and only project application-level series.
+async fn parent_series_episodes_items_result(
+    db: &Database,
+    query: &ItemsQuery,
+    user_id: Uuid,
+    server_id: &str,
+) -> Result<Option<Json<serde_json::Value>>, ApiError> {
+    let include_types = csv_values_lowercase(&query.include_item_types).unwrap_or_default();
+    if include_types != ["episode"]
+        || query.recursive == Some(true)
+        || query.ids.is_some()
+        || query.series_id.is_some()
+        || query.season_id.is_some()
+    {
+        return Ok(None);
+    }
+    let Some(series_id) = query.parent_id.as_deref() else {
+        return Ok(None);
+    };
+    let Ok(parent_id) = parse_jellyfin_uuid(series_id) else {
+        return Ok(None);
+    };
+    if db
+        .virtual_folders()
+        .await?
+        .iter()
+        .any(|folder| folder.id == parent_id)
+    {
+        return Ok(None);
+    }
+
+    let mut episode_query = query.clone();
+    episode_query.parent_id = None;
+
+    // Jellyfin Android TV also uses this exact shape with a Season id as ParentId while loading
+    // sibling episodes on the episode-detail screen. Resolve that indexed scope before treating
+    // the parent as a Series; otherwise a valid season falls through to the legacy synthetic-id
+    // scan of the entire TV catalogue and can exceed PostgreSQL's statement timeout.
+    let season_snapshot = match tv_episode_catalog_snapshot_for_season(db, series_id).await? {
+        some @ Some(_) => some,
+        None => {
+            let fallback = tv_episode_catalog_snapshot_without_canonical_series_id(db).await?;
+            fallback
+                .items
+                .iter()
+                .any(|item| {
+                    tv_episode_matches_season(
+                        item,
+                        fallback.metadata_by_item.get(&item.id),
+                        series_id,
+                    )
+                })
+                .then_some(fallback)
+        }
+    };
+    if let Some(season_snapshot) = season_snapshot {
+        let canonical_season_id = parent_id.simple().to_string();
+        let canonical_series_id = season_snapshot
+            .items
+            .iter()
+            .filter(|item| {
+                tv_episode_matches_season(
+                    item,
+                    season_snapshot.metadata_by_item.get(&item.id),
+                    series_id,
+                )
+            })
+            .find_map(|item| {
+                let metadata = season_snapshot.metadata_by_item.get(&item.id);
+                metadata
+                    .and_then(|metadata| canonical_metadata_uuid_from_json(metadata, &["SeriesId"]))
+                    .or_else(|| {
+                        tv_episode_info(item).map(|info| tv_series_id_for_episode(&info, metadata))
+                    })
+            });
+        if let Some(canonical_series_id) = canonical_series_id {
+            episode_query.season_id = Some(canonical_season_id);
+            return Ok(Some(
+                series_episodes_result(
+                    db,
+                    &episode_query,
+                    &canonical_series_id,
+                    user_id,
+                    server_id,
+                )
+                .await?,
+            ));
+        }
+    }
+    Ok(Some(
+        series_episodes_result(db, &episode_query, series_id, user_id, server_id).await?,
+    ))
+}
+
 async fn items_result(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(auth_query): Query<AuthQuery>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let query = parse_items_query(raw_query.as_deref());
-    let auth_user =
-        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let mut query = parse_items_query(raw_query.as_deref());
+    let (auth_user, token) =
+        require_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
     let requested_user_id = query.user_id.as_deref().map(resolve_user_id).transpose()?;
     if let Some(requested_user_id) = requested_user_id {
         ensure_user_access(&auth_user, requested_user_id)?;
     }
+    scope_items_query_for_plugin_catalogs(
+        &state.db,
+        &mut query,
+        &auth_user,
+        &token,
+        requested_user_id,
+    )
+    .await?;
     let server_id = state.db.server_state().await?.server_id.to_string();
     if let Some(parent_id) = query.parent_id.as_deref()
         && let Some(tuner) = live_tv_tuner_view_by_id(&state.db, parent_id).await?
@@ -32994,19 +34373,52 @@ async fn items_result(
         mixed_series_episode_search_items_result(&state.db, &query, &server_id, requested_user_id)
             .await?
     {
+        queue_plugin_vod_artwork_prefetch_from_page(&state, &result.0);
         return Ok(result);
     }
     if let Some(result) =
-        media_catalog_items_result(&state.db, &query, &server_id, requested_user_id).await?
+        exact_id_items_result(&state.db, &query, &server_id, requested_user_id).await?
     {
+        return Ok(result);
+    }
+    if let Some(result) = parent_series_seasons_items_result(
+        &state.db,
+        &query,
+        requested_user_id.unwrap_or(auth_user.id),
+        &server_id,
+    )
+    .await?
+    {
+        return Ok(result);
+    }
+    if let Some(result) = parent_series_episodes_items_result(
+        &state.db,
+        &query,
+        requested_user_id.unwrap_or(auth_user.id),
+        &server_id,
+    )
+    .await?
+    {
+        return Ok(result);
+    }
+    if let Some(result) = media_catalog_items_result(
+        &state.db,
+        &query,
+        &server_id,
+        requested_user_id.or(Some(auth_user.id)),
+    )
+    .await?
+    {
+        queue_plugin_vod_artwork_prefetch_from_page(&state, &result.0);
         return Ok(result);
     }
     if let Some(result) =
         fast_name_search_items_result(&state.db, &query, &server_id, requested_user_id).await?
     {
+        queue_plugin_vod_artwork_prefetch_from_page(&state, &result.0);
         return Ok(result);
     }
-    if query_requests_only_item_type(&query, "Series") {
+    if query_requests_only_item_type(&query, "Series") && query.allowed_plugin_tuner_ids.is_none() {
         return tv_series_items_result(&state.db, &query, requested_user_id, &server_id).await;
     }
     let filtered_items = filtered_media_items(
@@ -33046,9 +34458,14 @@ async fn items_result(
         )));
     }
     let total_record_count = filtered_items.len();
+    let page = paged_media_items(filtered_items, &query);
+    queue_plugin_vod_artwork_prefetch_ids(
+        &state,
+        &page.iter().map(|item| item.id).collect::<Vec<_>>(),
+    );
     let items = items_to_json(
         &state.db,
-        paged_media_items(filtered_items, &query),
+        page,
         &server_id,
         requested_user_id,
         should_use_compact_items_result(&query),
@@ -33068,11 +34485,19 @@ async fn user_items_result(
     Path(user_id): Path<String>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let query = parse_items_query(raw_query.as_deref());
-    let auth_user =
-        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let mut query = parse_items_query(raw_query.as_deref());
+    let (auth_user, token) =
+        require_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
     let requested_user_id = resolve_user_id(&user_id)?;
     ensure_user_access(&auth_user, requested_user_id)?;
+    scope_items_query_for_plugin_catalogs(
+        &state.db,
+        &mut query,
+        &auth_user,
+        &token,
+        Some(requested_user_id),
+    )
+    .await?;
     let server_id = state.db.server_state().await?.server_id.to_string();
     if let Some(parent_id) = query.parent_id.as_deref()
         && let Some(tuner) = live_tv_tuner_view_by_id(&state.db, parent_id).await?
@@ -33098,9 +34523,29 @@ async fn user_items_result(
     {
         return live_tv_channel_items_result(&state.db, &query, &server_id, None).await;
     }
+    // Keep the bounded projections in the same order as `/Items`. This route is the one Android TV
+    // and Jellyfin Web actually call, so a projection that exists only on the unscoped sibling
+    // leaves the user-scoped request on the legacy application-level scan.
+    if let Some(result) =
+        exact_id_items_result(&state.db, &query, &server_id, Some(requested_user_id)).await?
+    {
+        return Ok(result);
+    }
+    if let Some(result) =
+        parent_series_seasons_items_result(&state.db, &query, requested_user_id, &server_id).await?
+    {
+        return Ok(result);
+    }
+    if let Some(result) =
+        parent_series_episodes_items_result(&state.db, &query, requested_user_id, &server_id)
+            .await?
+    {
+        return Ok(result);
+    }
     if let Some(result) =
         media_catalog_items_result(&state.db, &query, &server_id, Some(requested_user_id)).await?
     {
+        queue_plugin_vod_artwork_prefetch_from_page(&state, &result.0);
         return Ok(result);
     }
     if let Some(result) = mixed_series_episode_search_items_result(
@@ -33111,15 +34556,17 @@ async fn user_items_result(
     )
     .await?
     {
+        queue_plugin_vod_artwork_prefetch_from_page(&state, &result.0);
         return Ok(result);
     }
     if let Some(result) =
         fast_name_search_items_result(&state.db, &query, &server_id, Some(requested_user_id))
             .await?
     {
+        queue_plugin_vod_artwork_prefetch_from_page(&state, &result.0);
         return Ok(result);
     }
-    if query_requests_only_item_type(&query, "Series") {
+    if query_requests_only_item_type(&query, "Series") && query.allowed_plugin_tuner_ids.is_none() {
         return tv_series_items_result(&state.db, &query, Some(requested_user_id), &server_id)
             .await;
     }
@@ -33160,9 +34607,14 @@ async fn user_items_result(
         )));
     }
     let total_record_count = filtered_items.len();
+    let page = paged_media_items(filtered_items, &query);
+    queue_plugin_vod_artwork_prefetch_ids(
+        &state,
+        &page.iter().map(|item| item.id).collect::<Vec<_>>(),
+    );
     let items = items_to_json(
         &state.db,
-        paged_media_items(filtered_items, &query),
+        page,
         &server_id,
         Some(requested_user_id),
         should_use_compact_items_result(&query),
@@ -33272,11 +34724,29 @@ async fn live_tv_channel_items_result(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let requested_limit = query.limit.unwrap_or(25);
     let limit = requested_limit.min(500);
+    let tuner_ids = match (&query.allowed_plugin_tuner_ids, tuner_id) {
+        (Some(allowed), Some(requested)) => {
+            let matching = allowed
+                .iter()
+                .find(|allowed| allowed.eq_ignore_ascii_case(requested))
+                .cloned();
+            let Some(matching) = matching else {
+                return Ok(Json(query_result_with_total(Vec::new(), 0, 0)));
+            };
+            vec![matching]
+        }
+        (Some(allowed), None) if allowed.is_empty() => {
+            return Ok(Json(query_result_with_total(Vec::new(), 0, 0)));
+        }
+        (Some(allowed), None) => allowed.clone(),
+        (None, Some(requested)) => vec![requested.to_string()],
+        (None, None) => Vec::new(),
+    };
     let db_query = LiveTvChannelQuery {
         start_index: query.start_index.unwrap_or(0),
         limit: Some(limit),
         search_term: query.search_term.clone(),
-        tuner_ids: tuner_id.map(ToOwned::to_owned).into_iter().collect(),
+        tuner_ids,
         category_ids: Vec::new(),
     };
     let page = LiveTvService::new(db).channel_page(db_query).await?;
@@ -33294,6 +34764,15 @@ async fn live_tv_channel_items_result(
     }
 
     let mut items = configured_live_tv_channel_items(db).await?;
+    if let Some(allowed) = query.allowed_plugin_tuner_ids.as_ref() {
+        items.retain(|item| {
+            json_string_field(item, "TunerHostId").is_some_and(|id| {
+                allowed
+                    .iter()
+                    .any(|allowed| allowed.eq_ignore_ascii_case(&id))
+            })
+        });
+    }
     if let Some(tuner_id) = tuner_id {
         items.retain(|item| {
             json_string_field(item, "TunerHostId")
@@ -33316,6 +34795,9 @@ async fn fast_name_search_items_result(
     server_id: &str,
     user_id: Option<Uuid>,
 ) -> Result<Option<Json<serde_json::Value>>, ApiError> {
+    if query.allowed_plugin_tuner_ids.is_some() {
+        return Ok(None);
+    }
     let Some(search_term) = query
         .search_term
         .as_deref()
@@ -33547,10 +35029,10 @@ async fn parent_virtual_items(
     let mut series_by_name = BTreeMap::<String, TvSeriesSummary>::new();
     let mut seasons_by_series = BTreeMap::<String, BTreeMap<Option<i32>, TvSeasonSummary>>::new();
     for episode in &episodes {
-        let Some(info) = tv_episode_info(episode) else {
+        let metadata = metadata_by_item.get(&episode.id);
+        let Some(info) = tv_episode_info_with_metadata(episode, metadata) else {
             continue;
         };
-        let metadata = metadata_by_item.get(&episode.id);
         let playback = playback_by_item.get(&episode.id);
         let series = series_by_name
             .entry(info.series_name.clone())
@@ -33575,7 +35057,8 @@ async fn parent_virtual_items(
         let series_id = summary.id();
         let series_name = summary.source_name.clone();
         values.push(tv_series_json(server_id, summary));
-        if let Some(seasons) = seasons_by_series.remove(&series_name) {
+        if let Some(mut seasons) = seasons_by_series.remove(&series_name) {
+            present_unnumbered_season_as_first(&mut seasons, &series_name);
             for season in seasons.into_values() {
                 values.push(tv_season_json(server_id, &series_name, &series_id, season));
             }
@@ -33608,7 +35091,7 @@ fn child_virtual_folders<'a>(
                 .any(|location| parent_locations.contains(&location))
         })
         .collect::<Vec<_>>();
-    children.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+    children.sort_by_key(|item| item.name.to_lowercase());
     children
 }
 
@@ -33624,7 +35107,10 @@ async fn virtual_folder_detail_json(
     let folders = db.virtual_folders().await?;
     let item_counts = db.media_item_counts_by_virtual_folder().await?;
     let child_count = virtual_folder_recursive_count(folder, &folders, &item_counts);
-    Ok(physical_folder_item_to_json(folder, server_id, child_count))
+    // A virtual folder is the root of a Jellyfin library and is advertised as a CollectionFolder
+    // by `/UserViews`. Keep the same type when a client hydrates that id through `/Items/{id}`;
+    // Wholphin rejects a mid-navigation type change to the physical-only `Folder` variant.
+    Ok(user_view_to_json_with_count(folder, server_id, child_count))
 }
 
 fn physical_folder_item_to_json(
@@ -33659,8 +35145,8 @@ fn physical_folder_item_to_json(
         "CollectionType": folder.collection_type,
         "ChildCount": child_count,
         "RecursiveItemCount": child_count,
-        "UserData": { "PlaybackPositionTicks": 0, "PlayCount": 0, "IsFavorite": false, "Played": false },
-        "ImageTags": { "Primary": default_primary_image_tag(&id) },
+        "UserData": default_user_data_json(&id),
+        "ImageTags": { "Primary": generated_folder_primary_image_tag(&id) },
         "PrimaryImageAspectRatio": 0.6666667,
         "BackdropImageTags": [],
         "LocationType": "FileSystem",
@@ -33695,13 +35181,21 @@ async fn item_counts(
     Query(auth_query): Query<AuthQuery>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let query = parse_items_query(raw_query.as_deref());
-    let auth_user =
-        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let mut query = parse_items_query(raw_query.as_deref());
+    let (auth_user, token) =
+        require_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
     let requested_user_id = query.user_id.as_deref().map(resolve_user_id).transpose()?;
     if let Some(requested_user_id) = requested_user_id {
         ensure_user_access(&auth_user, requested_user_id)?;
     }
+    scope_items_query_for_plugin_catalogs(
+        &state.db,
+        &mut query,
+        &auth_user,
+        &token,
+        requested_user_id,
+    )
+    .await?;
     if let Some(counts) = media_catalog_counts_result(&state.db, &query, requested_user_id).await? {
         return Ok(Json(counts));
     }
@@ -33722,11 +35216,19 @@ async fn user_item_counts(
     Path(user_id): Path<String>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let query = parse_items_query(raw_query.as_deref());
-    let auth_user =
-        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let mut query = parse_items_query(raw_query.as_deref());
+    let (auth_user, token) =
+        require_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
     let requested_user_id = resolve_user_id(&user_id)?;
     ensure_user_access(&auth_user, requested_user_id)?;
+    scope_items_query_for_plugin_catalogs(
+        &state.db,
+        &mut query,
+        &auth_user,
+        &token,
+        Some(requested_user_id),
+    )
+    .await?;
     if let Some(counts) =
         media_catalog_counts_result(&state.db, &query, Some(requested_user_id)).await?
     {
@@ -33803,14 +35305,25 @@ async fn latest_items(
     Query(auth_query): Query<AuthQuery>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
-    let query = parse_items_query(raw_query.as_deref());
-    let auth_user =
-        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let mut query = parse_items_query(raw_query.as_deref());
+    let (auth_user, token) =
+        require_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
     let requested_user_id = query.user_id.as_deref().map(resolve_user_id).transpose()?;
     if let Some(requested_user_id) = requested_user_id {
         ensure_user_access(&auth_user, requested_user_id)?;
     }
+    scope_items_query_for_plugin_catalogs(
+        &state.db,
+        &mut query,
+        &auth_user,
+        &token,
+        requested_user_id,
+    )
+    .await?;
     let server_id = state.db.server_state().await?.server_id.to_string();
+    if let Some(result) = special_user_view_latest_items(&state.db, &query, &server_id).await? {
+        return Ok(result);
+    }
     if let Some(result) = live_tv_latest_items_for_parent(&state.db, &query, &server_id).await? {
         return Ok(result);
     }
@@ -33826,15 +35339,13 @@ async fn latest_items(
         )
     });
     let limit = latest_items_limit(&query);
+    let page = filtered_items.into_iter().take(limit).collect::<Vec<_>>();
+    queue_plugin_vod_artwork_prefetch_ids(
+        &state,
+        &page.iter().map(|item| item.id).collect::<Vec<_>>(),
+    );
     Ok(Json(
-        items_to_json(
-            &state.db,
-            filtered_items.into_iter().take(limit).collect(),
-            &server_id,
-            requested_user_id,
-            false,
-        )
-        .await?,
+        items_to_json(&state.db, page, &server_id, requested_user_id, false).await?,
     ))
 }
 
@@ -33844,9 +35355,9 @@ async fn current_user_latest_items(
     Query(auth_query): Query<AuthQuery>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
-    let query = parse_items_query(raw_query.as_deref());
-    let auth_user =
-        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let mut query = parse_items_query(raw_query.as_deref());
+    let (auth_user, token) =
+        require_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
     let requested_user_id = query
         .user_id
         .as_deref()
@@ -33854,7 +35365,18 @@ async fn current_user_latest_items(
         .transpose()?
         .unwrap_or(auth_user.id);
     ensure_user_access(&auth_user, requested_user_id)?;
+    scope_items_query_for_plugin_catalogs(
+        &state.db,
+        &mut query,
+        &auth_user,
+        &token,
+        Some(requested_user_id),
+    )
+    .await?;
     let server_id = state.db.server_state().await?.server_id.to_string();
+    if let Some(result) = special_user_view_latest_items(&state.db, &query, &server_id).await? {
+        return Ok(result);
+    }
     if let Some(result) = live_tv_latest_items_for_parent(&state.db, &query, &server_id).await? {
         return Ok(result);
     }
@@ -33871,15 +35393,13 @@ async fn current_user_latest_items(
         )
     });
     let limit = latest_items_limit(&query);
+    let page = filtered_items.into_iter().take(limit).collect::<Vec<_>>();
+    queue_plugin_vod_artwork_prefetch_ids(
+        &state,
+        &page.iter().map(|item| item.id).collect::<Vec<_>>(),
+    );
     Ok(Json(
-        items_to_json(
-            &state.db,
-            filtered_items.into_iter().take(limit).collect(),
-            &server_id,
-            Some(requested_user_id),
-            false,
-        )
-        .await?,
+        items_to_json(&state.db, page, &server_id, Some(requested_user_id), false).await?,
     ))
 }
 
@@ -33890,12 +35410,23 @@ async fn user_latest_items(
     Path(user_id): Path<String>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
-    let query = parse_items_query(raw_query.as_deref());
-    let auth_user =
-        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let mut query = parse_items_query(raw_query.as_deref());
+    let (auth_user, token) =
+        require_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
     let requested_user_id = resolve_user_id(&user_id)?;
     ensure_user_access(&auth_user, requested_user_id)?;
+    scope_items_query_for_plugin_catalogs(
+        &state.db,
+        &mut query,
+        &auth_user,
+        &token,
+        Some(requested_user_id),
+    )
+    .await?;
     let server_id = state.db.server_state().await?.server_id.to_string();
+    if let Some(result) = special_user_view_latest_items(&state.db, &query, &server_id).await? {
+        return Ok(result);
+    }
     if let Some(result) = live_tv_latest_items_for_parent(&state.db, &query, &server_id).await? {
         return Ok(result);
     }
@@ -33912,15 +35443,13 @@ async fn user_latest_items(
         )
     });
     let limit = latest_items_limit(&query);
+    let page = filtered_items.into_iter().take(limit).collect::<Vec<_>>();
+    queue_plugin_vod_artwork_prefetch_ids(
+        &state,
+        &page.iter().map(|item| item.id).collect::<Vec<_>>(),
+    );
     Ok(Json(
-        items_to_json(
-            &state.db,
-            filtered_items.into_iter().take(limit).collect(),
-            &server_id,
-            Some(requested_user_id),
-            false,
-        )
-        .await?,
+        items_to_json(&state.db, page, &server_id, Some(requested_user_id), false).await?,
     ))
 }
 
@@ -33933,7 +35462,85 @@ async fn latest_items_candidates(
         return Ok(items);
     }
 
-    filtered_media_items(db.media_items().await?, query, user_id, db).await
+    // Never fall back to loading the entire catalogue: a standard client can issue several
+    // Latest calls concurrently and one unsupported predicate previously materialized ~1M rows,
+    // exhausting the six-connection pool. Pull a newest-first safety window from SQL and retain
+    // the legacy matcher only inside that bounded set.
+    const LATEST_FALLBACK_CANDIDATES: usize = 2_000;
+    let configuration = latest_user_configuration(db, query, user_id).await?;
+    let folders = db.virtual_folders().await?;
+    let mut folder_ids = if let Some(parent_id) = query
+        .parent_id
+        .as_deref()
+        .map(parse_jellyfin_uuid)
+        .transpose()?
+    {
+        let Some(parent) = folders.iter().find(|folder| folder.id == parent_id) else {
+            return Ok(Vec::new());
+        };
+        let mut values = vec![parent.id];
+        values.extend(
+            child_virtual_folders(parent, &folders)
+                .into_iter()
+                .map(|folder| folder.id),
+        );
+        values
+    } else {
+        folders.iter().map(|folder| folder.id).collect()
+    };
+    folder_ids.retain(|id| !configuration.excluded_folder_ids.contains(id));
+    if folder_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let page = MediaCatalogStore::media_item_catalog_page(
+        db,
+        &MediaItemCatalogQuery {
+            limit: LATEST_FALLBACK_CANDIDATES,
+            include_total_record_count: false,
+            virtual_folder_ids: folder_ids,
+            allowed_plugin_tuner_ids: query.allowed_plugin_tuner_ids.clone(),
+            user_id,
+            sort: vec![
+                (
+                    MediaItemCatalogSortField::DateLastMediaAdded,
+                    SortDirection::Descending,
+                ),
+                (
+                    MediaItemCatalogSortField::SortName,
+                    SortDirection::Descending,
+                ),
+            ],
+            ..MediaItemCatalogQuery::default()
+        },
+    )
+    .await?;
+    filtered_media_items(
+        page.items.into_iter().map(|entry| entry.item).collect(),
+        query,
+        user_id,
+        db,
+    )
+    .await
+}
+
+/// Special virtual views do not have persisted media rows. In particular, feeding their synthetic
+/// collection folder through the generic Latest fallback serializes it as `BaseItem`, which strict
+/// SDK clients reject. Return the real BoxSet-shaped collection entries instead.
+async fn special_user_view_latest_items(
+    db: &Database,
+    query: &ItemsQuery,
+    server_id: &str,
+) -> Result<Option<Json<Vec<serde_json::Value>>>, ApiError> {
+    if special_user_view_collection_type_for_parent(query.parent_id.as_deref()) != Some("boxsets") {
+        return Ok(None);
+    }
+    let limit = latest_items_limit(query);
+    let items = special_collection_items(db, server_id)
+        .await?
+        .into_iter()
+        .take(limit)
+        .collect();
+    Ok(Some(Json(items)))
 }
 
 fn latest_items_limit(query: &ItemsQuery) -> usize {
@@ -34042,6 +35649,7 @@ async fn exact_latest_items_page(
 
     db_query.start_index = 0;
     db_query.limit = limit;
+    db_query.include_total_record_count = false;
     // Mirror `compare_media_items(right, left, [DateLastMediaAdded, SortName])`: the repository
     // appends a descending id tie-break for a descending sort, which matters here because a library
     // sync stamps thousands of rows with the same `updated_at`.
@@ -34185,8 +35793,8 @@ async fn movie_recommendations(
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
     let mut query = parse_items_query(raw_query.as_deref());
-    let auth_user =
-        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let (auth_user, token) =
+        require_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
     let requested_user_id = query
         .user_id
         .as_deref()
@@ -34194,6 +35802,14 @@ async fn movie_recommendations(
         .transpose()?
         .unwrap_or(auth_user.id);
     ensure_user_access(&auth_user, requested_user_id)?;
+    scope_items_query_for_plugin_catalogs(
+        &state.db,
+        &mut query,
+        &auth_user,
+        &token,
+        Some(requested_user_id),
+    )
+    .await?;
     let category_limit =
         query_string_value(raw_query.as_deref(), &["CategoryLimit", "categoryLimit"])
             .and_then(|value| value.parse::<usize>().ok())
@@ -34253,8 +35869,8 @@ async fn movie_recommendations(
             liked.push((item.clone(), playback.clone()));
         }
     }
-    recently_played.sort_by(|(_, left), (_, right)| right.updated_at.cmp(&left.updated_at));
-    liked.sort_by(|(_, left), (_, right)| right.updated_at.cmp(&left.updated_at));
+    recently_played.sort_by_key(|(_, item)| std::cmp::Reverse(item.updated_at));
+    liked.sort_by_key(|(_, item)| std::cmp::Reverse(item.updated_at));
 
     let server_id = state.db.server_state().await?.server_id.to_string();
     let recommendation_context = MovieRecommendationContext {
@@ -34551,8 +36167,8 @@ async fn shows_next_up(
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let mut query = parse_items_query(raw_query.as_deref());
-    let auth_user =
-        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let (auth_user, token) =
+        require_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
     let requested_user_id = query
         .user_id
         .as_deref()
@@ -34560,6 +36176,14 @@ async fn shows_next_up(
         .transpose()?
         .unwrap_or(auth_user.id);
     ensure_user_access(&auth_user, requested_user_id)?;
+    scope_items_query_for_plugin_catalogs(
+        &state.db,
+        &mut query,
+        &auth_user,
+        &token,
+        Some(requested_user_id),
+    )
+    .await?;
     if query.include_item_types.is_empty() {
         query.include_item_types.push("Episode".to_string());
     }
@@ -34567,8 +36191,53 @@ async fn shows_next_up(
         query.is_played = Some(false);
     }
 
-    let common_next_up_query = is_common_next_up_query(&query);
+    let next_up_virtual_folder_id = if let Some(parent_id) = query.parent_id.as_deref() {
+        let Ok(parent_id) = parse_jellyfin_uuid(parent_id) else {
+            return Err(ApiError::bad_request("invalid parent id"));
+        };
+        state
+            .db
+            .virtual_folders()
+            .await?
+            .into_iter()
+            .find(|folder| folder.id == parent_id)
+            .map(|folder| folder.id)
+    } else {
+        None
+    };
+    let common_next_up_query = is_common_next_up_query(&query)
+        && (query.parent_id.is_none() || next_up_virtual_folder_id.is_some());
+    if common_next_up_query
+        && query.series_id.is_none()
+        && let Some(limit) = query.limit
+    {
+        let start_index = query.start_index.unwrap_or(0);
+        let candidate_page = MediaCatalogStore::tv_next_up_candidate_page(
+            &state.db,
+            requested_user_id,
+            next_up_virtual_folder_id,
+            start_index,
+            limit,
+            query_flag(&query._enable_total_record_count).unwrap_or(true),
+        )
+        .await?;
+        let page_ids = candidate_page
+            .items
+            .iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
+        let page = MediaCatalogStore::media_items_by_ids(&state.db, &page_ids).await?;
+        let server_id = state.db.server_state().await?.server_id.to_string();
+        let items =
+            items_to_json(&state.db, page, &server_id, Some(requested_user_id), false).await?;
+        return Ok(Json(query_result_with_total(
+            items,
+            candidate_page.total_record_count,
+            candidate_page.start_index,
+        )));
+    }
     let mut prefetched_metadata = HashMap::new();
+    let mut resolved_next_up_series_id = query.series_id.clone();
     // Only the SeriesId filter reads candidate metadata. Without it nothing downstream touches the
     // streams or metadata payloads before paging, so leave both unfetched and hydrate the retained
     // page below: one-per-series selection is derived from each episode's name and path.
@@ -34576,14 +36245,27 @@ async fn shows_next_up(
     let mut episodes = if hydrate_page {
         MediaCatalogStore::tv_next_up_candidate_items(&state.db, requested_user_id).await?
     } else if common_next_up_query {
-        let candidates =
-            MediaCatalogStore::tv_next_up_candidates(&state.db, requested_user_id).await?;
-        let mut items = Vec::with_capacity(candidates.len());
-        for candidate in candidates {
-            prefetched_metadata.insert(candidate.item.id, candidate.metadata);
-            items.push(candidate.item);
-        }
-        items
+        let series_id = query
+            .series_id
+            .as_deref()
+            .expect("common filtered NextUp query has a SeriesId");
+        // Jellyfin Web requests NextUp for the series detail it has just opened. Loading every
+        // unplayed episode in the library here makes that single-series request exceed
+        // PostgreSQL's statement timeout at catalogue scale. Resolve the persisted series (or a
+        // plugin's public series anchor) first and keep every subsequent filter bounded to it.
+        let (snapshot, resolved_series_id) =
+            tv_episode_catalog_snapshot_scoped_to_series(&state.db, series_id).await?;
+        resolved_next_up_series_id = Some(resolved_series_id);
+        prefetched_metadata = snapshot.metadata_by_item;
+        let mut scoped_query = query.clone();
+        scoped_query.series_id = None;
+        filtered_media_items(
+            snapshot.items,
+            &scoped_query,
+            Some(requested_user_id),
+            &state.db,
+        )
+        .await?
     } else {
         filtered_media_items(
             state.db.media_items_by_collection_type("tvshows").await?,
@@ -34593,7 +36275,7 @@ async fn shows_next_up(
         )
         .await?
     };
-    if let Some(series_id) = query.series_id.as_deref() {
+    if let Some(series_id) = resolved_next_up_series_id.as_deref() {
         let metadata_by_item = if prefetched_metadata.is_empty() {
             media_metadata_by_item_id(&state.db, episodes.iter().map(|item| item.id).collect())
                 .await?
@@ -34639,6 +36321,7 @@ async fn shows_next_up(
 fn is_common_next_up_query(query: &ItemsQuery) -> bool {
     let expected = ItemsQuery {
         user_id: query.user_id.clone(),
+        parent_id: query.parent_id.clone(),
         series_id: query.series_id.clone(),
         include_item_types: query.include_item_types.clone(),
         is_played: query.is_played,
@@ -34693,8 +36376,8 @@ async fn shows_upcoming(
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let mut query = parse_items_query(raw_query.as_deref());
-    let auth_user =
-        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let (auth_user, token) =
+        require_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
     let requested_user_id = query
         .user_id
         .as_deref()
@@ -34702,6 +36385,14 @@ async fn shows_upcoming(
         .transpose()?
         .unwrap_or(auth_user.id);
     ensure_user_access(&auth_user, requested_user_id)?;
+    scope_items_query_for_plugin_catalogs(
+        &state.db,
+        &mut query,
+        &auth_user,
+        &token,
+        Some(requested_user_id),
+    )
+    .await?;
     if query.include_item_types.is_empty() {
         query.include_item_types.push("Episode".to_string());
     }
@@ -34782,8 +36473,8 @@ async fn resume_items(
     Query(query): Query<AuthQuery>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let auth_user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    let items_query = parse_items_query(raw_query.as_deref());
+    let (auth_user, token) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let mut items_query = parse_items_query(raw_query.as_deref());
     let requested_user_id = items_query
         .user_id
         .as_deref()
@@ -34791,6 +36482,14 @@ async fn resume_items(
         .transpose()?
         .unwrap_or(auth_user.id);
     ensure_user_access(&auth_user, requested_user_id)?;
+    scope_items_query_for_plugin_catalogs(
+        &state.db,
+        &mut items_query,
+        &auth_user,
+        &token,
+        Some(requested_user_id),
+    )
+    .await?;
     resume_items_result(&state.db, requested_user_id, &items_query).await
 }
 
@@ -34801,10 +36500,18 @@ async fn user_resume_items(
     Path(user_id): Path<String>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let auth_user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let (auth_user, token) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
     let requested_user_id = resolve_user_id(&user_id)?;
     ensure_user_access(&auth_user, requested_user_id)?;
-    let items_query = parse_items_query(raw_query.as_deref());
+    let mut items_query = parse_items_query(raw_query.as_deref());
+    scope_items_query_for_plugin_catalogs(
+        &state.db,
+        &mut items_query,
+        &auth_user,
+        &token,
+        Some(requested_user_id),
+    )
+    .await?;
     resume_items_result(&state.db, requested_user_id, &items_query).await
 }
 
@@ -34993,15 +36700,16 @@ async fn user_root_folder(
 
 async fn root_folder_json(db: &Database) -> Result<serde_json::Value, ApiError> {
     let server = db.server_state().await?;
+    let id = server.server_id.simple().to_string();
     Ok(serde_json::json!({
         "Name": "Root",
         "ServerId": server.server_id.to_string(),
-        "Id": server.server_id.simple().to_string(),
+        "Id": id,
         "Type": "Folder",
         "IsFolder": true,
         "Path": null,
         "ParentId": null,
-        "UserData": { "PlaybackPositionTicks": 0, "PlayCount": 0, "IsFavorite": false, "Played": false },
+        "UserData": default_user_data_json(&id),
         "ImageTags": {},
         "BackdropImageTags": []
     }))
@@ -35037,7 +36745,7 @@ async fn live_tv_root_item_json(db: &Database) -> Result<serde_json::Value, ApiE
         "CollectionType": "livetv",
         "ChildCount": child_count,
         "RecursiveItemCount": child_count,
-        "UserData": { "PlaybackPositionTicks": 0, "PlayCount": 0, "IsFavorite": false, "Played": false },
+        "UserData": default_user_data_json("livetv"),
         "ImageTags": {},
         "BackdropImageTags": [],
         "LocationType": "Virtual",
@@ -35050,7 +36758,8 @@ async fn item_detail(
     Query(query): Query<AuthQuery>,
     Path(item_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let (user, token) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let user_context = plugin_user_context(&user, &token);
     if item_id.eq_ignore_ascii_case("livetv") {
         return Ok(Json(live_tv_root_item_json(&state.db).await?));
     }
@@ -35093,6 +36802,7 @@ async fn item_detail(
     }
     if let Ok(mut item) = media_item_by_id(&state.db, &item_id).await {
         let mut metadata = metadata_payload_for_item(&state.db, item.id).await?;
+        ensure_plugin_catalog_item_visible(&state.db, &metadata, &user_context).await?;
         // Xtream VOD/series items import with synthetic 1-video/1-audio streams;
         // probe the remote source on-demand so the detail page can expose real
         // audio languages and subtitle tracks for selection. Cached after first probe.
@@ -35102,6 +36812,7 @@ async fn item_detail(
                 .item;
         }
         enrich_plugin_vod_item_metadata(&state, &mut item, &mut metadata).await;
+        enrich_plugin_vod_item_media_streams(&state, &mut item, &metadata, user_context).await;
         return Ok(Json(media_item_to_json_with_playback_and_metadata(
             &item,
             &server_id,
@@ -35115,13 +36826,30 @@ async fn item_detail(
     if let Some(channel) = live_tv_channel_json_by_id(&state.db, &item_id).await? {
         return Ok(Json(channel));
     }
+    if let Some((series_name, series_id, mut summary)) =
+        tv_season_summary_by_id(&state.db, &item_id, None, false).await?
+    {
+        ensure_plugin_catalog_item_visible(&state.db, &summary.metadata, &user_context).await?;
+        enrich_plugin_vod_virtual_metadata(&state, &item_id, true, &mut summary.metadata).await;
+        return Ok(Json(tv_season_json(
+            &server_id,
+            &series_name,
+            &series_id,
+            summary,
+        )));
+    }
+    // A season id is also a syntactically valid Jellyfin UUID. Resolve the indexed SeasonId
+    // projection before trying the synthetic-series fallback; doing this in the opposite order
+    // scans every legacy episode without a canonical SeriesId before a web season page can open.
     if let Some(mut summary) = tv_series_summary_by_id(&state.db, &item_id, None).await? {
+        ensure_plugin_catalog_item_visible(&state.db, &summary.metadata, &user_context).await?;
         enrich_plugin_vod_virtual_metadata(&state, &item_id, false, &mut summary.metadata).await;
         return Ok(Json(tv_series_json(&server_id, summary)));
     }
     if let Some((series_name, series_id, mut summary)) =
-        tv_season_summary_by_id(&state.db, &item_id, None).await?
+        tv_season_summary_by_id(&state.db, &item_id, None, true).await?
     {
+        ensure_plugin_catalog_item_visible(&state.db, &summary.metadata, &user_context).await?;
         enrich_plugin_vod_virtual_metadata(&state, &item_id, true, &mut summary.metadata).await;
         return Ok(Json(tv_season_json(
             &server_id,
@@ -35147,8 +36875,9 @@ async fn current_user_item_detail(
     Path(item_id): Path<String>,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let auth_user =
-        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let (auth_user, token) =
+        require_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let user_context = plugin_user_context(&auth_user, &token);
     let query = parse_items_query(raw_query.as_deref());
     let requested_user_id = query
         .user_id
@@ -35203,6 +36932,7 @@ async fn current_user_item_detail(
             .playback_state_for_item(requested_user_id, item.id)
             .await?;
         let mut metadata = metadata_payload_for_item(&state.db, item.id).await?;
+        ensure_plugin_catalog_item_visible(&state.db, &metadata, &user_context).await?;
         // Android, Android TV and Jellyfin Web normally read the user-scoped detail route rather
         // than `/Items/{id}`. Keep its Xtream contract identical so episode detail pages receive
         // the real embedded audio/subtitle tracks instead of the two synthetic import streams.
@@ -35212,6 +36942,7 @@ async fn current_user_item_detail(
                 .item;
         }
         enrich_plugin_vod_item_metadata(&state, &mut item, &mut metadata).await;
+        enrich_plugin_vod_item_media_streams(&state, &mut item, &metadata, user_context).await;
         return Ok(Json(media_item_to_json_with_playback_and_metadata(
             &item,
             &server_id,
@@ -35225,15 +36956,29 @@ async fn current_user_item_detail(
     if let Some(channel) = live_tv_channel_json_by_id(&state.db, &item_id).await? {
         return Ok(Json(channel));
     }
+    if let Some((series_name, series_id, mut summary)) =
+        tv_season_summary_by_id(&state.db, &item_id, Some(requested_user_id), false).await?
+    {
+        ensure_plugin_catalog_item_visible(&state.db, &summary.metadata, &user_context).await?;
+        enrich_plugin_vod_virtual_metadata(&state, &item_id, true, &mut summary.metadata).await;
+        return Ok(Json(tv_season_json(
+            &server_id,
+            &series_name,
+            &series_id,
+            summary,
+        )));
+    }
     if let Some(mut summary) =
         tv_series_summary_by_id(&state.db, &item_id, Some(requested_user_id)).await?
     {
+        ensure_plugin_catalog_item_visible(&state.db, &summary.metadata, &user_context).await?;
         enrich_plugin_vod_virtual_metadata(&state, &item_id, false, &mut summary.metadata).await;
         return Ok(Json(tv_series_json(&server_id, summary)));
     }
     if let Some((series_name, series_id, mut summary)) =
-        tv_season_summary_by_id(&state.db, &item_id, Some(requested_user_id)).await?
+        tv_season_summary_by_id(&state.db, &item_id, Some(requested_user_id), true).await?
     {
+        ensure_plugin_catalog_item_visible(&state.db, &summary.metadata, &user_context).await?;
         enrich_plugin_vod_virtual_metadata(&state, &item_id, true, &mut summary.metadata).await;
         return Ok(Json(tv_season_json(
             &server_id,
@@ -35258,7 +37003,8 @@ async fn user_item_detail(
     Query(query): Query<AuthQuery>,
     Path((user_id, item_id)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let auth_user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let (auth_user, token) = require_user(&state.db, &headers, query.api_key.as_deref()).await?;
+    let user_context = plugin_user_context(&auth_user, &token);
     let user_id = resolve_user_id(&user_id)?;
     ensure_user_access(&auth_user, user_id)?;
     if item_id.eq_ignore_ascii_case("livetv") {
@@ -35304,12 +37050,14 @@ async fn user_item_detail(
     if let Ok(mut item) = media_item_by_id(&state.db, &item_id).await {
         let playback = state.db.playback_state_for_item(user_id, item.id).await?;
         let mut metadata = metadata_payload_for_item(&state.db, item.id).await?;
+        ensure_plugin_catalog_item_visible(&state.db, &metadata, &user_context).await?;
         if is_xtream_remote_media(Some(&metadata)) {
             item = ensure_xtream_remote_media_info(&state, item, &mut metadata)
                 .await?
                 .item;
         }
         enrich_plugin_vod_item_metadata(&state, &mut item, &mut metadata).await;
+        enrich_plugin_vod_item_media_streams(&state, &mut item, &metadata, user_context).await;
         return Ok(Json(media_item_to_json_with_playback_and_metadata(
             &item,
             &server_id,
@@ -35323,13 +37071,27 @@ async fn user_item_detail(
     if let Some(channel) = live_tv_channel_json_by_id(&state.db, &item_id).await? {
         return Ok(Json(channel));
     }
+    if let Some((series_name, series_id, mut summary)) =
+        tv_season_summary_by_id(&state.db, &item_id, Some(user_id), false).await?
+    {
+        ensure_plugin_catalog_item_visible(&state.db, &summary.metadata, &user_context).await?;
+        enrich_plugin_vod_virtual_metadata(&state, &item_id, true, &mut summary.metadata).await;
+        return Ok(Json(tv_season_json(
+            &server_id,
+            &series_name,
+            &series_id,
+            summary,
+        )));
+    }
     if let Some(mut summary) = tv_series_summary_by_id(&state.db, &item_id, Some(user_id)).await? {
+        ensure_plugin_catalog_item_visible(&state.db, &summary.metadata, &user_context).await?;
         enrich_plugin_vod_virtual_metadata(&state, &item_id, false, &mut summary.metadata).await;
         return Ok(Json(tv_series_json(&server_id, summary)));
     }
     if let Some((series_name, series_id, mut summary)) =
-        tv_season_summary_by_id(&state.db, &item_id, Some(user_id)).await?
+        tv_season_summary_by_id(&state.db, &item_id, Some(user_id), true).await?
     {
+        ensure_plugin_catalog_item_visible(&state.db, &summary.metadata, &user_context).await?;
         enrich_plugin_vod_virtual_metadata(&state, &item_id, true, &mut summary.metadata).await;
         return Ok(Json(tv_season_json(
             &server_id,
@@ -35583,7 +37345,7 @@ async fn item_metadata_editor(
         })));
     }
     if let Some((series_name, series_id, summary)) =
-        tv_season_summary_by_id(&state.db, &item_id, None).await?
+        tv_season_summary_by_id(&state.db, &item_id, None, true).await?
     {
         let item = tv_season_json(&server_id, &series_name, &series_id, summary);
         return Ok(Json(serde_json::json!({
@@ -35771,7 +37533,7 @@ async fn item_external_id_infos(
     if series_name_for_id(&state.db, &item_id).await?.is_some() {
         return Ok(Json(external_id_infos_for_item_type("Series")));
     }
-    if tv_season_summary_by_id(&state.db, &item_id, None)
+    if tv_season_summary_by_id(&state.db, &item_id, None, true)
         .await?
         .is_some()
     {
@@ -37379,7 +39141,8 @@ async fn item_ancestors(
         return Ok(Json(vec![root]));
     }
 
-    let tv_snapshot = tv_episode_catalog_snapshot_scoped_to_series(&state.db, &item_id).await?;
+    let (tv_snapshot, resolved_series_id) =
+        tv_episode_catalog_snapshot_scoped_to_series(&state.db, &item_id).await?;
 
     if let Some((series_name, series_id)) = tv_season_parent_from_snapshot(&tv_snapshot, &item_id) {
         let folder_id = tv_snapshot
@@ -37408,7 +39171,7 @@ async fn item_ancestors(
         return Ok(Json(vec![series_json, folder_json, root]));
     }
 
-    if let Some(series_name) = series_name_for_id_from_snapshot(&tv_snapshot, &item_id) {
+    if let Some(series_name) = series_name_for_id_from_snapshot(&tv_snapshot, &resolved_series_id) {
         let folder_id = tv_snapshot
             .items
             .iter()
@@ -37896,6 +39659,7 @@ struct PlaybackInfoOptions {
     transcoding_profiles: Option<Vec<TranscodingProfileMatcher>>,
     subtitle_profiles: Option<Vec<SubtitleProfileMatcher>>,
     hls_subtitles_as_embedded: bool,
+    plugin_vod_selection_hls: bool,
     codec_profiles: Vec<CodecProfileMatcher>,
 }
 
@@ -38138,6 +39902,7 @@ impl Default for PlaybackInfoOptions {
             transcoding_profiles: None,
             subtitle_profiles: None,
             hls_subtitles_as_embedded: false,
+            plugin_vod_selection_hls: false,
             codec_profiles: Vec::new(),
         }
     }
@@ -38656,6 +40421,7 @@ async fn playback_info_response(
             &reference.plugin_id,
             &reference.tuner_id,
             &reference.provider_reference,
+            Some(plugin_user_context(user, token)),
         )
         .await?;
         apply_plugin_vod_playback_descriptor(&mut item, &playback)?;
@@ -38663,6 +40429,7 @@ async fn playback_info_response(
     let metadata = metadata.as_ref();
     normalize_completed_remote_resume_position(&item, metadata, &mut options);
     apply_android_remote_subtitle_hls_policy(&item, metadata, &token.client, &mut options);
+    apply_plugin_vod_stream_selection_hls_policy(&item, metadata, &token.client, &mut options);
     let item_json = media_item_to_json_with_playback_and_metadata(
         &item,
         &server_id,
@@ -38744,15 +40511,32 @@ async fn playback_info_response(
         );
         media_source.insert("SupportsTranscoding".to_string(), serde_json::json!(false));
         if decision.delivery == DeliveryMode::DirectProxy {
+            let direct_stream_url = remote_direct_stream_url(&item, &token.access_token);
             media_source.insert(
                 "DirectStreamUrl".to_string(),
-                serde_json::json!(remote_direct_stream_url(&item, &token.access_token)),
+                serde_json::json!(direct_stream_url),
             );
+            // Jellyfin Android TV 0.19.x implements DirectStream by reading the legacy
+            // TranscodingUrl field even when SupportsTranscoding is false. Keep the opaque local
+            // proxy in both URL slots: it is still a byte-for-byte direct stream, never an
+            // upstream or signed provider URL.
+            media_source.insert(
+                "TranscodingUrl".to_string(),
+                serde_json::json!(direct_stream_url),
+            );
+            if let Some(container) = media_item_container(&item) {
+                media_source.insert(
+                    "TranscodingContainer".to_string(),
+                    serde_json::json!(container),
+                );
+            }
         } else {
             media_source.remove("DirectStreamUrl");
+            media_source.remove("TranscodingUrl");
+            media_source.remove("TranscodingContainer");
         }
         apply_playback_stream_selection(media_source, &options);
-        if selected_text_subtitle_can_use_external(&item, &options) {
+        if text_subtitle_profile_supports_external(&item, &options) {
             apply_direct_external_text_subtitle_contract(
                 media_source,
                 &token.access_token,
@@ -38842,6 +40626,73 @@ fn apply_android_remote_subtitle_hls_policy(
     // method. The renditions are already part of our HLS master manifest, so expose them as
     // embedded tracks to make every rendition selectable without creating a second sidecar input.
     options.hls_subtitles_as_embedded = true;
+}
+
+/// A TV client that can decode the source video directly can keep that codec while HLS narrows a
+/// plugin-VOD stream to the selected audio/subtitle tracks. Device profiles commonly list only
+/// H264 in their transcoding profile even when their direct profile accepts HEVC; extending the
+/// HLS profile here avoids needlessly re-encoding video merely to switch audio.
+fn apply_plugin_vod_stream_selection_hls_policy(
+    item: &MediaItem,
+    metadata: Option<&serde_json::Value>,
+    client: &str,
+    options: &mut PlaybackInfoOptions,
+) {
+    if !is_plugin_vod_remote_media(metadata) || !plugin_vod_tv_client_requires_selected_hls(client)
+    {
+        return;
+    }
+    // Wholphin and Jellyfin Android TV both construct external Media3 subtitle sources before
+    // playback starts. An HLS/Embed descriptor is instead matched against rendition groups in the
+    // A/V manifest; MAGSTV subtitles are independent JIT resources and have no such embedded
+    // group. Advertise every text track through Jellyfin's authenticated WebVTT contract from the
+    // initial PlaybackInfo response, so changing subtitle selection can take effect in place.
+    if item.media_streams.iter().any(|stream| {
+        json_string_field(stream, "Type")
+            .is_some_and(|stream_type| stream_type.eq_ignore_ascii_case("Subtitle"))
+            && json_string_field(stream, "Codec")
+                .is_some_and(|codec| is_text_subtitle_codec(&codec))
+    }) {
+        options.subtitle_profiles = Some(vec![SubtitleProfileMatcher {
+            format: Some("webvtt".to_string()),
+            method: Some("external".to_string()),
+        }]);
+        options.hls_subtitles_as_embedded = false;
+    }
+    if !plugin_vod_has_nondefault_stream_selection(item, options) {
+        return;
+    }
+    options.plugin_vod_selection_hls = true;
+    if !playback_profile_video_codec_compatible(item, options) {
+        return;
+    }
+    let Some(codec) = media_item_stream_codec(item, "Video") else {
+        return;
+    };
+    let Some(profiles) = options.transcoding_profiles.as_mut() else {
+        return;
+    };
+    for profile in profiles.iter_mut().filter(|profile| {
+        profile
+            .protocols
+            .iter()
+            .any(|protocol| protocol.eq_ignore_ascii_case("hls"))
+    }) {
+        if !profile
+            .video_codecs
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(&codec))
+        {
+            profile.video_codecs.push(codec.clone());
+        }
+    }
+}
+
+fn plugin_vod_tv_client_requires_selected_hls(client: &str) -> bool {
+    let client = client.trim().to_ascii_lowercase();
+    client == "wholphin"
+        || client == "jellyfin android tv"
+        || client.starts_with("jellyfin+android+tv+")
 }
 
 fn live_tv_playback_info_response(
@@ -39101,7 +40952,10 @@ async fn playback_transcode_info_response(
     let input_relay = if is_xtream_remote_media(metadata) || is_plugin_vod_remote_media(metadata) {
         Some(register_internal_remote_relay(
             state,
-            InternalRemoteRelayTarget::MediaItem(item.id),
+            InternalRemoteRelayTarget::MediaItem {
+                item_id: item.id,
+                user_context: Some(plugin_user_context(user, token)),
+            },
             INTERNAL_REMOTE_RELAY_TRANSCODE_TTL,
         )?)
     } else {
@@ -41690,13 +43544,32 @@ fn selected_text_subtitle_can_use_external(
                 .and_then(serde_json::Value::as_str)
                 .is_some_and(is_text_subtitle_codec)
     });
-    selected_is_text
-        && options.subtitle_profiles.as_ref().is_some_and(|profiles| {
-            profiles.iter().any(|profile| {
-                profile.method.as_deref() == Some("external")
-                    && matches!(profile.format.as_deref(), Some("vtt" | "webvtt"))
-            })
+    selected_is_text && text_subtitle_profile_supports_external(item, options)
+}
+
+/// External text tracks have to be described on the initial PlaybackInfo response as well as
+/// after a stream is selected. Android TV builds its Media3 subtitle sources only once; if the
+/// initial response has no DeliveryUrl it later tries to select an absent track and drops it
+/// without issuing a second PlaybackInfo request.
+fn text_subtitle_profile_supports_external(
+    item: &MediaItem,
+    options: &PlaybackInfoOptions,
+) -> bool {
+    media_item_streams(item).iter().any(|stream| {
+        stream
+            .get("Type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|stream_type| stream_type.eq_ignore_ascii_case("Subtitle"))
+            && stream
+                .get("Codec")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(is_text_subtitle_codec)
+    }) && options.subtitle_profiles.as_ref().is_some_and(|profiles| {
+        profiles.iter().any(|profile| {
+            profile.method.as_deref() == Some("external")
+                && matches!(profile.format.as_deref(), Some("vtt" | "webvtt"))
         })
+    })
 }
 
 fn selected_text_subtitle_prefers_hls(options: &PlaybackInfoOptions) -> bool {
@@ -42348,6 +44221,10 @@ fn playback_delivery_decision_with_ffmpeg_mode(
 ) -> TranscodeDecision {
     let plugin_vod_remote = is_plugin_vod_remote_media(metadata);
     let is_remote = is_xtream_remote_media(metadata) || plugin_vod_remote;
+    let plugin_vod_stream_selection_requires_hls = options.plugin_vod_selection_hls
+        && ffmpeg_mode != FfmpegMode::Disabled
+        && plugin_vod_remote
+        && plugin_vod_has_nondefault_stream_selection(item, options);
     // Plugin-VOD sources use the same compatibility decision as other remote media. A native
     // client whose profile accepts MPEG-TS may keep the cheap direct proxy. Browsers normally do
     // not advertise TS direct play, so they fall through to the existing HLS remux/transcode
@@ -42386,6 +44263,7 @@ fn playback_delivery_decision_with_ffmpeg_mode(
         && direct_compatible
         && !selected_audio_needs_transcode
         && !selected_subtitle_requires_processing
+        && !plugin_vod_stream_selection_requires_hls
     {
         return TranscodeDecision {
             delivery: if is_remote {
@@ -42462,7 +44340,8 @@ fn playback_delivery_decision_with_ffmpeg_mode(
         }
         let video = if item.media_type != "Video" {
             HlsStreamMode::Drop
-        } else if hls_video_stream_copy_supported(item)
+        } else if (plugin_vod_stream_selection_requires_hls
+            || hls_video_stream_copy_supported(item))
             && profile_video_codec_compatible
             && video_codec_conditions_compatible
             && !max_streaming_bitrate_exceeded
@@ -42517,6 +44396,25 @@ fn playback_delivery_decision_with_ffmpeg_mode(
         reasons: vec!["NoCompatibleStream"],
         output: PlaybackOutputConstraints::default(),
     }
+}
+
+/// Native TV clients restart `PlaybackInfo` when a user changes tracks, but their DirectStream
+/// players are allowed to ignore Jellyfin's default stream indices and choose the first MPEG-TS
+/// track again. Route only a non-default plugin-VOD choice through the existing HLS pipeline: its
+/// FFmpeg input maps the requested audio index, while text subtitles remain authenticated HLS
+/// renditions resolved just in time. Ordinary/default playback keeps the zero-CPU direct proxy.
+fn plugin_vod_has_nondefault_stream_selection(
+    item: &MediaItem,
+    options: &PlaybackInfoOptions,
+) -> bool {
+    let streams = media_item_streams(item);
+    let nondefault_audio = options.audio_stream_index.is_some_and(|selected| {
+        default_audio_stream_index(&streams).is_some_and(|default| selected != default)
+    });
+    let selected_subtitle = options
+        .subtitle_stream_index
+        .is_some_and(|selected| selected >= 0);
+    nondefault_audio || selected_subtitle
 }
 
 fn selected_audio_stream_needs_transcode(item: &MediaItem, options: &PlaybackInfoOptions) -> bool {
@@ -44654,7 +46552,7 @@ async fn audio_hls_segment_response(
     if !item_container.eq_ignore_ascii_case(container) {
         return Err(ApiError::not_found("Audio HLS segment not found"));
     }
-    stream_resolved_media_item(state, item, headers, true).await
+    stream_resolved_media_item(state, item, headers, true, None).await
 }
 
 async fn audio_hls_legacy_segment_response(
@@ -45884,6 +47782,7 @@ async fn plugin_vod_subtitle_output(
     format: &str,
     start_position_ticks: i64,
     end_position_ticks: Option<i64>,
+    user_context: Option<jellyrin_plugin_sdk::PluginUserContext>,
 ) -> Result<Option<Vec<u8>>, ApiError> {
     if !is_plugin_vod_virtual_item(item) {
         return Ok(None);
@@ -45901,6 +47800,7 @@ async fn plugin_vod_subtitle_output(
         &reference.tuner_id,
         &reference.provider_reference,
         index,
+        user_context,
     )
     .await?;
     let configured_proxy = if subtitle.requires_provider_egress {
@@ -45998,7 +47898,7 @@ fn subtitle_srt_to_vtt(bytes: &[u8]) -> Result<Vec<u8>, ApiError> {
 
 pub(crate) async fn subtitle_stream_response(
     state: &AppState,
-    _headers: &HeaderMap,
+    headers: &HeaderMap,
     route: SubtitleStreamRoute,
     query: SubtitleStreamQuery,
 ) -> Result<axum::response::Response, ApiError> {
@@ -46031,6 +47931,17 @@ pub(crate) async fn subtitle_stream_response(
     let extraction_end_position_ticks = end_position_ticks;
 
     let item = subtitle_media_item(state, item_id, Some(media_source_id)).await?;
+    // Local and DLNA subtitle delivery historically works without a Jellyfin token because the
+    // media player follows sidecar URLs directly. Provider-backed VOD is different: resolving its
+    // short-lived remote subtitle requires the authenticated user/device context so the plugin can
+    // enforce source assignment and concurrent-device policy. Authenticate only that sensitive
+    // path, preserving the existing local subtitle contract.
+    let user_context = if is_plugin_vod_virtual_item(&item) {
+        let (user, token) = require_user(&state.db, headers, query._api_key.as_deref()).await?;
+        Some(plugin_user_context(&user, &token))
+    } else {
+        None
+    };
     let plugin_vod_output = plugin_vod_subtitle_output(
         state,
         &item,
@@ -46038,6 +47949,7 @@ pub(crate) async fn subtitle_stream_response(
         extraction_format,
         start_position_ticks,
         extraction_end_position_ticks,
+        user_context,
     )
     .await?;
     let stream = if plugin_vod_output.is_none() {
@@ -47159,7 +49071,7 @@ async fn active_hls_transcode_session_for(
     query: &HlsQuery,
     media_type: &str,
 ) -> Result<TranscodeSession, ApiError> {
-    let user = require_request_user(&state.db, headers, query.api_key.as_deref()).await?;
+    let (user, token) = require_user(&state.db, headers, query.api_key.as_deref()).await?;
     let play_session_id = query
         .play_session_id
         .as_deref()
@@ -47181,6 +49093,7 @@ async fn active_hls_transcode_session_for(
             query.subtitle_stream_index,
             media_type,
             user.id,
+            Some(plugin_user_context(&user, &token)),
             live_tv_channel,
         )
         .await;
@@ -47213,6 +49126,7 @@ async fn active_hls_transcode_session_for(
 // Uses an in-memory registry (LIVE_HLS_SESSIONS) because live TV channels are not in the
 // media_items DB table and therefore cannot be stored via the standard transcode DB path.
 // Registers stop_tx in TRANSCODE_STOPS so DELETE ActiveEncodings kills ffmpeg cleanly.
+#[allow(clippy::too_many_arguments)]
 async fn active_hls_transcode_session_for_live_tv(
     state: &AppState,
     channel_id: &str,
@@ -47220,6 +49134,7 @@ async fn active_hls_transcode_session_for_live_tv(
     subtitle_stream_index: Option<i64>,
     media_type: &str,
     user_id: Uuid,
+    user_context: Option<jellyrin_plugin_sdk::PluginUserContext>,
     channel: Option<serde_json::Value>,
 ) -> Result<TranscodeSession, ApiError> {
     if media_type != "Video" {
@@ -47319,7 +49234,10 @@ async fn active_hls_transcode_session_for_live_tv(
     } else if uses_opaque_provider {
         let relay = register_internal_remote_relay(
             state,
-            InternalRemoteRelayTarget::LiveTvChannel(channel_id.to_string()),
+            InternalRemoteRelayTarget::LiveTvChannel {
+                channel_id: channel_id.to_string(),
+                user_context,
+            },
             INTERNAL_REMOTE_RELAY_TRANSCODE_TTL,
         )?;
         (relay.url().to_string(), None, None, Some(relay))
@@ -47490,13 +49408,15 @@ async fn direct_stream_media(
     media_type: &str,
     include_body: bool,
 ) -> Result<axum::response::Response, ApiError> {
-    require_request_user(&state.db, headers, api_key).await?;
+    let (user, token) = require_user(&state.db, headers, api_key).await?;
+    let user_context = Some(plugin_user_context(&user, &token));
     // Some Jellyfin clients ignore DirectStreamUrl and synthesize /Videos/{id}/stream.* from the
     // media-source id. Keep that native-client fallback working for opaque Live TV ids as well.
     if media_type == "Video"
         && let Some(channel) = live_tv_channel_json_for_playable_item(&state.db, item_id).await?
     {
-        let mut response = stream_live_tv_channel(channel, headers, &state.db).await?;
+        let mut response =
+            stream_live_tv_channel(channel, headers, &state.db, user_context.clone()).await?;
         if !include_body {
             *response.body_mut() = Body::empty();
         }
@@ -47512,7 +49432,7 @@ async fn direct_stream_media(
         )));
     }
 
-    stream_resolved_media_item(state, item, headers, include_body).await
+    stream_resolved_media_item(state, item, headers, include_body, user_context).await
 }
 
 pub(crate) async fn stream_resolved_media_item(
@@ -47520,6 +49440,7 @@ pub(crate) async fn stream_resolved_media_item(
     item: MediaItem,
     headers: &HeaderMap,
     include_body: bool,
+    user_context: Option<jellyrin_plugin_sdk::PluginUserContext>,
 ) -> Result<axum::response::Response, ApiError> {
     if is_xtream_virtual_item(&item) {
         let metadata_by_item =
@@ -47547,7 +49468,8 @@ pub(crate) async fn stream_resolved_media_item(
             .ok_or_else(|| {
                 ApiError::service_unavailable("VOD provider playback route is unavailable")
             })?;
-        return stream_plugin_vod_media(state, &reference, headers, include_body).await;
+        return stream_plugin_vod_media(state, &reference, headers, include_body, user_context)
+            .await;
     }
 
     stream_media_item(item, headers, include_body).await
@@ -47561,15 +49483,85 @@ async fn stream_plugin_vod_media(
     reference: &PluginVodRemoteReference,
     headers: &HeaderMap,
     include_body: bool,
+    user_context: Option<jellyrin_plugin_sdk::PluginUserContext>,
 ) -> Result<axum::response::Response, ApiError> {
-    for attempt in 0..2 {
-        let playback = resolve_plugin_vod_playback(
+    stream_plugin_vod_media_with_cache(state, reference, headers, include_body, user_context, None)
+        .await
+}
+
+fn cached_plugin_vod_playback_is_fresh(cached: &CachedPluginVodPlayback) -> bool {
+    if cached.cached_at.elapsed() >= INTERNAL_PLUGIN_VOD_PLAYBACK_CACHE_TTL {
+        return false;
+    }
+    cached
+        .playback
+        .expires_at
+        .as_deref()
+        .is_none_or(|expires_at| {
+            OffsetDateTime::parse(expires_at, &Rfc3339).is_ok_and(|expires_at| {
+                expires_at > OffsetDateTime::now_utc() + Duration::seconds(2)
+            })
+        })
+}
+
+async fn plugin_vod_playback_for_relay(
+    state: &AppState,
+    reference: &PluginVodRemoteReference,
+    user_context: Option<jellyrin_plugin_sdk::PluginUserContext>,
+    cache: Option<&Arc<Mutex<Option<CachedPluginVodPlayback>>>>,
+) -> Result<VodPlaybackResult, ApiError> {
+    let Some(cache) = cache else {
+        return resolve_plugin_vod_playback(
             &state.db,
             &reference.plugin_id,
             &reference.tuner_id,
             &reference.provider_reference,
+            user_context,
         )
-        .await?;
+        .await;
+    };
+
+    // Hold the relay-local lock through the first resolution so FFmpeg's simultaneous HEAD/range
+    // opens coalesce onto one grant. The lock is released before opening or streaming the source.
+    let mut cached = cache.lock().await;
+    if cached
+        .as_ref()
+        .is_some_and(cached_plugin_vod_playback_is_fresh)
+    {
+        return Ok(cached
+            .as_ref()
+            .expect("fresh relay playback cache entry")
+            .playback
+            .clone());
+    }
+    *cached = None;
+    let playback = resolve_plugin_vod_playback(
+        &state.db,
+        &reference.plugin_id,
+        &reference.tuner_id,
+        &reference.provider_reference,
+        user_context,
+    )
+    .await?;
+    *cached = Some(CachedPluginVodPlayback {
+        playback: playback.clone(),
+        cached_at: StdInstant::now(),
+    });
+    Ok(playback)
+}
+
+async fn stream_plugin_vod_media_with_cache(
+    state: &AppState,
+    reference: &PluginVodRemoteReference,
+    headers: &HeaderMap,
+    include_body: bool,
+    user_context: Option<jellyrin_plugin_sdk::PluginUserContext>,
+    cache: Option<Arc<Mutex<Option<CachedPluginVodPlayback>>>>,
+) -> Result<axum::response::Response, ApiError> {
+    for attempt in 0..2 {
+        let playback =
+            plugin_vod_playback_for_relay(state, reference, user_context.clone(), cache.as_ref())
+                .await?;
         if !opaque_live_tv_delivery_is_safe_for_direct_proxy(&playback) {
             return Err(ApiError::service_unavailable(
                 "VOD provider did not authorize a safe direct stream",
@@ -47611,13 +49603,12 @@ async fn stream_plugin_vod_media(
             )
             .await?;
         }
-        if matches!(
-            upstream.status(),
-            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
-        ) && attempt == 0
-        {
+        if plugin_vod_playback_grant_was_rejected(upstream.status()) && attempt == 0 {
             // Dropping both the response and playback value zeroizes the rejected sensitive URL
             // before asking the provider for a replacement.
+            if let Some(cache) = &cache {
+                *cache.lock().await = None;
+            }
             continue;
         }
         return plugin_vod_upstream_response(upstream, headers, include_body).await;
@@ -47625,6 +49616,18 @@ async fn stream_plugin_vod_media(
     Err(ApiError::service_unavailable(
         "VOD provider authorization was rejected",
     ))
+}
+
+fn plugin_vod_playback_grant_was_rejected(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        // MAGSTV reports an already-consumed/expired signed VOD grant as 400, while other
+        // providers use the conventional authorization statuses. Retry each exactly once with a
+        // newly resolved in-memory grant; the source URL is still never persisted or disclosed.
+        reqwest::StatusCode::BAD_REQUEST
+            | reqwest::StatusCode::UNAUTHORIZED
+            | reqwest::StatusCode::FORBIDDEN
+    )
 }
 
 async fn plugin_vod_upstream_response(
@@ -47766,22 +49769,55 @@ async fn internal_remote_media_response(
     if !peer.ip().is_loopback() {
         return Err(ApiError::not_found("remote media relay not found"));
     }
-    let target = internal_remote_relay_target(token)
+    let relay = internal_remote_relay_lookup(token)
         .ok_or_else(|| ApiError::not_found("remote media relay not found"))?;
-    match target {
-        InternalRemoteRelayTarget::MediaItem(item_id) => {
+    match relay.target {
+        InternalRemoteRelayTarget::MediaItem {
+            item_id,
+            user_context,
+        } => {
             let item = state.db.media_item_by_id(item_id).await?;
             if !is_xtream_virtual_item(&item) && !is_plugin_vod_virtual_item(&item) {
                 return Err(ApiError::not_found("remote media relay not found"));
             }
-            // Both virtual-item kinds share the library streaming pipeline: Xtream resolves its
-            // cached source URL; plugin-VOD resolves a fresh signed URL through the provider
-            // gate and the sensitive remote proxy.
-            stream_resolved_media_item(state, item, headers, include_body).await
+            if is_plugin_vod_virtual_item(&item) {
+                let metadata_by_item =
+                    media_metadata_by_item_id(&state.db, HashSet::from([item.id])).await?;
+                let metadata = metadata_by_item.get(&item.id);
+                if !is_plugin_vod_remote_media(metadata) {
+                    return Err(ApiError::service_unavailable(
+                        "VOD provider playback route is unavailable",
+                    ));
+                }
+                let reference =
+                    metadata
+                        .and_then(plugin_vod_remote_reference)
+                        .ok_or_else(|| {
+                            ApiError::service_unavailable(
+                                "VOD provider playback route is unavailable",
+                            )
+                        })?;
+                return stream_plugin_vod_media_with_cache(
+                    state,
+                    &reference,
+                    headers,
+                    include_body,
+                    user_context,
+                    Some(relay.plugin_vod_playback_cache),
+                )
+                .await;
+            }
+            // Xtream keeps its existing durable encrypted source reference. Plugin VOD above
+            // instead shares only one short-lived, in-memory playback grant inside this relay.
+            stream_resolved_media_item(state, item, headers, include_body, user_context).await
         }
-        InternalRemoteRelayTarget::LiveTvChannel(channel_id) => {
+        InternalRemoteRelayTarget::LiveTvChannel {
+            channel_id,
+            user_context,
+        } => {
             let channel = live_tv_channel_by_id(&state.db, &channel_id).await?;
-            let mut response = stream_live_tv_channel(channel, headers, &state.db).await?;
+            let mut response =
+                stream_live_tv_channel(channel, headers, &state.db, user_context).await?;
             if !include_body {
                 *response.body_mut() = Body::empty();
             }
@@ -48141,13 +50177,20 @@ async fn library_item_file_response(
     media_source_id: Option<&str>,
     download: bool,
 ) -> Result<axum::response::Response, ApiError> {
-    require_request_user(&state.db, headers, api_key).await?;
+    let (user, token) = require_user(&state.db, headers, api_key).await?;
     let requested_item = media_item_by_id(&state.db, item_id).await?;
     let item = resolve_media_source_item(&state.db, requested_item, media_source_id)
         .await?
         .ok_or_else(|| ApiError::not_found("File not found"))?;
     let file_name = download.then(|| media_item_download_file_name(&item));
-    let mut response = stream_resolved_media_item(state, item, headers, true).await?;
+    let mut response = stream_resolved_media_item(
+        state,
+        item,
+        headers,
+        true,
+        Some(plugin_user_context(&user, &token)),
+    )
+    .await?;
     if let Some(file_name) = file_name {
         response.headers_mut().insert(
             header::CONTENT_DISPOSITION,
@@ -48354,22 +50397,38 @@ async fn series_episodes(
         query.include_item_types.push("Episode".to_string());
     }
 
-    let TvEpisodeCatalogSnapshot {
-        items,
-        metadata_by_item,
-    } = tv_episode_catalog_snapshot_scoped_to_series(&state.db, &series_id).await?;
+    let server_id = state.db.server_state().await?.server_id.to_string();
+    series_episodes_result(&state.db, &query, &series_id, requested_user_id, &server_id).await
+}
+
+async fn series_episodes_result(
+    db: &Database,
+    query: &ItemsQuery,
+    series_id: &str,
+    requested_user_id: Uuid,
+    server_id: &str,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (
+        TvEpisodeCatalogSnapshot {
+            items,
+            metadata_by_item,
+        },
+        resolved_series_id,
+    ) = tv_episode_catalog_snapshot_scoped_to_series(db, series_id).await?;
     let candidate_episodes =
-        filtered_media_items(items, &query, Some(requested_user_id), &state.db).await?;
+        filtered_media_items(items, query, Some(requested_user_id), db).await?;
     let mut episodes = candidate_episodes
         .into_iter()
-        .filter(|item| tv_episode_matches_series(item, metadata_by_item.get(&item.id), &series_id))
+        .filter(|item| {
+            tv_episode_matches_series(item, metadata_by_item.get(&item.id), &resolved_series_id)
+        })
         .filter(|item| {
             query.season_id.as_deref().is_none_or(|season_id| {
                 tv_episode_matches_season(item, metadata_by_item.get(&item.id), season_id)
             })
         })
         .collect::<Vec<_>>();
-    if episodes.is_empty() && series_name_for_id(&state.db, &series_id).await?.is_none() {
+    if episodes.is_empty() && series_name_for_id(db, &resolved_series_id).await?.is_none() {
         return Err(ApiError::not_found("Series not found"));
     }
     episodes.sort_by(|left, right| {
@@ -48382,11 +50441,10 @@ async fn series_episodes(
     });
 
     let total_record_count = episodes.len();
-    let server_id = state.db.server_state().await?.server_id.to_string();
     let items = items_to_json(
-        &state.db,
-        paged_media_items(episodes, &query),
-        &server_id,
+        db,
+        paged_media_items(episodes, query),
+        server_id,
         Some(requested_user_id),
         false,
     )
@@ -48416,17 +50474,51 @@ async fn series_seasons(
         .unwrap_or(auth_user.id);
     ensure_user_access(&auth_user, requested_user_id)?;
 
-    let TvEpisodeCatalogSnapshot {
-        items: candidate_episodes,
-        metadata_by_item,
-    } = tv_episode_catalog_snapshot_scoped_to_series(&state.db, &series_id).await?;
-    let episodes = candidate_episodes
+    let server_id = state.db.server_state().await?.server_id.to_string();
+    series_seasons_result(&state.db, &query, &series_id, requested_user_id, &server_id).await
+}
+
+async fn series_seasons_result(
+    db: &Database,
+    query: &ItemsQuery,
+    series_id: &str,
+    requested_user_id: Uuid,
+    server_id: &str,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (
+        TvEpisodeCatalogSnapshot {
+            mut items,
+            metadata_by_item,
+        },
+        resolved_series_id,
+    ) = tv_episode_catalog_snapshot_scoped_to_series(db, series_id).await?;
+    if let Some(allowed_tuner_ids) = query.allowed_plugin_tuner_ids.as_ref() {
+        items.retain(|item| {
+            if !is_plugin_vod_virtual_item(item) {
+                return true;
+            }
+            metadata_by_item
+                .get(&item.id)
+                .and_then(|metadata| json_string_field(metadata, "TunerId"))
+                .is_some_and(|tuner_id| {
+                    allowed_tuner_ids
+                        .iter()
+                        .any(|allowed| allowed.eq_ignore_ascii_case(&tuner_id))
+                })
+        });
+    }
+    let episodes = items
         .into_iter()
-        .filter(|item| tv_episode_matches_series(item, metadata_by_item.get(&item.id), &series_id))
+        .filter(|item| {
+            tv_episode_matches_series(item, metadata_by_item.get(&item.id), &resolved_series_id)
+        })
         .collect::<Vec<_>>();
     let series_name = episodes
         .iter()
-        .find_map(|item| tv_episode_info(item).map(|info| info.series_name))
+        .find_map(|item| {
+            tv_episode_info_with_metadata(item, metadata_by_item.get(&item.id))
+                .map(|info| info.series_name)
+        })
         .ok_or_else(|| ApiError::not_found("Series not found"))?;
     let series_id = episodes
         .iter()
@@ -48441,14 +50533,16 @@ async fn series_seasons(
         .map(|episode| episode.id)
         .collect::<Vec<_>>();
     let playback_by_item =
-        MediaCatalogStore::playback_states_for_items(&state.db, requested_user_id, &episode_ids)
+        MediaCatalogStore::playback_states_for_items(db, requested_user_id, &episode_ids)
             .await?
             .into_iter()
             .map(|state| (state.item_id, state))
             .collect::<HashMap<_, _>>();
     let mut seasons = BTreeMap::<Option<i32>, TvSeasonSummary>::new();
     for episode in &episodes {
-        let season_number = tv_episode_info(episode).and_then(|info| info.season_number);
+        let season_number =
+            tv_episode_info_with_metadata(episode, metadata_by_item.get(&episode.id))
+                .and_then(|info| info.season_number);
         let playback = playback_by_item.get(&episode.id);
         let entry = seasons
             .entry(season_number)
@@ -48461,10 +50555,10 @@ async fn series_seasons(
             entry.merge_episode_metadata(metadata);
         }
     }
-    let server_id = state.db.server_state().await?.server_id.to_string();
+    present_unnumbered_season_as_first(&mut seasons, &series_name);
     let mut season_items = seasons
         .into_values()
-        .map(|summary| tv_season_json(&server_id, &series_name, &series_id, summary))
+        .map(|summary| tv_season_json(server_id, &series_name, &series_id, summary))
         .collect::<Vec<_>>();
     season_items.sort_by(|left, right| {
         let left_index = left
@@ -48890,11 +50984,17 @@ async fn remote_trailers(
     scope_query.limit = None;
     scope_query.sort_by = None;
     scope_query.sort_order = None;
-    let scoped_items = filtered_items_for_query(
+    let scoped_items = filtered_items_for_query_from_source(
         &state,
         &headers,
         auth_query.api_key.as_deref(),
         &scope_query,
+        Some(
+            state
+                .db
+                .media_items_with_remote_trailers(REMOTE_TRAILER_SOURCE_MAX_ITEMS)
+                .await?,
+        ),
     )
     .await?;
     let item_by_id = scoped_items
@@ -49113,19 +51213,59 @@ async fn metadata_collection_keys(
     facet_kind: MediaItemFacetKind,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let query = parse_items_query(raw_query.as_deref());
-    let auth_user =
-        require_request_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
-    if let Some(user_id) = query.user_id.as_deref().map(resolve_user_id).transpose()? {
+    let (auth_user, token) =
+        require_user(&state.db, &headers, auth_query.api_key.as_deref()).await?;
+    let requested_user_id = query.user_id.as_deref().map(resolve_user_id).transpose()?;
+    if let Some(user_id) = requested_user_id {
         ensure_user_access(&auth_user, user_id)?;
     }
-    if metadata_facet_query_is_supported(&query)
-        && let Some(folder_ids) = metadata_facet_folder_scope(&state.db, &query).await?
+    let mut facet_query =
+        metadata_facet_query_with_redundant_types_removed(&state.db, &query).await?;
+    normalize_series_filter_catalog_query(&mut facet_query);
+    // Resolve this caller's plugin-catalogue visibility before any shared lookup below. The cached
+    // facet page is keyed by folder and item type alone, so serving it to a user whose plugin
+    // catalogues are restricted would let them enumerate values from a catalogue the item
+    // endpoints refuse to list for them.
+    scope_items_query_for_plugin_catalogs(
+        &state.db,
+        &mut facet_query,
+        &auth_user,
+        &token,
+        requested_user_id,
+    )
+    .await?;
+    if facet_kind == MediaItemFacetKind::Genre
+        && !facet_query.include_item_types.is_empty()
+        && let Some(values) = media_catalog_filter_values_result(
+            &state.db,
+            &facet_query,
+            requested_user_id,
+            MediaItemQueryFilterSelection::GENRES_ONLY,
+        )
+        .await?
     {
-        let values = MediaCatalogStore::media_item_facet_values(&state.db, facet_kind, &folder_ids)
-            .await?
-            .into_iter()
-            .map(|facet| facet.display_value)
-            .collect();
+        let server_id = state.db.server_state().await?.server_id.to_string();
+        return Ok(Json(metadata_values_response(
+            values.genres,
+            &server_id,
+            item_type,
+            &query,
+        )));
+    }
+    let effective_item_types = metadata_facet_effective_item_types(&facet_query);
+    let mut supported_facet_query = facet_query.clone();
+    supported_facet_query.include_item_types.clear();
+    if effective_item_types.is_some()
+        && metadata_facet_query_is_supported(&supported_facet_query)
+        && let Some(folder_ids) = metadata_facet_folder_scope(&state.db, &facet_query).await?
+    {
+        let values = catalog_cache::cached_media_item_facet_display_values(
+            &state.db,
+            facet_kind,
+            &folder_ids,
+            effective_item_types.as_deref().unwrap_or_default(),
+        )
+        .await?;
         let server_id = state.db.server_state().await?.server_id.to_string();
         return Ok(Json(metadata_values_response(
             values, &server_id, item_type, &query,
@@ -49157,8 +51297,87 @@ async fn metadata_collection_keys(
     )))
 }
 
+/// Maps synthetic Series/Season catalogue types to their persisted episode rows. Returning
+/// `None` keeps uncommon synthetic types on the exact legacy path rather than broadening scope.
+fn metadata_facet_effective_item_types(query: &ItemsQuery) -> Option<Vec<String>> {
+    let mut item_types = Vec::new();
+    for item_type in csv_values_lowercase(&query.include_item_types).unwrap_or_default() {
+        let item_type = match item_type.as_str() {
+            "series" | "season" => "episode".to_string(),
+            "movie" | "episode" | "video" | "musicvideo" | "audio" | "photo" | "book"
+            | "baseitem" => item_type,
+            _ => return None,
+        };
+        item_types.push(item_type);
+    }
+    item_types.sort_unstable();
+    item_types.dedup();
+    Some(item_types)
+}
+
+/// Jellyfin Web repeats the folder's own media type on Genres/Studios requests. Once a request is
+/// scoped to a real homogeneous virtual folder, that predicate is redundant; retaining it forced
+/// the legacy path to materialize hundreds of thousands of items instead of using the facet table.
+async fn metadata_facet_query_with_redundant_types_removed(
+    db: &Database,
+    query: &ItemsQuery,
+) -> Result<ItemsQuery, ApiError> {
+    let Some(parent_id) = query.parent_id.as_deref() else {
+        return Ok(query.clone());
+    };
+    let Ok(parent_id) = parse_jellyfin_uuid(parent_id) else {
+        return Ok(query.clone());
+    };
+    let folders = db.virtual_folders().await?;
+    let Some(folder) = folders.iter().find(|folder| folder.id == parent_id) else {
+        return Ok(query.clone());
+    };
+    let collection_type = folder
+        .collection_type
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let compatible = |item_type: &str| match collection_type.as_str() {
+        "movies" => matches!(item_type.to_ascii_lowercase().as_str(), "movie" | "video"),
+        "tvshows" | "tvshow" | "series" => matches!(
+            item_type.to_ascii_lowercase().as_str(),
+            "series" | "season" | "episode" | "video"
+        ),
+        "music" => matches!(
+            item_type.to_ascii_lowercase().as_str(),
+            "audio" | "musicalbum" | "musicartist"
+        ),
+        _ => false,
+    };
+    if query.include_item_types.is_empty()
+        || !query
+            .include_item_types
+            .iter()
+            .all(|value| compatible(value))
+    {
+        return Ok(query.clone());
+    }
+    let mut normalized = query.clone();
+    normalized.include_item_types.clear();
+    if normalized
+        .media_types
+        .iter()
+        .all(|value| value.eq_ignore_ascii_case("Video"))
+    {
+        normalized.media_types.clear();
+    }
+    Ok(normalized)
+}
+
+/// Whether the shared cached facet page can answer this query.
+///
+/// The cached page is keyed by folder and effective item type alone, so a query carrying the
+/// caller's plugin-catalogue visibility is deliberately unsupported: answering it from that cache
+/// would let a user enumerate facet values from a catalogue the item endpoints refuse to list for
+/// them. Those requests fall through to the per-user path instead.
 fn metadata_facet_query_is_supported(query: &ItemsQuery) -> bool {
-    query.ids.is_none()
+    query.allowed_plugin_tuner_ids.is_none()
+        && query.ids.is_none()
         && query.season_id.is_none()
         && query.series_id.is_none()
         && query.include_item_types.is_empty()
@@ -49391,6 +51610,7 @@ fn remote_trailer_json(
     name: Option<&str>,
 ) -> serde_json::Value {
     let source_id = item.id.simple().to_string();
+    let trailer_id = stable_entity_id("Trailer", &format!("{source_id}:{url}"));
     let display_name = name
         .map(str::to_string)
         .unwrap_or_else(|| format!("{} Trailer", item.name));
@@ -49398,7 +51618,7 @@ fn remote_trailer_json(
         "Name": display_name,
         "OriginalTitle": null,
         "ServerId": server_id,
-        "Id": stable_entity_id("Trailer", &format!("{source_id}:{url}")),
+        "Id": trailer_id,
         "Etag": null,
         "DateCreated": format_time_for_json(item.created_at),
         "CanDelete": false,
@@ -49419,7 +51639,7 @@ fn remote_trailer_json(
         "ParentId": source_id,
         "Type": "Trailer",
         "MediaType": "Video",
-        "UserData": { "PlaybackPositionTicks": 0, "PlayCount": 0, "IsFavorite": false, "Played": false },
+        "UserData": default_user_data_json(&trailer_id),
         "ImageTags": {},
         "BackdropImageTags": [],
         "LocationType": "Remote"
@@ -49603,13 +51823,14 @@ fn metadata_entity_json(
         "Type": item_type,
         "MediaType": null,
         "ProductionYear": production_year,
-        "UserData": { "PlaybackPositionTicks": 0, "PlayCount": 0, "IsFavorite": false, "Played": false },
+        "UserData": default_user_data_json(&id),
         "ImageTags": image_tags,
         "BackdropImageTags": [],
         "LocationType": "Virtual"
     })
 }
 
+#[derive(Clone)]
 struct MetadataEntityMatch {
     name: String,
     item_type: &'static str,
@@ -49718,6 +51939,42 @@ async fn metadata_entity_by_stable_id(
         }
     }
     Ok(None)
+}
+
+const RECENT_METADATA_ENTITY_MAX_ENTRIES: usize = 32 * 1024;
+
+fn remember_metadata_people(people: &[serde_json::Value]) {
+    let cache = RECENT_METADATA_ENTITIES.get_or_init(|| StdMutex::new(HashMap::new()));
+    let Ok(mut cache) = cache.lock() else {
+        return;
+    };
+    if cache.len().saturating_add(people.len()) > RECENT_METADATA_ENTITY_MAX_ENTRIES {
+        cache.clear();
+    }
+    for person in people {
+        let Some(id) = json_string_field(person, "Id") else {
+            continue;
+        };
+        let Some(name) = json_string_field(person, "Name") else {
+            continue;
+        };
+        cache.insert(
+            id.to_ascii_lowercase(),
+            MetadataEntityMatch {
+                name,
+                item_type: "Person",
+                production_year: None,
+                metadata: Some(person.clone()),
+            },
+        );
+    }
+}
+
+fn recent_metadata_entity(entity_id: &str) -> Option<MetadataEntityMatch> {
+    RECENT_METADATA_ENTITIES
+        .get()
+        .and_then(|cache| cache.lock().ok())
+        .and_then(|cache| cache.get(&entity_id.to_ascii_lowercase()).cloned())
 }
 
 fn metadata_entity_provider_ids(metadata: &serde_json::Value) -> Option<serde_json::Value> {
@@ -50963,8 +53220,17 @@ async fn authenticated_item_sidecars(
     kind: SidecarKind,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    let item = media_item_by_id(&state.db, &item_id).await?;
-    local_sidecar_result(&state.db, &item, user.id, kind).await
+    match media_item_by_id(&state.db, &item_id).await {
+        Ok(item) => local_sidecar_result(&state.db, &item, user.id, kind).await,
+        Err(error) if error.status() == StatusCode::NOT_FOUND => {
+            if virtual_or_live_tv_item_exists(&state.db, &item_id).await? {
+                Ok(empty_sidecar_result())
+            } else {
+                Err(error)
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 
 async fn authenticated_item_sidecar_list(
@@ -50975,8 +53241,17 @@ async fn authenticated_item_sidecar_list(
     kind: SidecarKind,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
     let user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
-    let item = media_item_by_id(&state.db, &item_id).await?;
-    local_sidecar_list(&state.db, &item, user.id, kind).await
+    match media_item_by_id(&state.db, &item_id).await {
+        Ok(item) => local_sidecar_list(&state.db, &item, user.id, kind).await,
+        Err(error) if error.status() == StatusCode::NOT_FOUND => {
+            if virtual_or_live_tv_item_exists(&state.db, &item_id).await? {
+                Ok(Json(Vec::new()))
+            } else {
+                Err(error)
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 
 async fn user_item_sidecars(
@@ -50990,8 +53265,39 @@ async fn user_item_sidecars(
     let auth_user = require_request_user(&state.db, &headers, query.api_key.as_deref()).await?;
     let user_id = resolve_user_id(&user_id)?;
     ensure_user_access(&auth_user, user_id)?;
-    let item = media_item_by_id(&state.db, &item_id).await?;
-    local_sidecar_result(&state.db, &item, user_id, kind).await
+    match media_item_by_id(&state.db, &item_id).await {
+        Ok(item) => local_sidecar_result(&state.db, &item, user_id, kind).await,
+        Err(error) if error.status() == StatusCode::NOT_FOUND => {
+            if virtual_or_live_tv_item_exists(&state.db, &item_id).await? {
+                Ok(empty_sidecar_result())
+            } else {
+                Err(error)
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn live_tv_item_exists(db: &Database, item_id: &str) -> Result<bool, ApiError> {
+    if live_tv_channel_optional_by_id(db, item_id).await?.is_some() {
+        return Ok(true);
+    }
+    Ok(live_tv_program_by_id(db, item_id).await?.is_some())
+}
+
+async fn virtual_or_live_tv_item_exists(db: &Database, item_id: &str) -> Result<bool, ApiError> {
+    if virtual_tv_item_exists(db, item_id).await? {
+        return Ok(true);
+    }
+    live_tv_item_exists(db, item_id).await
+}
+
+fn empty_sidecar_result() -> Json<serde_json::Value> {
+    Json(query_result_with_total(
+        Vec::<serde_json::Value>::new(),
+        0,
+        0,
+    ))
 }
 
 async fn local_sidecar_list(
@@ -51036,6 +53342,11 @@ async fn local_sidecar_items(
     source: &MediaItem,
     kind: SidecarKind,
 ) -> Result<Vec<MediaItem>, ApiError> {
+    // Remote plugin-VOD entries cannot have filesystem sidecars. Avoid materialising the entire
+    // virtual folder for the extras requests that Jellyfin clients issue on every detail page.
+    if is_plugin_vod_virtual_item(source) {
+        return Ok(Vec::new());
+    }
     let mut items = db
         .media_items_for_virtual_folders(&[source.virtual_folder_id])
         .await?
@@ -51315,7 +53626,7 @@ async fn authenticated_item_theme_media(
             if error.status == StatusCode::NOT_FOUND
                 && virtual_tv_item_exists(&state.db, &item_id).await? =>
         {
-            return Ok(Json(empty_theme_media_result()));
+            return Ok(Json(empty_theme_media_result(&item_id)));
         }
         Err(error) => return Err(error),
     };
@@ -51332,12 +53643,23 @@ async fn authenticated_item_theme_media(
     })))
 }
 
-fn empty_theme_media_result() -> serde_json::Value {
+fn empty_theme_media_result(owner_id: &str) -> serde_json::Value {
     serde_json::json!({
-        "ThemeVideosResult": query_result(Vec::new()),
-        "ThemeSongsResult": query_result(Vec::new()),
-        "SoundtrackSongsResult": query_result(Vec::new())
+        "ThemeVideosResult": theme_media_query_result(Vec::new(), 0, 0, owner_id),
+        "ThemeSongsResult": theme_media_query_result(Vec::new(), 0, 0, owner_id),
+        "SoundtrackSongsResult": theme_media_query_result(Vec::new(), 0, 0, owner_id)
     })
+}
+
+fn theme_media_query_result(
+    items: Vec<serde_json::Value>,
+    total_record_count: usize,
+    start_index: usize,
+    owner_id: &str,
+) -> serde_json::Value {
+    let mut result = query_result_with_total(items, total_record_count, start_index);
+    result["OwnerId"] = serde_json::Value::String(owner_id.to_string());
+    result
 }
 
 async fn authenticated_item_theme_songs(
@@ -51378,7 +53700,21 @@ async fn authenticated_item_theme_items(
         .transpose()?
         .unwrap_or(auth_user.id);
     ensure_user_access(&auth_user, requested_user_id)?;
-    let source = media_item_by_id(&state.db, &item_id).await?;
+    let source = match media_item_by_id(&state.db, &item_id).await {
+        Ok(source) => source,
+        Err(error)
+            if error.status == StatusCode::NOT_FOUND
+                && virtual_or_live_tv_item_exists(&state.db, &item_id).await? =>
+        {
+            return Ok(Json(theme_media_query_result(
+                Vec::new(),
+                0,
+                query.start_index.unwrap_or(0),
+                &item_id,
+            )));
+        }
+        Err(error) => return Err(error),
+    };
     Ok(Json(
         theme_items_result(&state.db, &source, requested_user_id, media_type, &query).await?,
     ))
@@ -51391,6 +53727,16 @@ async fn theme_items_result(
     media_type: &str,
     query: &ItemsQuery,
 ) -> Result<serde_json::Value, ApiError> {
+    // Opaque remote VOD paths cannot own local theme media. Returning the canonical empty result
+    // here keeps the detail-page fan-out bounded even for very large provider catalogues.
+    if is_plugin_vod_virtual_item(source) {
+        return Ok(theme_media_query_result(
+            Vec::new(),
+            0,
+            query.start_index.unwrap_or(0),
+            &source.id.simple().to_string(),
+        ));
+    }
     let server_id = db.server_state().await?.server_id.to_string();
     let mut theme_items = db
         .media_items_for_virtual_folders(&[source.virtual_folder_id])
@@ -51400,7 +53746,7 @@ async fn theme_items_result(
         .collect::<Vec<_>>();
     theme_items.sort_by(|left, right| compare_media_items(left, right, &[SortField::SortName]));
     let total_record_count = theme_items.len();
-    Ok(query_result_with_total(
+    Ok(theme_media_query_result(
         items_to_json(
             db,
             paged_media_items(theme_items, query),
@@ -51411,6 +53757,7 @@ async fn theme_items_result(
         .await?,
         total_record_count,
         query.start_index.unwrap_or(0),
+        &source.id.simple().to_string(),
     ))
 }
 
@@ -51420,6 +53767,14 @@ async fn soundtrack_items_result(
     user_id: Uuid,
     query: &ItemsQuery,
 ) -> Result<serde_json::Value, ApiError> {
+    if is_plugin_vod_virtual_item(source) {
+        return Ok(theme_media_query_result(
+            Vec::new(),
+            0,
+            query.start_index.unwrap_or(0),
+            &source.id.simple().to_string(),
+        ));
+    }
     let entries =
         MediaCatalogStore::media_items_with_metadata_by_effective_types(db, &["Audio".to_string()])
             .await?;
@@ -51434,7 +53789,12 @@ async fn soundtrack_items_result(
     }
     let source_terms = soundtrack_match_terms(metadata_by_item.get(&source.id));
     if source_terms.is_empty() {
-        return Ok(query_result(Vec::new()));
+        return Ok(theme_media_query_result(
+            Vec::new(),
+            0,
+            0,
+            &source.id.simple().to_string(),
+        ));
     }
 
     let mut scored = audio_items
@@ -51460,10 +53820,11 @@ async fn soundtrack_items_result(
         .take(query.limit.unwrap_or(usize::MAX))
         .collect::<Vec<_>>();
     let server_id = db.server_state().await?.server_id.to_string();
-    Ok(query_result_with_total(
+    Ok(theme_media_query_result(
         items_to_json(db, items, &server_id, Some(user_id), false).await?,
         total_record_count,
         query.start_index.unwrap_or(0),
+        &source.id.simple().to_string(),
     ))
 }
 
@@ -51613,15 +53974,20 @@ async fn authenticated_similar_show_items(
     items_query.sort_by = None;
     items_query.sort_order = None;
 
-    let TvEpisodeCatalogSnapshot {
-        items,
-        metadata_by_item,
-    } = tv_episode_catalog_snapshot_scoped_to_series(&state.db, &item_id).await?;
+    let (
+        TvEpisodeCatalogSnapshot {
+            items,
+            metadata_by_item,
+        },
+        resolved_series_id,
+    ) = tv_episode_catalog_snapshot_scoped_to_series(&state.db, &item_id).await?;
     let candidate_episodes =
         filtered_media_items(items, &items_query, Some(requested_user_id), &state.db).await?;
     let mut episodes = candidate_episodes
         .into_iter()
-        .filter(|item| tv_episode_matches_series(item, metadata_by_item.get(&item.id), &item_id))
+        .filter(|item| {
+            tv_episode_matches_series(item, metadata_by_item.get(&item.id), &resolved_series_id)
+        })
         .collect::<Vec<_>>();
     if episodes.is_empty() {
         return Err(ApiError::not_found("Similar source not found"));
@@ -51666,8 +54032,15 @@ async fn authenticated_similar_trailer_items(
     scope_query.limit = None;
     scope_query.sort_by = None;
     scope_query.sort_order = None;
+    // This path resolves one exact trailer id rather than serving a page, so the paging cap the
+    // listing uses would make it wrong by construction: every trailer whose parent sorts past the
+    // cap answered "Similar source not found". The predicate already restricts the read to items
+    // that carry a trailer array, which is a small slice of a catalogue.
     let scoped_items = filtered_media_items(
-        state.db.media_items().await?,
+        state
+            .db
+            .media_items_with_remote_trailers(usize::MAX)
+            .await?,
         &scope_query,
         Some(requested_user_id),
         &state.db,
@@ -51677,9 +54050,10 @@ async fn authenticated_similar_trailer_items(
         .iter()
         .map(|item| (item.id, item))
         .collect::<HashMap<_, _>>();
+    let item_ids = item_by_id.keys().copied().collect::<HashSet<_>>();
     let server_id = state.db.server_state().await?.server_id.to_string();
     let mut trailers = Vec::new();
-    for metadata in state.db.media_item_metadata().await? {
+    for metadata in state.db.media_item_metadata_by_item_ids(&item_ids).await? {
         let Some(item) = item_by_id.get(&metadata.item_id) else {
             continue;
         };
@@ -51814,38 +54188,65 @@ async fn similar_items_for_media_source(
     let source = media_item_by_id(&state.db, item_id).await?;
     let server_id = state.db.server_state().await?.server_id.to_string();
     let source_type = media_item_type(&source).to_string();
+    let source_metadata = metadata_payload_for_item(&state.db, source.id).await?;
+    let source_terms = similar_item_terms(Some(&source_metadata));
+    if source_terms.is_empty() {
+        return Ok(Json(query_result_with_total(Vec::new(), 0, 0)));
+    }
+    let requested_start_index = query.start_index.unwrap_or(0);
+    let requested_limit = query.limit.unwrap_or(20).min(100);
     let mut items_query = query.clone();
-    if items_query.include_item_types.is_empty() {
-        items_query.include_item_types.push(source_type.clone());
-    }
-    let entries = MediaCatalogStore::media_items_with_metadata_by_effective_types(
-        &state.db,
-        std::slice::from_ref(&source_type),
-    )
-    .await?;
-    let mut candidate_items = Vec::with_capacity(entries.len());
-    let mut metadata_by_item = HashMap::with_capacity(entries.len());
-    for entry in entries {
-        metadata_by_item.insert(entry.item.id, entry.metadata);
-        candidate_items.push(entry.item);
-    }
-    let mut candidates = filtered_media_items(
-        candidate_items,
-        &items_query,
-        Some(requested_user_id),
-        &state.db,
-    )
-    .await?;
-    candidates.retain(|item| item.id != source.id);
-
-    let source_terms = similar_item_terms(metadata_by_item.get(&source.id));
+    items_query.parent_id = None;
+    items_query.include_item_types = vec![source_type.clone()];
+    items_query.start_index = Some(0);
+    items_query.limit = Some(500);
+    items_query.sort_by = Some("SortName".to_string());
+    items_query.sort_order = Some("Ascending".to_string());
+    let genres = metadata_values_from_json(&source_metadata, &["Genres", "SeriesGenres"]);
+    let studios = metadata_values_from_json(&source_metadata, &["Studios", "SeriesStudios"]);
+    let tags = metadata_values_from_json(&source_metadata, &["Tags"]);
+    items_query.genre_ids = genres;
+    items_query.studio_ids = if items_query.genre_ids.is_empty() {
+        studios
+    } else {
+        Vec::new()
+    };
+    items_query.tags = if items_query.genre_ids.is_empty() && items_query.studio_ids.is_empty() {
+        tags
+    } else {
+        Vec::new()
+    };
+    // The bounded catalogue page cannot express every shape: a persisted Series source is one, and
+    // answering those with an empty page removed Similar for every series while leaving the
+    // caller's fallback unreachable, because an empty page is still `Ok`. Score the type-scoped
+    // candidate read instead -- Series rows are a small fraction of the episode catalogue.
+    let candidates = match media_catalog_query_for_items(&items_query, Some(requested_user_id))? {
+        Some(mut db_query) => {
+            db_query.virtual_folder_ids = vec![source.virtual_folder_id];
+            db_query.include_total_record_count = false;
+            MediaCatalogStore::media_item_catalog_page(&state.db, &db_query)
+                .await?
+                .items
+        }
+        None => {
+            MediaCatalogStore::media_items_with_metadata_by_effective_types(
+                &state.db,
+                std::slice::from_ref(&source_type),
+            )
+            .await?
+        }
+    };
     let mut scored = candidates
         .into_iter()
-        .filter_map(|item| {
+        .filter_map(|entry| {
+            let item = entry.item;
+            if item.id == source.id {
+                return None;
+            }
             if !media_item_type(&item).eq_ignore_ascii_case(&source_type) {
                 return None;
             }
-            let terms = similar_item_terms(metadata_by_item.get(&item.id));
+            let terms = similar_item_terms(Some(&entry.metadata));
             let shared_terms = terms.intersection(&source_terms).count();
             if shared_terms == 0 {
                 return None;
@@ -51860,19 +54261,17 @@ async fn similar_items_for_media_source(
             .then_with(|| compare_media_items(left_item, right_item, &[SortField::SortName]))
     });
 
-    let start_index = items_query.start_index.unwrap_or(0);
     let total_record_count = scored.len();
-    let limit = items_query.limit.unwrap_or(20).min(100);
     let items = scored
         .into_iter()
-        .skip(start_index)
-        .take(limit)
+        .skip(requested_start_index)
+        .take(requested_limit)
         .map(|(_, item)| item)
         .collect::<Vec<_>>();
     Ok(Json(query_result_with_total(
         items_to_json(&state.db, items, &server_id, Some(requested_user_id), false).await?,
         total_record_count,
-        start_index,
+        requested_start_index,
     )))
 }
 
@@ -52193,6 +54592,12 @@ async fn resolved_media_catalog_query_for_filter_values(
     db_query.search_scope = MediaItemCatalogSearchScope::AllMetadataScalars;
 
     let Some(parent_id) = query.parent_id.as_deref() else {
+        db_query.virtual_folder_ids = db
+            .virtual_folders()
+            .await?
+            .into_iter()
+            .map(|folder| folder.id)
+            .collect();
         return Ok(Some(db_query));
     };
     if special_user_view_collection_type_for_parent(Some(parent_id)).is_some()
@@ -52445,13 +54850,39 @@ async fn filtered_items_for_query(
     api_key: Option<&str>,
     query: &ItemsQuery,
 ) -> Result<Vec<MediaItem>, ApiError> {
-    let auth_user = require_request_user(&state.db, headers, api_key).await?;
+    filtered_items_for_query_from_source(state, headers, api_key, query, None).await
+}
+
+/// Same authorization and filtering as [`filtered_items_for_query`], but lets a caller supply an
+/// already-narrowed candidate set. Plugin-catalog visibility is still enforced by
+/// [`filtered_media_items`] over whatever source it receives, so overriding the source cannot
+/// widen what a user is allowed to see.
+async fn filtered_items_for_query_from_source(
+    state: &AppState,
+    headers: &HeaderMap,
+    api_key: Option<&str>,
+    query: &ItemsQuery,
+    source_items: Option<Vec<MediaItem>>,
+) -> Result<Vec<MediaItem>, ApiError> {
+    let (auth_user, token) = require_user(&state.db, headers, api_key).await?;
     let requested_user_id = query.user_id.as_deref().map(resolve_user_id).transpose()?;
     if let Some(requested_user_id) = requested_user_id {
         ensure_user_access(&auth_user, requested_user_id)?;
     }
-    let source_items = media_items_source_for_query(&state.db, query).await?;
-    filtered_media_items(source_items, query, requested_user_id, &state.db).await
+    let mut scoped_query = query.clone();
+    scope_items_query_for_plugin_catalogs(
+        &state.db,
+        &mut scoped_query,
+        &auth_user,
+        &token,
+        requested_user_id,
+    )
+    .await?;
+    let source_items = match source_items {
+        Some(source_items) => source_items,
+        None => media_items_source_for_query(&state.db, &scoped_query).await?,
+    };
+    filtered_media_items(source_items, &scoped_query, requested_user_id, &state.db).await
 }
 
 async fn media_items_source_for_query(
@@ -52624,9 +55055,43 @@ async fn filtered_media_items(
     } else {
         None
     };
+    let plugin_visibility_metadata = if query.allowed_plugin_tuner_ids.is_some() {
+        Some(
+            media_metadata_by_item_id(
+                db,
+                items
+                    .iter()
+                    .filter(|item| is_plugin_vod_virtual_item(item))
+                    .map(|item| item.id)
+                    .collect(),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
 
     let mut items = items
         .into_iter()
+        .filter(|item| {
+            query
+                .allowed_plugin_tuner_ids
+                .as_ref()
+                .is_none_or(|allowed| {
+                    if !is_plugin_vod_virtual_item(item) {
+                        return true;
+                    }
+                    plugin_visibility_metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.get(&item.id))
+                        .and_then(|metadata| json_string_field(metadata, "TunerId"))
+                        .is_some_and(|tuner_id| {
+                            allowed
+                                .iter()
+                                .any(|allowed| allowed.eq_ignore_ascii_case(&tuner_id))
+                        })
+                })
+        })
         .filter(|item| ids.as_ref().is_none_or(|ids| ids.contains(&item.id)))
         .filter(|item| {
             parent_folder_ids
@@ -53516,6 +55981,7 @@ async fn tv_series_items_result(
                     .limit
                     .unwrap_or(25)
                     .min(MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE),
+                query_flag(&query._enable_total_record_count).unwrap_or(true),
                 TvSeriesCatalogNameFilter {
                     search_term: query.search_term.clone(),
                     starts_with: query.name_starts_with.clone(),
@@ -53575,7 +56041,7 @@ async fn tv_series_items_result(
                 summary.id.get_or_insert_with(|| series.id.clone());
                 summary
             })
-            .map(|summary| tv_series_json(server_id, summary))
+            .map(|summary| shape_catalog_item_for_query(tv_series_json(server_id, summary), query))
             .collect::<Vec<_>>();
         return Ok(Json(query_result_with_total(
             items,
@@ -54120,6 +56586,7 @@ fn metadata_people_items_from_json(
         };
         collect_metadata_people(value, &mut people, &mut seen);
     }
+    remember_metadata_people(&people);
     people
 }
 
@@ -55245,6 +57712,7 @@ async fn tv_season_summary_by_id(
     db: &Database,
     season_id: &str,
     user_id: Option<Uuid>,
+    allow_synthetic_fallback: bool,
 ) -> Result<Option<(String, String, TvSeasonSummary)>, ApiError> {
     // Resolving one season must not materialize every episode in the library along with its
     // metadata;
@@ -55253,12 +57721,13 @@ async fn tv_season_summary_by_id(
         .await?
     {
         Some(snapshot) => (snapshot.items, snapshot.metadata_by_item),
-        None => {
+        None if allow_synthetic_fallback => {
             let items = db.media_items_by_collection_type("tvshows").await?;
             let metadata_by_item =
                 media_metadata_by_item_id(db, items.iter().map(|item| item.id).collect()).await?;
             (items, metadata_by_item)
         }
+        None => return Ok(None),
     };
     let items = items
         .into_iter()
@@ -55279,10 +57748,10 @@ async fn tv_season_summary_by_id(
     let mut summary = None::<TvSeasonSummary>;
 
     for item in items {
-        let Some(info) = tv_episode_info(&item) else {
+        let metadata = metadata_by_item.get(&item.id);
+        let Some(info) = tv_episode_info_with_metadata(&item, metadata) else {
             continue;
         };
-        let metadata = metadata_by_item.get(&item.id);
         series_name.get_or_insert_with(|| info.series_name.clone());
         series_id.get_or_insert_with(|| tv_series_id_for_episode(&info, metadata));
         let playback = playback_by_item.get(&item.id);
@@ -55323,9 +57792,12 @@ async fn virtual_tv_item_exists(db: &Database, item_id: &str) -> Result<bool, Ap
     Ok(items.into_iter().any(|item| {
         tv_episode_info(&item).is_some_and(|info| {
             let metadata = metadata_by_item.get(&item.id);
-            tv_series_id_for_episode(&info, metadata).eq_ignore_ascii_case(item_id)
-                || tv_season_id_for_episode(&info, metadata).eq_ignore_ascii_case(item_id)
-                || tv_season_id(&info.series_name, info.season_number).eq_ignore_ascii_case(item_id)
+            jellyfin_id_matches(&tv_series_id_for_episode(&info, metadata), item_id)
+                || jellyfin_id_matches(&tv_season_id_for_episode(&info, metadata), item_id)
+                || jellyfin_id_matches(
+                    &tv_season_id(&info.series_name, info.season_number),
+                    item_id,
+                )
         })
     }))
 }
@@ -55402,7 +57874,57 @@ fn hyphenate_uuid(value: &str) -> String {
 }
 
 fn default_primary_image_tag(item_id: &str) -> String {
-    format!("generated-{item_id}")
+    // Keep this version aligned with the bytes returned by the generated item fallback. Android
+    // TV caches image responses by tag; retaining the legacy tag after replacing its transparent
+    // pixel would make the client reuse that invisible response forever and never request the
+    // visible raster tile.
+    format!("generated-raster-v1-{item_id}")
+}
+
+fn primary_image_tag_for_metadata(item_id: &str, metadata: Option<&serde_json::Value>) -> String {
+    let provider_image_is_ready = metadata.is_some_and(|metadata| {
+        [
+            "PluginVodImageAvailable",
+            "SeriesPluginVodImageAvailable",
+            "SeasonPluginVodImageAvailable",
+        ]
+        .iter()
+        .any(|field| {
+            json_field_case_insensitive(metadata, field).and_then(serde_json::Value::as_bool)
+                == Some(true)
+        })
+    });
+    if provider_image_is_ready {
+        // A resolved raster must never reuse the key under which a television client may have
+        // cached the provisional generated tile.
+        format!("provider-raster-v6-{item_id}")
+    } else if metadata.is_some_and(|metadata| {
+        is_plugin_vod_remote_media(Some(metadata))
+            || json_field_case_insensitive(metadata, "PluginVodImageCandidate")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+    }) {
+        // This distinct key makes the client request the provider-backed route before hydration.
+        // Once hydration succeeds, the ready marker above changes the key again.
+        format!("provider-probe-v5-{item_id}")
+    } else {
+        default_primary_image_tag(item_id)
+    }
+}
+
+fn generated_folder_primary_image_tag(item_id: &str) -> String {
+    format!("generated-raster-v1-{item_id}")
+}
+
+fn default_user_data_json(item_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "PlaybackPositionTicks": 0,
+        "PlayCount": 0,
+        "IsFavorite": false,
+        "Played": false,
+        "Key": item_id,
+        "ItemId": item_id,
+    })
 }
 
 fn user_view_to_json(folder: &VirtualFolder, server_id: &str) -> serde_json::Value {
@@ -55414,10 +57936,11 @@ fn user_view_to_json_with_count(
     server_id: &str,
     child_count: usize,
 ) -> serde_json::Value {
+    let id = folder.id.simple().to_string();
     serde_json::json!({
         "Name": folder.name,
         "ServerId": server_id,
-        "Id": folder.id.simple().to_string(),
+        "Id": id,
         "Etag": null,
         "DateCreated": format_time_for_json(folder.created_at),
         "CanDelete": false,
@@ -55438,8 +57961,8 @@ fn user_view_to_json_with_count(
         "ParentId": null,
         "Type": "CollectionFolder",
         "CollectionType": folder.collection_type,
-        "UserData": { "PlaybackPositionTicks": 0, "PlayCount": 0, "IsFavorite": false, "Played": false, "Key": folder.id.simple().to_string(), "ItemId": folder.id.simple().to_string() },
-        "ImageTags": { "Primary": "placeholder" },
+        "UserData": { "PlaybackPositionTicks": 0, "PlayCount": 0, "IsFavorite": false, "Played": false, "Key": id, "ItemId": id },
+        "ImageTags": { "Primary": generated_folder_primary_image_tag(&id) },
         "PrimaryImageAspectRatio": 0.6666667,
         "BackdropImageTags": [],
         "LocationType": "FileSystem",
@@ -55499,7 +58022,7 @@ fn media_item_to_json_with_playback_and_metadata(
 ) -> serde_json::Value {
     let item_type = media_item_type(item);
     let item_id = item.id.simple().to_string();
-    let image_tag = default_primary_image_tag(&item_id);
+    let image_tag = primary_image_tag_for_metadata(&item_id, metadata);
     let container = media_item_container(item);
     let file_name = media_item_file_name(item);
     let file_size = media_item_file_size(item);
@@ -55669,6 +58192,15 @@ fn media_item_to_json_with_playback_and_metadata(
         object.insert("LocationType".to_string(), serde_json::json!("Remote"));
         object.insert("CanDownload".to_string(), serde_json::json!(false));
     }
+    if item_type == "Series"
+        && let Some(object) = value.as_object_mut()
+    {
+        object.insert("IsFolder".to_string(), serde_json::json!(true));
+        object.insert("MediaType".to_string(), serde_json::json!("Video"));
+        object.insert("CanDownload".to_string(), serde_json::json!(false));
+        object.remove("MediaSources");
+        object.remove("MediaStreams");
+    }
     apply_media_item_metadata(&mut value, metadata, item, server_id);
     value
 }
@@ -55776,9 +58308,22 @@ fn apply_media_item_metadata(
             serde_json::json!({ "Primary": primary_tag }),
         );
     }
-    if let Some(series_primary_tag) =
-        first_metadata_value_from_json(metadata, &["SeriesPrimaryImageTag"])
-    {
+    let series_primary_tag = first_metadata_value_from_json(metadata, &["SeriesPrimaryImageTag"])
+        .or_else(|| {
+            // Jellyfin Android TV deliberately uses the series poster for portrait episode cards.
+            // Plugin catalogues persist that poster under the virtual Series owner, so advertise
+            // its deterministic tag even when the provider did not supply an explicit tag field.
+            // The authenticated image route resolves/caches the provider raster on first use.
+            (media_item_type(item) == "Episode" && is_plugin_vod_remote_media(Some(metadata)))
+                .then(|| {
+                    object
+                        .get("SeriesId")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|series_id| primary_image_tag_for_metadata(series_id, Some(metadata)))
+                })
+                .flatten()
+        });
+    if let Some(series_primary_tag) = series_primary_tag {
         object.insert(
             "SeriesPrimaryImageTag".to_string(),
             serde_json::Value::String(series_primary_tag),
@@ -56604,15 +59149,56 @@ struct ResolvedXtreamSource {
     source_revision: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum InternalRemoteRelayTarget {
-    MediaItem(Uuid),
-    LiveTvChannel(String),
+    MediaItem {
+        item_id: Uuid,
+        user_context: Option<jellyrin_plugin_sdk::PluginUserContext>,
+    },
+    LiveTvChannel {
+        channel_id: String,
+        user_context: Option<jellyrin_plugin_sdk::PluginUserContext>,
+    },
+}
+
+impl std::fmt::Debug for InternalRemoteRelayTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MediaItem {
+                item_id,
+                user_context,
+            } => formatter
+                .debug_struct("MediaItem")
+                .field("item_id", item_id)
+                .field("user_context_present", &user_context.is_some())
+                .finish(),
+            Self::LiveTvChannel {
+                channel_id,
+                user_context,
+            } => formatter
+                .debug_struct("LiveTvChannel")
+                .field("channel_id", channel_id)
+                .field("user_context_present", &user_context.is_some())
+                .finish(),
+        }
+    }
 }
 
 struct InternalRemoteRelayEntry {
     target: InternalRemoteRelayTarget,
     expires_at: StdInstant,
+    plugin_vod_playback_cache: Arc<Mutex<Option<CachedPluginVodPlayback>>>,
+}
+
+struct CachedPluginVodPlayback {
+    playback: VodPlaybackResult,
+    cached_at: StdInstant,
+}
+
+#[derive(Clone)]
+struct InternalRemoteRelayLookup {
+    target: InternalRemoteRelayTarget,
+    plugin_vod_playback_cache: Arc<Mutex<Option<CachedPluginVodPlayback>>>,
 }
 
 /// Keeps an unguessable loopback relay route alive for exactly as long as its
@@ -56688,6 +59274,7 @@ fn register_internal_remote_relay(
         InternalRemoteRelayEntry {
             target,
             expires_at: now + ttl,
+            plugin_vod_playback_cache: Arc::new(Mutex::new(None)),
         },
     );
     Ok(InternalRemoteRelayLease {
@@ -56696,7 +59283,12 @@ fn register_internal_remote_relay(
     })
 }
 
+#[cfg(test)]
 fn internal_remote_relay_target(token: &str) -> Option<InternalRemoteRelayTarget> {
+    internal_remote_relay_lookup(token).map(|lookup| lookup.target)
+}
+
+fn internal_remote_relay_lookup(token: &str) -> Option<InternalRemoteRelayLookup> {
     if token.len() != 43
         || !token
             .bytes()
@@ -56710,7 +59302,10 @@ fn internal_remote_relay_target(token: &str) -> Option<InternalRemoteRelayTarget
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     registry.retain(|_, entry| entry.expires_at > now);
-    registry.get(token).map(|entry| entry.target.clone())
+    registry.get(token).map(|entry| InternalRemoteRelayLookup {
+        target: entry.target.clone(),
+        plugin_vod_playback_cache: Arc::clone(&entry.plugin_vod_playback_cache),
+    })
 }
 
 /// Recovers a finite runtime from the protected media only when catalogue and JIT metadata both
@@ -56768,7 +59363,10 @@ async fn ensure_plugin_vod_media_runtime(
     };
     let relay = register_internal_remote_relay(
         state,
-        InternalRemoteRelayTarget::MediaItem(item.id),
+        InternalRemoteRelayTarget::MediaItem {
+            item_id: item.id,
+            user_context: None,
+        },
         INTERNAL_REMOTE_RELAY_PROBE_TTL,
     )?;
     let media_info =
@@ -57074,7 +59672,10 @@ async fn ensure_live_tv_stream_probe(
     };
     let relay = register_internal_remote_relay(
         state,
-        InternalRemoteRelayTarget::LiveTvChannel(channel_id.clone()),
+        InternalRemoteRelayTarget::LiveTvChannel {
+            channel_id: channel_id.clone(),
+            user_context: None,
+        },
         INTERNAL_REMOTE_RELAY_PROBE_TTL,
     )?;
     let observed_at = OffsetDateTime::now_utc();
@@ -57210,7 +59811,10 @@ async fn ensure_xtream_remote_media_info(
     };
     let probe_relay = register_internal_remote_relay(
         state,
-        InternalRemoteRelayTarget::MediaItem(item.id),
+        InternalRemoteRelayTarget::MediaItem {
+            item_id: item.id,
+            user_context: None,
+        },
         INTERNAL_REMOTE_RELAY_PROBE_TTL,
     )?;
     let media_info =
@@ -57532,7 +60136,10 @@ pub(crate) async fn media_process_input(
     }
     let relay = register_internal_remote_relay(
         state,
-        InternalRemoteRelayTarget::MediaItem(item.id),
+        InternalRemoteRelayTarget::MediaItem {
+            item_id: item.id,
+            user_context: None,
+        },
         relay_ttl,
     )?;
     Ok(MediaProcessInput {
@@ -58467,6 +61074,54 @@ fn tv_episode_info(item: &MediaItem) -> Option<TvEpisodeInfo> {
     })
 }
 
+/// Same as [`tv_episode_info`], but trusts explicit numbering from the item's metadata first.
+///
+/// Path parsing is the right fallback for scanned files, whose season and episode live in the
+/// filename. It cannot work for an imported catalogue: those items carry an opaque path such as
+/// `plugin-vod://<id>` and a display name with no `S01E02` pattern, so every episode parsed as
+/// season `None` and collapsed into one "Season Unknown" folder even though the metadata already
+/// held the correct `ParentIndexNumber`.
+fn tv_episode_info_with_metadata(
+    item: &MediaItem,
+    metadata: Option<&serde_json::Value>,
+) -> Option<TvEpisodeInfo> {
+    let mut info = tv_episode_info(item)?;
+    let Some(metadata) = metadata else {
+        return Some(info);
+    };
+    if let Some(series_name) = first_metadata_value_from_json(metadata, &["SeriesName"])
+        .filter(|name| !name.trim().is_empty())
+    {
+        info.series_name = series_name;
+    }
+    if let Some(season_number) = metadata_i32_field(metadata, &["ParentIndexNumber"]) {
+        info.season_number = Some(season_number);
+    }
+    if let Some(episode_number) = metadata_i32_field(metadata, &["IndexNumber"]) {
+        info.episode_number = Some(episode_number);
+    }
+    Some(info)
+}
+
+/// Reads a bounded integer from metadata, accepting the string form some importers persist.
+fn metadata_i32_field(metadata: &serde_json::Value, keys: &[&str]) -> Option<i32> {
+    for key in keys {
+        let Some(value) = json_field_case_insensitive(metadata, key) else {
+            continue;
+        };
+        if let Some(number) = value.as_i64() {
+            return i32::try_from(number).ok();
+        }
+        if let Some(parsed) = value
+            .as_str()
+            .and_then(|value| value.trim().parse::<i32>().ok())
+        {
+            return Some(parsed);
+        }
+    }
+    None
+}
+
 fn plugin_vod_series_anchor_info(
     item: &MediaItem,
     metadata: &serde_json::Value,
@@ -58548,7 +61203,7 @@ fn tv_episode_matches_season(
     metadata: Option<&serde_json::Value>,
     season_id: &str,
 ) -> bool {
-    tv_episode_info(item)
+    tv_episode_info_with_metadata(item, metadata)
         .map(|info| {
             jellyfin_id_matches(&tv_season_id_for_episode(&info, metadata), season_id)
                 || jellyfin_id_matches(
@@ -58674,19 +61329,37 @@ async fn tv_episode_catalog_snapshot_for_season(
 }
 
 /// The scoped snapshot for an id that may name either a series or a season, falling back to the
-/// full
-/// catalogue only when neither persisted id resolves.
+/// episodes without a canonical series id when neither persisted id resolves. Those are the only
+/// rows that can belong to a name-derived synthetic series.
 async fn tv_episode_catalog_snapshot_scoped_to_series(
     db: &Database,
     series_id: &str,
-) -> Result<TvEpisodeCatalogSnapshot, ApiError> {
+) -> Result<(TvEpisodeCatalogSnapshot, String), ApiError> {
     if let Some(snapshot) = tv_episode_catalog_snapshot_for_series(db, series_id).await? {
-        return Ok(snapshot);
+        return Ok((snapshot, series_id.to_string()));
+    }
+    // Plugin VOD listings expose the persisted Series anchor's item id, while its episodes carry
+    // the provider's canonical SeriesId. Resolve that public anchor id before trying legacy
+    // synthetic ids so both `/Shows/{id}/Seasons` and Wholphin's generic `/Items` shape agree with
+    // the id returned by the catalogue.
+    if let Ok(anchor_item_id) = parse_jellyfin_uuid(series_id)
+        && let Some(anchor) = db
+            .media_item_with_metadata_by_id_visible(anchor_item_id)
+            .await?
+        && let Some((canonical_series_id, _)) =
+            plugin_vod_series_anchor_info(&anchor.item, &anchor.metadata)
+        && let Some(snapshot) =
+            tv_episode_catalog_snapshot_for_series(db, &canonical_series_id).await?
+    {
+        return Ok((snapshot, canonical_series_id));
     }
     if let Some(snapshot) = tv_episode_catalog_snapshot_for_season(db, series_id).await? {
-        return Ok(snapshot);
+        return Ok((snapshot, series_id.to_string()));
     }
-    tv_episode_catalog_snapshot(db).await
+    Ok((
+        tv_episode_catalog_snapshot_without_canonical_series_id(db).await?,
+        series_id.to_string(),
+    ))
 }
 
 fn tv_season_parent_from_snapshot(
@@ -58702,7 +61375,7 @@ fn tv_season_parent_from_snapshot(
         {
             return None;
         }
-        let info = tv_episode_info(item)?;
+        let info = tv_episode_info_with_metadata(item, snapshot.metadata_by_item.get(&item.id))?;
         Some((
             info.series_name.clone(),
             tv_series_id_for_episode(&info, snapshot.metadata_by_item.get(&item.id)),
@@ -58779,6 +61452,11 @@ impl TvSeasonSummary {
     }
 
     fn merge_episode_metadata(&mut self, metadata: &serde_json::Value) {
+        if is_plugin_vod_remote_media(Some(metadata)) {
+            // Internal presentation marker only. `tv_season_json` copies a fixed allowlist of
+            // public fields, so this cannot expose the provider reference used to derive it.
+            self.metadata["PluginVodImageCandidate"] = serde_json::json!(true);
+        }
         if self.id.is_none() {
             self.id = canonical_metadata_uuid_from_json(metadata, &["SeasonId"]);
         }
@@ -58795,6 +61473,16 @@ impl TvSeasonSummary {
                 && let Some(value) = first_metadata_value_from_json(metadata, keys)
             {
                 self.metadata[target] = serde_json::Value::String(value);
+            }
+        }
+        for field in [
+            "SeriesPluginVodImageAvailable",
+            "SeasonPluginVodImageAvailable",
+        ] {
+            if json_field_case_insensitive(metadata, field).and_then(serde_json::Value::as_bool)
+                == Some(true)
+            {
+                self.metadata[field] = serde_json::json!(true);
             }
         }
         if self.metadata.get("ProviderIds").is_none()
@@ -58817,6 +61505,33 @@ impl TvSeasonSummary {
     }
 }
 
+/// Presents a series whose provider ships no season numbering as a single season one.
+///
+/// An unnumbered episode is not the same as an episode in an unknown season. When a provider omits
+/// numbering entirely — 3,610 of the series in a real imported catalogue — every episode parses as
+/// unnumbered and the series showed one "Season Unknown" folder, which is wrong for the shape it
+/// actually has: a flat run of episodes that is season one. A series that mixes numbered and
+/// unnumbered episodes keeps its unknown bucket, because there the gap is real information.
+fn present_unnumbered_season_as_first(
+    seasons: &mut BTreeMap<Option<i32>, TvSeasonSummary>,
+    series_name: &str,
+) {
+    if seasons.len() != 1 || !seasons.contains_key(&None) {
+        return;
+    }
+    let Some(mut summary) = seasons.remove(&None) else {
+        return;
+    };
+    // Relabel the presentation only. The episodes still parse as unnumbered and
+    // `tv_episode_matches_season` derives their season id from that, so advertising the numbered id
+    // would leave the season unreachable: its detail page would resolve no episode at all.
+    if summary.id.is_none() {
+        summary.id = Some(tv_season_id(series_name, None));
+    }
+    summary.season_number = Some(1);
+    seasons.insert(Some(1), summary);
+}
+
 fn tv_season_json(
     server_id: &str,
     series_name: &str,
@@ -58831,8 +61546,8 @@ fn tv_season_json(
         .id
         .clone()
         .unwrap_or_else(|| tv_season_id(series_name, season_number));
-    let image_tag = default_primary_image_tag(&season_id);
-    let series_image_tag = default_primary_image_tag(series_id);
+    let image_tag = primary_image_tag_for_metadata(&season_id, Some(&summary.metadata));
+    let series_image_tag = primary_image_tag_for_metadata(series_id, Some(&summary.metadata));
     let (display_series_name, _) = clean_tv_series_name_and_year(series_name);
     let episode_count = summary.episode_count;
     let unplayed_count = summary.unplayed_count;
@@ -59211,17 +61926,94 @@ async fn bitrate_test(
 
 async fn item_placeholder_image(
     State(state): State<AppState>,
+    method: axum::http::Method,
+    headers: HeaderMap,
+    Query(size): Query<ImageResizeQuery>,
     Path((item_id, image_type)): Path<(String, String)>,
 ) -> Result<axum::response::Response, ApiError> {
-    item_image_or_placeholder(&state, &item_id, &image_type, 0).await
+    let resize = size.normalized();
+    let response = item_image_or_placeholder(
+        &state,
+        &item_id,
+        &image_type,
+        0,
+        ItemImageRequest {
+            resize,
+            headers: &headers,
+            query_token: size.api_key.as_deref(),
+            allow_plugin_vod_fill: method == axum::http::Method::GET,
+        },
+    )
+    .await?;
+    Ok(conditional_image_response(&headers, response))
 }
 
 async fn item_placeholder_image_by_index(
     State(state): State<AppState>,
+    method: axum::http::Method,
+    headers: HeaderMap,
+    Query(size): Query<ImageResizeQuery>,
     Path((item_id, image_type, image_index)): Path<(String, String, String)>,
 ) -> Result<axum::response::Response, ApiError> {
     let image_index = parse_image_index(&image_index)?;
-    item_image_or_placeholder(&state, &item_id, &image_type, image_index).await
+    let resize = size.normalized();
+    let response = item_image_or_placeholder(
+        &state,
+        &item_id,
+        &image_type,
+        image_index,
+        ItemImageRequest {
+            resize,
+            headers: &headers,
+            query_token: size.api_key.as_deref(),
+            allow_plugin_vod_fill: method == axum::http::Method::GET,
+        },
+    )
+    .await?;
+    Ok(conditional_image_response(&headers, response))
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ImageResizeQuery {
+    #[serde(alias = "MaxWidth", alias = "maxWidth")]
+    max_width: Option<u32>,
+    #[serde(alias = "MaxHeight", alias = "maxHeight")]
+    max_height: Option<u32>,
+    /// Jellyfin clients request card artwork with `fillWidth`/`fillHeight`. Jellyrin bounds the
+    /// cached derivative by those dimensions rather than cropping to them: the card already uses
+    /// `object-fit` for the final framing, and without honouring them at all every grid tile
+    /// downloads the full-size original.
+    #[serde(alias = "FillWidth", alias = "fillWidth")]
+    fill_width: Option<u32>,
+    #[serde(alias = "FillHeight", alias = "fillHeight")]
+    fill_height: Option<u32>,
+    #[serde(alias = "api_key", alias = "ApiKey", alias = "apiKey")]
+    api_key: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ImageResize {
+    max_width: u32,
+    max_height: u32,
+}
+
+impl ImageResizeQuery {
+    fn normalized(&self) -> Option<ImageResize> {
+        const MAX_IMAGE_EDGE: u32 = 4096;
+        let positive = |value: Option<u32>| value.filter(|value| *value > 0);
+        let requested_width = positive(self.max_width).or_else(|| positive(self.fill_width));
+        let requested_height = positive(self.max_height).or_else(|| positive(self.fill_height));
+        let max_width = requested_width
+            .unwrap_or(MAX_IMAGE_EDGE)
+            .clamp(1, MAX_IMAGE_EDGE);
+        let max_height = requested_height
+            .unwrap_or(MAX_IMAGE_EDGE)
+            .clamp(1, MAX_IMAGE_EDGE);
+        (requested_width.is_some() || requested_height.is_some()).then_some(ImageResize {
+            max_width,
+            max_height,
+        })
+    }
 }
 
 type ExtendedItemImagePath = (
@@ -59238,20 +62030,42 @@ type ExtendedItemImagePath = (
 
 async fn item_placeholder_image_extended(
     State(state): State<AppState>,
+    method: axum::http::Method,
+    headers: HeaderMap,
+    Query(query_size): Query<ImageResizeQuery>,
     Path((
         item_id,
         image_type,
         image_index,
         _tag,
         _format,
-        _max_width,
-        _max_height,
+        max_width,
+        max_height,
         _percent_played,
         _unplayed_count,
     )): Path<ExtendedItemImagePath>,
 ) -> Result<axum::response::Response, ApiError> {
     let image_index = parse_image_index(&image_index)?;
-    item_image_or_placeholder(&state, &item_id, &image_type, image_index).await
+    let path_size = ImageResizeQuery {
+        max_width: max_width.parse().ok(),
+        max_height: max_height.parse().ok(),
+        ..ImageResizeQuery::default()
+    };
+    let size = query_size.normalized().or_else(|| path_size.normalized());
+    let response = item_image_or_placeholder(
+        &state,
+        &item_id,
+        &image_type,
+        image_index,
+        ItemImageRequest {
+            resize: size,
+            headers: &headers,
+            query_token: query_size.api_key.as_deref(),
+            allow_plugin_vod_fill: method == axum::http::Method::GET,
+        },
+    )
+    .await?;
+    Ok(conditional_image_response(&headers, response))
 }
 
 async fn user_placeholder_image(
@@ -59394,6 +62208,20 @@ fn placeholder_png_response() -> axum::response::Response {
         TRANSPARENT_PNG.to_vec(),
     )
         .into_response()
+}
+
+/// A missing movie or episode poster must still be visible in television clients. Wholphin and
+/// Jellyfin Android TV render the historical transparent-pixel fallback as a permanently loading
+/// grey card, which makes a healthy catalog look broken when an upstream provider has stale
+/// artwork. Use deterministic raster artwork for item routes while retaining the tiny transparent
+/// response for branding and other non-catalog compatibility endpoints.
+fn generated_item_placeholder_response(
+    item_id: &str,
+    image_type: &str,
+    image_index: usize,
+) -> axum::response::Response {
+    let placeholder_key = format!("missing-item-image-v1:{image_type}:{image_index}");
+    live_tv_generated_image_response(&serde_json::Value::Null, item_id, &placeholder_key)
 }
 
 pub(crate) enum ImageOwner<'a> {
@@ -59602,80 +62430,84 @@ async fn precache_single_live_tv_logo(
     }
 }
 
+/// Memoized bodies for the generated Live TV tiles.
+///
+/// The tile is a pure function of the image tag, so rasterizing 512x512 pixels and encoding a PNG
+/// on every request is the wrong cost for a fallback that one grid screen asks for dozens of times.
+/// The map is capped and cleared wholesale, like the other in-process caches here: it exists to
+/// absorb a page load, not to retain every tile a server ever produced.
+fn live_tv_generated_image_cache() -> &'static std::sync::Mutex<HashMap<String, axum::body::Bytes>>
+{
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, axum::body::Bytes>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+const LIVE_TV_GENERATED_IMAGE_CACHE_MAX_ENTRIES: usize = 512;
+
 fn live_tv_generated_image_response(
-    item: &serde_json::Value,
+    _item: &serde_json::Value,
     item_id: &str,
     image_url: &str,
 ) -> axum::response::Response {
-    let name = json_string_field(item, "Name").unwrap_or_else(|| item_id.to_string());
-    let label = live_tv_generated_image_label(&name);
     let hash = live_tv_image_tag(item_id, image_url);
-    let bg = &hash[..6.min(hash.len())];
-    let fg = if u8::from_str_radix(&bg[..2], 16).unwrap_or(0) > 170 {
-        "111827"
-    } else {
-        "ffffff"
+    if let Some(png) = live_tv_generated_image_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&hash).cloned())
+    {
+        return live_tv_generated_image_reply(&hash, png);
+    }
+    let color = |offset: usize| {
+        64_u8.saturating_add(
+            u8::from_str_radix(hash.get(offset..offset + 2).unwrap_or("00"), 16).unwrap_or(0) % 160,
+        )
     };
-    let svg = format!(
-        r##"<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
-<rect width="512" height="512" rx="56" fill="#{bg}"/>
-<text x="256" y="244" text-anchor="middle" dominant-baseline="middle" font-family="Arial, Helvetica, sans-serif" font-size="116" font-weight="700" fill="#{fg}">{}</text>
-<text x="256" y="338" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="34" font-weight="600" fill="#{fg}" opacity="0.9">{}</text>
-</svg>"##,
-        escape_xml_text(&label),
-        escape_xml_text(&live_tv_generated_image_caption(&name)),
-    );
+    let base = image::Rgba([color(0), color(2), color(4), 255]);
+    let stripe = image::Rgba([
+        base[0].saturating_add(24),
+        base[1].saturating_add(24),
+        base[2].saturating_add(24),
+        255,
+    ]);
+    let mut bitmap = image::RgbaImage::from_pixel(512, 512, base);
+    for y in 0..512_u32 {
+        for x in 0..512_u32 {
+            if ((x + y) / 48) % 2 == 0 {
+                bitmap.put_pixel(x, y, stripe);
+            }
+        }
+    }
+    // A simple raster play mark remains legible after Android TV center-crops the square tile.
+    for x in 0..140_u32 {
+        let half_height = 70_u32.saturating_sub(x / 2);
+        for y in (256 - half_height)..=(256 + half_height) {
+            bitmap.put_pixel(196 + x, y, image::Rgba([255, 255, 255, 230]));
+        }
+    }
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(bitmap)
+        .write_to(&mut png, image::ImageFormat::Png)
+        .expect("generated Android TV artwork must encode as PNG");
+    let png = axum::body::Bytes::from(png.into_inner());
+    if let Ok(mut cache) = live_tv_generated_image_cache().lock() {
+        if cache.len() >= LIVE_TV_GENERATED_IMAGE_CACHE_MAX_ENTRIES {
+            cache.clear();
+        }
+        cache.insert(hash.clone(), png.clone());
+    }
+    live_tv_generated_image_reply(&hash, png)
+}
+
+fn live_tv_generated_image_reply(hash: &str, png: axum::body::Bytes) -> axum::response::Response {
     let mut headers = HeaderMap::new();
-    headers.insert(
-        header::CONTENT_TYPE,
-        "image/svg+xml; charset=utf-8".parse().unwrap(),
-    );
+    headers.insert(header::CONTENT_TYPE, "image/png".parse().unwrap());
     headers.insert(
         header::CACHE_CONTROL,
         "public, max-age=3600".parse().unwrap(),
     );
     headers.insert(header::ETAG, hash.parse().unwrap());
-    (headers, svg.into_bytes()).into_response()
-}
-
-fn live_tv_generated_image_label(name: &str) -> String {
-    let words = name
-        .split(|character: char| !character.is_alphanumeric())
-        .filter(|word| !word.is_empty())
-        .collect::<Vec<_>>();
-    let label = words
-        .iter()
-        .filter_map(|word| word.chars().next())
-        .take(3)
-        .collect::<String>();
-    if label.is_empty() {
-        "TV".to_string()
-    } else {
-        label.to_ascii_uppercase()
-    }
-}
-
-fn live_tv_generated_image_caption(name: &str) -> String {
-    let trimmed = name.trim();
-    let caption = if trimmed.chars().count() > 18 {
-        trimmed.chars().take(17).collect::<String>() + "..."
-    } else {
-        trimmed.to_string()
-    };
-    if caption.is_empty() {
-        "Live TV".to_string()
-    } else {
-        caption
-    }
-}
-
-fn escape_xml_text(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+    (headers, png).into_response()
 }
 
 async fn live_tv_item_image_response(
@@ -59823,29 +62655,294 @@ async fn item_image_from_plugins(
     Ok(None)
 }
 
+fn plugin_vod_grid_image_admission() -> Arc<Semaphore> {
+    Arc::clone(
+        PLUGIN_VOD_GRID_IMAGE_ADMISSION
+            .get_or_init(|| Arc::new(Semaphore::new(PLUGIN_VOD_GRID_IMAGE_MAX_IN_FLIGHT))),
+    )
+}
+
+fn plugin_vod_artwork_prefetch_admission() -> Arc<Semaphore> {
+    Arc::clone(
+        PLUGIN_VOD_ARTWORK_PREFETCH_ADMISSION
+            .get_or_init(|| Arc::new(Semaphore::new(PLUGIN_VOD_ARTWORK_PREFETCH_MAX_IN_FLIGHT))),
+    )
+}
+
+/// Warms artwork for a page an authenticated client just received.
+///
+/// Browser `<img>` requests carry no credential — Jellyfin Web builds image URLs without a token —
+/// so the image route can never start a credentialed provider call for them, and must not: an
+/// anonymous request that could drive provider traffic is an abuse vector. The authenticated
+/// listing that produced the page is therefore the only correct trigger, and it is also the most
+/// precise one, because it knows exactly which items the client is about to render.
+///
+/// Nothing here is speculative beyond that page. Enrichment is deduplicated across concurrent and
+/// repeated listings, bounded in flight, and capped per page, so revisiting a library does not
+/// re-queue work and one large page cannot fan out unbounded provider calls.
+fn queue_plugin_vod_artwork_prefetch_from_page(state: &AppState, page: &serde_json::Value) {
+    let Some(items) = page.get("Items").and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    let item_ids = items
+        .iter()
+        .filter_map(|item| item.get("Id").and_then(serde_json::Value::as_str))
+        .filter_map(|id| parse_jellyfin_uuid(id).ok())
+        .collect::<Vec<_>>();
+    queue_plugin_vod_artwork_prefetch_ids(state, &item_ids);
+}
+
+fn queue_plugin_vod_artwork_prefetch_ids(state: &AppState, item_ids: &[Uuid]) {
+    let mut queued = 0usize;
+    for item_id in item_ids.iter().copied() {
+        if queued >= PLUGIN_VOD_ARTWORK_PREFETCH_MAX_PER_PAGE {
+            break;
+        }
+        let fill_key = plugin_vod_artwork_fill_key(state, item_id);
+        if !claim_plugin_vod_artwork_prefetch(fill_key.clone()) {
+            continue;
+        }
+        queued += 1;
+        let state = state.clone();
+        // Marked pending before the task is spawned, so an image request arriving in between waits
+        // for the fill instead of racing it to the cache and losing. Losing that race is what made
+        // artwork look random: whichever tiles happened to be filled when their single `<img>`
+        // request was served showed art, and the browser never asks again.
+        let pending = PluginVodArtworkFillGuard::register(fill_key);
+        tokio::spawn(async move {
+            let _pending = pending;
+            let permit = plugin_vod_artwork_prefetch_admission()
+                .acquire_owned()
+                .await;
+            if permit.is_err() {
+                return;
+            }
+            if let Err(error) = prefetch_one_plugin_vod_artwork(&state, item_id).await {
+                tracing::debug!(
+                    status = %error.status(),
+                    "listing artwork prefetch was unavailable"
+                );
+            }
+        });
+    }
+}
+
+/// Marks one item as having a fill in flight for as long as it is held, including on panic.
+struct PluginVodArtworkFillGuard(PluginVodArtworkFillKey);
+
+impl PluginVodArtworkFillGuard {
+    fn register(fill_key: PluginVodArtworkFillKey) -> Self {
+        if let Ok(mut pending) = plugin_vod_artwork_fill_pending().lock() {
+            pending.insert(fill_key.clone());
+        }
+        Self(fill_key)
+    }
+}
+
+impl Drop for PluginVodArtworkFillGuard {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = plugin_vod_artwork_fill_pending().lock() {
+            pending.remove(&self.0);
+        }
+    }
+}
+
+fn plugin_vod_artwork_fill_pending() -> &'static StdMutex<HashSet<PluginVodArtworkFillKey>> {
+    PLUGIN_VOD_ARTWORK_FILL_PENDING.get_or_init(|| StdMutex::new(HashSet::new()))
+}
+
+fn plugin_vod_artwork_fill_key(state: &AppState, item_id: Uuid) -> PluginVodArtworkFillKey {
+    (api_cache_root(&state.log_dir), item_id)
+}
+
+fn plugin_vod_artwork_fill_is_pending(fill_key: &PluginVodArtworkFillKey) -> bool {
+    plugin_vod_artwork_fill_pending()
+        .lock()
+        .map(|pending| pending.contains(fill_key))
+        .unwrap_or(false)
+}
+
+/// Waits for a fill that an authenticated listing already queued for this item.
+///
+/// Browser `<img>` requests carry no credential, so they can never *start* provider work — but
+/// making them wait for work already authorised removes the race that made artwork appear at
+/// random. The wait is bounded, ends as soon as the fill finishes or gives up, and returns nothing
+/// for an item with no fill in flight, so an anonymous request for an unqueued item still answers
+/// immediately with the placeholder.
+async fn await_pending_plugin_vod_artwork(
+    state: &AppState,
+    item_id: Uuid,
+    owner_id: &str,
+    image_type: &str,
+    image_index: usize,
+) -> Result<Option<PathBuf>, ApiError> {
+    let fill_key = plugin_vod_artwork_fill_key(state, item_id);
+    if !plugin_vod_artwork_fill_is_pending(&fill_key) {
+        return Ok(None);
+    }
+    let deadline = StdInstant::now() + PLUGIN_VOD_ARTWORK_FILL_MAX_WAIT;
+    loop {
+        tokio::time::sleep(PLUGIN_VOD_ARTWORK_FILL_POLL_INTERVAL).await;
+        if let Some(path) =
+            find_stored_image(state, ImageOwner::Item(owner_id), image_type, image_index).await?
+        {
+            return Ok(Some(path));
+        }
+        if !plugin_vod_artwork_fill_is_pending(&fill_key) || StdInstant::now() >= deadline {
+            return Ok(None);
+        }
+    }
+}
+
+/// Resolves one item's artwork, skipping anything that is not a provider-backed VOD item.
+/// `ensure_plugin_vod_metadata` already short-circuits on a fresh marker, so an item enriched by an
+/// earlier visit costs one metadata read rather than a provider call.
+async fn prefetch_one_plugin_vod_artwork(state: &AppState, item_id: Uuid) -> Result<(), ApiError> {
+    let Some(item) = state
+        .db
+        .media_item_by_id_visible(item_id)
+        .await
+        .map_err(ApiError::from)?
+    else {
+        return Ok(());
+    };
+    let metadata = metadata_payload_for_item(&state.db, item_id).await?;
+    let Some(target) = plugin_vod_item_metadata_target(&item, &metadata) else {
+        return Ok(());
+    };
+    ensure_plugin_vod_metadata(state, &target).await.map(|_| ())
+}
+
+/// Returns true when this call is the one responsible for enriching `item_id`.
+///
+/// The claim expires so a later failure can be retried, and the registry is bounded: at the cap the
+/// oldest claims are dropped rather than letting a long browsing session grow memory without limit.
+fn claim_plugin_vod_artwork_prefetch(fill_key: PluginVodArtworkFillKey) -> bool {
+    let registry = PLUGIN_VOD_ARTWORK_PREFETCH_CLAIMS.get_or_init(|| StdMutex::new(HashMap::new()));
+    let Ok(mut claims) = registry.lock() else {
+        return false;
+    };
+    let now = StdInstant::now();
+    claims.retain(|_, claimed_at: &mut StdInstant| {
+        now.duration_since(*claimed_at) < PLUGIN_VOD_ARTWORK_PREFETCH_CLAIM_TTL
+    });
+    if claims.contains_key(&fill_key) {
+        return false;
+    }
+    if claims.len() >= PLUGIN_VOD_ARTWORK_PREFETCH_MAX_CLAIMS {
+        let oldest = claims
+            .iter()
+            .min_by_key(|(_, claimed_at)| **claimed_at)
+            .map(|(key, _)| key.clone());
+        if let Some(oldest) = oldest {
+            claims.remove(&oldest);
+        } else {
+            return false;
+        }
+    }
+    claims.insert(fill_key, now);
+    true
+}
+
+/// Progressively fills an authenticated plugin-VOD grid without letting one page fan out an
+/// unbounded number of credentialed provider calls. The provider JIT lane remains serial; this
+/// outer admission bound caps queued HTTP work. Running the fill in a detached Tokio task means a
+/// browser cancelling an image request does not cancel the credentialed RPC midway or discard an
+/// image that is already being validated and written.
+async fn hydrate_plugin_vod_grid_image(
+    state: &AppState,
+    item: &MediaItem,
+    metadata: &serde_json::Value,
+    request_headers: &HeaderMap,
+    query_token: Option<&str>,
+) -> Result<Option<PathBuf>, ApiError> {
+    if require_request_user(&state.db, request_headers, query_token)
+        .await
+        .is_err()
+    {
+        return Ok(None);
+    }
+    let Some(target) = plugin_vod_item_metadata_target(item, metadata) else {
+        return Ok(None);
+    };
+    let Ok(permit) = plugin_vod_grid_image_admission().try_acquire_owned() else {
+        return Ok(None);
+    };
+    let state = state.clone();
+    let owner_id = target.owner_id.clone();
+    let mut fill = tokio::spawn(async move {
+        let _permit = permit;
+        if let Err(error) = ensure_plugin_vod_metadata(&state, &target).await {
+            tracing::warn!(
+                status = %error.status(),
+                "VOD grid artwork enrichment was unavailable"
+            );
+            return Ok(None);
+        }
+        find_stored_image(&state, ImageOwner::Item(&owner_id), "Primary", 0).await
+    });
+    match tokio::time::timeout(PLUGIN_VOD_GRID_IMAGE_WAIT_TIMEOUT, &mut fill).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Ok(None),
+        // Dropping JoinHandle detaches rather than aborts the task. The bounded fill completes in
+        // the background and the next browser request or refresh reads the durable cache entry.
+        Err(_) => Ok(None),
+    }
+}
+
 async fn item_image_or_placeholder(
     state: &AppState,
     item_id: &str,
     image_type: &str,
     image_index: usize,
+    request: ItemImageRequest<'_>,
 ) -> Result<axum::response::Response, ApiError> {
+    let ItemImageRequest {
+        resize,
+        headers: request_headers,
+        query_token,
+        allow_plugin_vod_fill,
+    } = request;
     if let Some(item) = live_tv_item_for_image(&state.db, item_id).await? {
         if let Some(response) =
             live_tv_item_image_response(state, &item, image_type, image_index).await?
         {
             return Ok(response);
         }
-        return Ok(placeholder_png_response());
+        return Ok(generated_item_placeholder_response(
+            item_id,
+            image_type,
+            image_index,
+        ));
     }
     if let Some(channel_item) = channel_content_item_by_id(&state.db, item_id).await?
         && let Some(response) = channel_item_image_response(&channel_item, image_type, image_index)?
     {
         return Ok(response);
     }
-    if let Some(stored) =
-        find_stored_image(state, ImageOwner::Item(item_id), image_type, image_index).await?
+    // Jellyfin clients freely alternate compact and hyphenated UUIDs in image paths. Durable
+    // artwork is keyed by the canonical compact owner id, so normalize before touching the cache;
+    // otherwise Android TV receives a generated tile even though the real raster is already there.
+    let canonical_item_id = parse_jellyfin_uuid(item_id)
+        .map(|id| id.simple().to_string())
+        .unwrap_or_else(|_| item_id.to_string());
+    if let Some(stored) = find_stored_image(
+        state,
+        ImageOwner::Item(&canonical_item_id),
+        image_type,
+        image_index,
+    )
+    .await?
     {
-        return stored_image_response(stored).await;
+        return stored_image_response_sized(state, stored, resize).await;
+    }
+    // Only synthesize the library tile once no real artwork exists. Resolving it first shadowed
+    // every poster an operator uploaded for a library, which is the opposite of what this fallback
+    // is for.
+    if let Some(response) =
+        virtual_folder_image_response(&state.db, item_id, image_type, image_index).await?
+    {
+        return Ok(response);
     }
     let item = match media_item_by_id(&state.db, item_id).await {
         Ok(item) => item,
@@ -59854,11 +62951,16 @@ async fn item_image_or_placeholder(
             // request for one used to fall straight through to the placeholder. Their episodes carry
             // it in metadata.
             if let Some(response) =
-                virtual_tv_item_image_response(state, item_id, image_type, image_index).await?
+                virtual_tv_item_image_response(state, item_id, image_type, image_index, resize)
+                    .await?
             {
                 return Ok(response);
             }
-            return Ok(placeholder_png_response());
+            return Ok(generated_item_placeholder_response(
+                item_id,
+                image_type,
+                image_index,
+            ));
         }
         Err(error) => return Err(error),
     };
@@ -59866,43 +62968,113 @@ async fn item_image_or_placeholder(
     let metadata = metadata_payload_for_item(&state.db, item.id).await?;
     let metadata_image_provider = remote_image_provider_name(&metadata);
     if image_policy.allows("", &metadata_image_provider)
-        && let Some(response) =
-            remote_metadata_item_image_response(state, item_id, &metadata, image_type, image_index)
-                .await?
+        && let Some(response) = remote_metadata_item_image_response(
+            state,
+            item_id,
+            &metadata,
+            image_type,
+            image_index,
+            resize,
+            !is_plugin_vod_virtual_item(&item),
+        )
+        .await?
     {
         return Ok(response);
     }
-    if image_index == 0
-        && normalize_image_type(image_type) == "primary"
-        && let Some(target) = plugin_vod_item_metadata_target(&item, &metadata)
+    if allow_plugin_vod_fill
+        && is_plugin_vod_virtual_item(&item)
+        && image_index == 0
+        && normalize_image_type(image_type).eq_ignore_ascii_case("primary")
+        && let Some(path) =
+            hydrate_plugin_vod_grid_image(state, &item, &metadata, request_headers, query_token)
+                .await?
     {
-        if let Err(error) = ensure_plugin_vod_metadata(state, &target).await {
-            tracing::warn!(
-                status = %error.status(),
-                "VOD artwork resolution was unavailable; using placeholder"
-            );
-        }
-        if let Some(path) =
-            find_stored_image(state, ImageOwner::Item(item_id), "Primary", 0).await?
-        {
-            return stored_image_response(path).await;
-        }
+        return stored_image_response_sized(state, path, resize).await;
     }
+    // A listing may already have queued this item's fill. Waiting for that authorised work is what
+    // makes a freshly opened page complete: the browser requests each image exactly once, so
+    // answering with a placeholder while the fill is still running loses the artwork until a reload.
+    if image_index == 0
+        && normalize_image_type(image_type).eq_ignore_ascii_case("primary")
+        && let Some(path) = await_pending_plugin_vod_artwork(
+            state,
+            item.id,
+            &canonical_item_id,
+            image_type,
+            image_index,
+        )
+        .await?
+    {
+        return stored_image_response_sized(state, path, resize).await;
+    }
+    // Requests for an item with no fill in flight receive a cheap placeholder immediately.
     if let Some(local_image) = find_local_item_image(&item, image_type, image_index).await? {
-        return stored_image_response(local_image).await;
+        return stored_image_response_sized(state, local_image, resize).await;
     }
     // Try plugin ImageProvider as fallback
-    if let Some(plugin_image) =
-        item_image_from_plugins(&state.db, item_id, media_item_type(&item), image_type).await?
+    if !is_plugin_vod_virtual_item(&item)
+        && let Some(plugin_image) =
+            item_image_from_plugins(&state.db, item_id, media_item_type(&item), image_type).await?
     {
         return Ok(plugin_image);
     }
     if let Some(generated_image) =
         find_generated_video_item_image(state, &item, item_id, image_type, image_index).await?
     {
-        return stored_image_response(generated_image).await;
+        return stored_image_response_sized(state, generated_image, resize).await;
     }
-    Ok(placeholder_png_response())
+    Ok(generated_item_placeholder_response(
+        item_id,
+        image_type,
+        image_index,
+    ))
+}
+
+struct ItemImageRequest<'a> {
+    resize: Option<ImageResize>,
+    headers: &'a HeaderMap,
+    query_token: Option<&'a str>,
+    allow_plugin_vod_fill: bool,
+}
+
+/// A real library id is also UUID-shaped, so it must be resolved before the synthetic
+/// Series/Season fallback. Passing a Movies library into that fallback scans the TV projection and
+/// ultimately returns a transparent pixel. A deterministic library tile is both cheap and useful
+/// until the operator uploads custom library artwork.
+async fn virtual_folder_image_response(
+    db: &Database,
+    item_id: &str,
+    image_type: &str,
+    image_index: usize,
+) -> Result<Option<axum::response::Response>, ApiError> {
+    if image_index != 0
+        || !matches!(
+            normalize_image_type(image_type).as_str(),
+            "primary" | "thumb"
+        )
+    {
+        return Ok(None);
+    }
+    let Ok(folder_id) = parse_jellyfin_uuid(item_id) else {
+        return Ok(None);
+    };
+    let Some(folder) = db
+        .virtual_folders()
+        .await?
+        .into_iter()
+        .find(|folder| folder.id == folder_id)
+    else {
+        return Ok(None);
+    };
+    let item = serde_json::json!({
+        "Id": folder.id.simple().to_string(),
+        "Name": folder.name,
+    });
+    Ok(Some(live_tv_generated_image_response(
+        &item,
+        &folder.id.simple().to_string(),
+        &format!("virtual-folder:{}", folder.id.simple()),
+    )))
 }
 
 async fn find_local_item_image(
@@ -60149,18 +63321,27 @@ async fn remote_metadata_item_image_response(
     metadata: &serde_json::Value,
     image_type: &str,
     image_index: usize,
+    resize: Option<ImageResize>,
+    allow_remote_fetch: bool,
 ) -> Result<Option<axum::response::Response>, ApiError> {
     if image_index != 0 {
         return Ok(None);
     }
     for image_url in metadata_remote_image_urls(metadata, image_type) {
         if let Some(path) = find_cached_live_tv_image(state, item_id, &image_url).await? {
-            return stored_image_response(path).await.map(Some);
+            return stored_image_response_sized(state, path, resize)
+                .await
+                .map(Some);
+        }
+        if !allow_remote_fetch {
+            continue;
         }
         match fetch_remote_image_payload(&image_url).await {
             Ok((bytes, _mime_type)) => {
                 let path = cache_live_tv_image(state, item_id, &image_url, &bytes).await?;
-                return stored_image_response(path).await.map(Some);
+                return stored_image_response_sized(state, path, resize)
+                    .await
+                    .map(Some);
             }
             Err(error) => {
                 tracing::warn!(
@@ -60182,6 +63363,7 @@ async fn virtual_tv_item_image_response(
     item_id: &str,
     image_type: &str,
     image_index: usize,
+    resize: Option<ImageResize>,
 ) -> Result<Option<axum::response::Response>, ApiError> {
     if image_index != 0 {
         return Ok(None);
@@ -60210,34 +63392,61 @@ async fn virtual_tv_item_image_response(
                 continue;
             }
             if let Some(path) = find_cached_live_tv_image(state, item_id, &image_url).await? {
-                return stored_image_response(path).await.map(Some);
-            }
-            match fetch_remote_image_payload(&image_url).await {
-                Ok((bytes, _mime_type)) => {
-                    let path = cache_live_tv_image(state, item_id, &image_url, &bytes).await?;
-                    return stored_image_response(path).await.map(Some);
-                }
-                Err(error) => {
-                    tracing::warn!(?error, "failed to cache remote series image candidate");
-                }
+                return stored_image_response_sized(state, path, resize)
+                    .await
+                    .map(Some);
             }
         }
     }
-    if normalize_image_type(image_type) == "primary" {
-        let season = item_type == "Season";
-        if let Some(target) = plugin_vod_virtual_metadata_target(&state.db, item_id, season).await?
+    // A season has no artwork of its own. Jellyfin renders the series poster on a season that has
+    // none, so fall back to the series anchor's stored image instead of leaving a blank card. The
+    // anchor is where the provider artwork was cached, which is why looking it up by the season's
+    // own id above cannot find it.
+    let mut seen_series_ids = HashSet::new();
+    for item in &snapshot.items {
+        let Some(series_id) = snapshot
+            .metadata_by_item
+            .get(&item.id)
+            .and_then(|metadata| canonical_metadata_uuid_from_json(metadata, &["SeriesId"]))
+        else {
+            continue;
+        };
+        if series_id.eq_ignore_ascii_case(item_id) {
+            continue;
+        }
+        if !seen_series_ids.insert(series_id.clone()) {
+            continue;
+        }
+        // Provider artwork is cached against the public Series row exposed in the catalogue,
+        // while the synthetic Season points at its canonical SeriesId. Resolve that indexed
+        // relationship and reuse the already-cached poster before trying the legacy canonical
+        // owner id.
+        if let Some(series_snapshot) =
+            tv_episode_catalog_snapshot_for_series(&state.db, &series_id).await?
         {
-            if let Err(error) = ensure_plugin_vod_metadata(state, &target).await {
-                tracing::warn!(
-                    status = %error.status(),
-                    "VOD virtual artwork resolution was unavailable; using placeholder"
-                );
+            for anchor in &series_snapshot.items {
+                let Some(metadata) = series_snapshot.metadata_by_item.get(&anchor.id) else {
+                    continue;
+                };
+                if !plugin_vod_series_anchor_matches(anchor, metadata, &series_id) {
+                    continue;
+                }
+                let anchor_id = anchor.id.simple().to_string();
+                if let Some(path) =
+                    find_stored_image(state, ImageOwner::Item(&anchor_id), image_type, 0).await?
+                {
+                    return stored_image_response_sized(state, path, resize)
+                        .await
+                        .map(Some);
+                }
             }
-            if let Some(path) =
-                find_stored_image(state, ImageOwner::Item(item_id), "Primary", 0).await?
-            {
-                return stored_image_response(path).await.map(Some);
-            }
+        }
+        if let Some(path) =
+            find_stored_image(state, ImageOwner::Item(&series_id), image_type, 0).await?
+        {
+            return stored_image_response_sized(state, path, resize)
+                .await
+                .map(Some);
         }
     }
     Ok(None)
@@ -60377,49 +63586,33 @@ async fn find_named_entity_representative_image(
     {
         return Ok(Some(path));
     }
-    for metadata in state.db.media_item_metadata().await? {
-        if !metadata_payload_contains_entity_name(&metadata.payload, needle) {
-            continue;
-        }
-        let owner_id = metadata.item_id.simple().to_string();
-        if let Some(path) =
-            find_stored_image(state, ImageOwner::Item(&owner_id), image_type, image_index).await?
-        {
-            return Ok(Some(path));
+    // Resolve the representative through the indexed facet projection. Scanning every metadata
+    // payload here materialised the whole catalogue — over 1 GiB of JSONB on a real library — and
+    // exceeded the statement timeout, so genre, studio and person artwork answered 500 instead of
+    // an image. These kinds are exactly the families the payload scan inspected, and querying one
+    // at a time keeps `facet_kind` bound so the value index applies instead of a full index scan.
+    for kind in NAMED_ENTITY_IMAGE_FACET_KINDS {
+        let candidates = MediaCatalogStore::media_item_ids_for_facets(
+            &state.db,
+            &MediaItemFacetCandidateQuery {
+                kind: Some(kind),
+                normalized_values: vec![needle.to_string()],
+                limit: Some(NAMED_ENTITY_IMAGE_CANDIDATE_LIMIT),
+                ..MediaItemFacetCandidateQuery::default()
+            },
+        )
+        .await?;
+        for item_id in candidates {
+            let owner_id = item_id.simple().to_string();
+            if let Some(path) =
+                find_stored_image(state, ImageOwner::Item(&owner_id), image_type, image_index)
+                    .await?
+            {
+                return Ok(Some(path));
+            }
         }
     }
     Ok(None)
-}
-
-fn metadata_payload_contains_entity_name(metadata: &serde_json::Value, needle: &str) -> bool {
-    [
-        "Genres",
-        "MusicGenres",
-        "Artists",
-        "AlbumArtists",
-        "People",
-        "Studios",
-    ]
-    .iter()
-    .any(|key| {
-        json_field_case_insensitive(metadata, key)
-            .is_some_and(|value| metadata_value_contains_name(value, needle))
-    })
-}
-
-fn metadata_value_contains_name(value: &serde_json::Value, needle: &str) -> bool {
-    match value {
-        serde_json::Value::Array(values) => values
-            .iter()
-            .any(|value| metadata_value_contains_name(value, needle)),
-        serde_json::Value::String(value) => value.eq_ignore_ascii_case(needle),
-        serde_json::Value::Object(object) => object
-            .get("Name")
-            .or_else(|| object.get("name"))
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|value| value.eq_ignore_ascii_case(needle)),
-        _ => false,
-    }
 }
 
 async fn store_uploaded_image(
@@ -60561,7 +63754,7 @@ async fn stored_images_for_type(
             path,
         });
     }
-    images.sort_by(|left, right| left.index.cmp(&right.index));
+    images.sort_by_key(|image| image.index);
     Ok(images)
 }
 
@@ -60674,6 +63867,46 @@ async fn item_image_info_from_path(
     }))
 }
 
+fn conditional_image_response(
+    request_headers: &HeaderMap,
+    mut response: axum::response::Response,
+) -> axum::response::Response {
+    let Some(response_etag) = response
+        .headers()
+        .get(header::ETAG)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return response;
+    };
+    let matches = request_headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|candidates| {
+            candidates.split(',').any(|candidate| {
+                let candidate = candidate.trim();
+                candidate == "*"
+                    || normalized_etag(candidate)
+                        .eq_ignore_ascii_case(normalized_etag(response_etag))
+            })
+        });
+    if !matches {
+        return response;
+    }
+    *response.status_mut() = StatusCode::NOT_MODIFIED;
+    response.headers_mut().remove(header::CONTENT_LENGTH);
+    response.headers_mut().remove(header::CONTENT_TYPE);
+    *response.body_mut() = Body::empty();
+    response
+}
+
+fn normalized_etag(value: &str) -> &str {
+    value
+        .trim()
+        .strip_prefix("W/")
+        .unwrap_or(value.trim())
+        .trim_matches('"')
+}
+
 async fn stored_image_response(path: PathBuf) -> Result<axum::response::Response, ApiError> {
     let extension = path
         .extension()
@@ -60690,6 +63923,396 @@ async fn stored_image_response(path: PathBuf) -> Result<axum::response::Response
     );
     headers.insert(header::ETAG, tag.parse().unwrap());
     Ok((headers, bytes).into_response())
+}
+
+/// Decode `source` and re-encode it as a JPEG that fits inside `bound`, preserving aspect ratio.
+///
+/// Returns `Ok(None)` when the image already fits, so callers can keep the original bytes instead
+/// of paying a lossy re-encode for nothing. Decode limits are deliberately explicit: provider
+/// artwork is untrusted input and a decompression bomb must not exhaust the process.
+fn encode_bounded_jpeg(source: Vec<u8>, bound: ImageResize) -> anyhow::Result<Option<Vec<u8>>> {
+    use image::GenericImageView as _;
+
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(source)).with_guessed_format()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(16_384);
+    limits.max_image_height = Some(16_384);
+    limits.max_alloc = Some(128 * 1024 * 1024);
+    reader.limits(limits);
+    let image = reader.decode()?;
+    let (width, height) = image.dimensions();
+    if width <= bound.max_width && height <= bound.max_height {
+        return Ok(None);
+    }
+    // `thumbnail` is a fast box filter and visibly softens a large downscale. Lanczos3 is the
+    // right resampler for the ratios here (a 1920px poster to 900px or less) and costs only CPU
+    // on a path that runs once per artwork, not per request.
+    let resized = image
+        .resize(
+            bound.max_width,
+            bound.max_height,
+            image::imageops::FilterType::Lanczos3,
+        )
+        .to_rgb8();
+    let mut output = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut output, STORED_ARTWORK_JPEG_QUALITY)
+        .encode_image(&resized)?;
+    Ok(Some(output))
+}
+
+/// Bounds provider artwork before it becomes a durable cache entry.
+///
+/// The provider returns display-quality originals — measured up to 2.3 MiB each — and storing them
+/// verbatim projected to roughly 316 GiB across this catalogue. A poster-sized JPEG serves every
+/// Jellyfin surface (grid cards bound themselves far below this, and the detail page renders well
+/// under it), so the original is downscaled once at fetch time rather than kept on disk. A decode
+/// failure keeps the provider bytes: artwork that cannot be re-encoded is still better than none.
+async fn bounded_provider_artwork_bytes(bytes: Vec<u8>) -> Vec<u8> {
+    let bound = ImageResize {
+        max_width: PROVIDER_ARTWORK_STORED_MAX_EDGE,
+        max_height: PROVIDER_ARTWORK_STORED_MAX_EDGE,
+    };
+    let original_len = bytes.len();
+    let fallback = bytes.clone();
+    match tokio::task::spawn_blocking(move || encode_bounded_jpeg(bytes, bound)).await {
+        Ok(Ok(Some(encoded))) if encoded.len() < original_len => encoded,
+        Ok(Ok(_)) => fallback,
+        Ok(Err(error)) => {
+            tracing::warn!(
+                ?error,
+                "provider artwork could not be bounded; storing as received"
+            );
+            fallback
+        }
+        Err(error) => {
+            tracing::warn!(?error, "provider artwork resize worker failed");
+            fallback
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ArtworkCompactionReport {
+    pub scanned: u64,
+    pub rewritten: u64,
+    pub failed: u64,
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+}
+
+/// Re-encodes provider artwork that predates the store-time bound.
+///
+/// Entries fetched before that bound existed hold the provider's original — measured at 353 KiB on
+/// average and up to 4.8 MiB, mostly PNG, which is the worst possible container for photographic
+/// posters. Only files above [`ARTWORK_COMPACTION_MIN_BYTES`] are decoded, so a second pass over an
+/// already-compacted cache is a stat-only walk and this stays cheap to run on every boot.
+///
+/// The cache is regenerable: a failure leaves the original in place and the item simply keeps its
+/// larger artwork. User and branding uploads are out of scope because those are operator-supplied
+/// originals rather than a provider cache.
+pub async fn compact_oversized_artwork_cache(cache_dir: &FsPath) -> ArtworkCompactionReport {
+    let bound = ImageResize {
+        max_width: PROVIDER_ARTWORK_STORED_MAX_EDGE,
+        max_height: PROVIDER_ARTWORK_STORED_MAX_EDGE,
+    };
+    let images_root = cache_dir.join("metadata").join("images");
+    let mut report = ArtworkCompactionReport::default();
+    for scope in ARTWORK_COMPACTION_SCOPES {
+        let mut pending = vec![images_root.join(scope)];
+        // Provider artwork nests one owner directory deep; the explicit stack keeps the walk
+        // iterative and refuses to descend a symlinked directory out of the cache.
+        while let Some(directory) = pending.pop() {
+            let Ok(mut entries) = tokio::fs::read_dir(&directory).await else {
+                continue;
+            };
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                let Ok(file_type) = entry.file_type().await else {
+                    continue;
+                };
+                if file_type.is_symlink() {
+                    continue;
+                }
+                if file_type.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if !file_type.is_file() {
+                    continue;
+                }
+                let Ok(metadata) = entry.metadata().await else {
+                    continue;
+                };
+                report.scanned += 1;
+                let original_len = metadata.len();
+                if original_len < ARTWORK_COMPACTION_MIN_BYTES {
+                    continue;
+                }
+                match compact_one_artwork_file(&path, original_len, bound).await {
+                    Ok(Some(new_len)) => {
+                        report.rewritten += 1;
+                        report.bytes_before += original_len;
+                        report.bytes_after += new_len;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        report.failed += 1;
+                        tracing::warn!(?error, "could not compact cached artwork");
+                    }
+                }
+            }
+        }
+    }
+    report
+}
+
+/// Runs artwork cache maintenance for the process lifetime.
+///
+/// Compaction runs once at startup because it only has legacy oversized entries to fix; the quota
+/// then runs on an interval because the cache grows as people browse. Startup is never blocked on
+/// either: the cache is regenerable, so nothing here is on a critical path.
+pub fn spawn_artwork_cache_maintenance(cache_dir: PathBuf) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let report = compact_oversized_artwork_cache(&cache_dir).await;
+        if report.rewritten > 0 || report.failed > 0 {
+            tracing::info!(
+                scanned = report.scanned,
+                rewritten = report.rewritten,
+                failed = report.failed,
+                bytes_before = report.bytes_before,
+                bytes_after = report.bytes_after,
+                "compacted oversized cached artwork"
+            );
+        }
+        loop {
+            let report = enforce_artwork_cache_quota(&cache_dir).await;
+            if report.evicted > 0 || report.truncated {
+                tracing::info!(
+                    scanned = report.scanned,
+                    total_bytes = report.total_bytes,
+                    evicted = report.evicted,
+                    reclaimed_bytes = report.reclaimed_bytes,
+                    truncated = report.truncated,
+                    "evicted least recently used artwork to stay inside the cache budget"
+                );
+            }
+            tokio::time::sleep(ARTWORK_CACHE_QUOTA_INTERVAL).await;
+        }
+    })
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ArtworkCacheEvictionReport {
+    pub scanned: u64,
+    pub total_bytes: u64,
+    pub evicted: u64,
+    pub reclaimed_bytes: u64,
+    pub truncated: bool,
+}
+
+/// Keeps the artwork cache inside its disk budget by dropping the least recently used entries.
+///
+/// Artwork is populated on demand as people browse, so the cache grows with real use rather than
+/// with catalogue size. This is the hard ceiling on that growth. Eviction is by access time — the
+/// filesystem is mounted `relatime`, so serving an entry refreshes it without Jellyrin writing
+/// anything — and drops to a low-water mark so the walk does not run on every tick.
+///
+/// Every entry is regenerable: an evicted poster is fetched again the next time someone opens that
+/// item. Only the provider artwork scopes and the derivative cache are eligible; user and branding
+/// uploads are operator-supplied originals and are never evicted.
+pub async fn enforce_artwork_cache_quota(cache_dir: &FsPath) -> ArtworkCacheEvictionReport {
+    let quota = artwork_cache_quota_bytes();
+    let metadata_root = cache_dir.join("metadata");
+    let mut roots = ARTWORK_COMPACTION_SCOPES
+        .iter()
+        .map(|scope| metadata_root.join("images").join(scope))
+        .collect::<Vec<_>>();
+    roots.push(metadata_root.join("thumbnails"));
+
+    let mut report = ArtworkCacheEvictionReport::default();
+    let mut entries = Vec::new();
+    for root in roots {
+        let mut pending = vec![root];
+        while let Some(directory) = pending.pop() {
+            let Ok(mut dir) = tokio::fs::read_dir(&directory).await else {
+                continue;
+            };
+            while let Ok(Some(entry)) = dir.next_entry().await {
+                let Ok(file_type) = entry.file_type().await else {
+                    continue;
+                };
+                if file_type.is_symlink() {
+                    continue;
+                }
+                if file_type.is_dir() {
+                    pending.push(entry.path());
+                    continue;
+                }
+                if !file_type.is_file() {
+                    continue;
+                }
+                let Ok(metadata) = entry.metadata().await else {
+                    continue;
+                };
+                report.scanned += 1;
+                report.total_bytes += metadata.len();
+                if entries.len() >= ARTWORK_CACHE_MAX_TRACKED_ENTRIES {
+                    // Refuse to grow this list without bound. The pass still reclaims from what it
+                    // did track, and the flag makes the incomplete sweep visible rather than
+                    // letting it look like the cache is inside budget.
+                    report.truncated = true;
+                    continue;
+                }
+                let accessed = metadata
+                    .accessed()
+                    .or_else(|_| metadata.modified())
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
+                entries.push((accessed, metadata.len(), entry.path()));
+            }
+        }
+    }
+    if report.total_bytes <= quota {
+        return report;
+    }
+
+    let low_water = quota / 10 * 9;
+    entries.sort_by_key(|(accessed, _, _)| *accessed);
+    let mut remaining = report.total_bytes;
+    for (_, len, path) in entries {
+        if remaining <= low_water {
+            break;
+        }
+        if tokio::fs::remove_file(&path).await.is_ok() {
+            remaining = remaining.saturating_sub(len);
+            report.evicted += 1;
+            report.reclaimed_bytes += len;
+        }
+    }
+    report
+}
+
+fn artwork_cache_quota_bytes() -> u64 {
+    static QUOTA: OnceLock<u64> = OnceLock::new();
+    *QUOTA.get_or_init(|| {
+        std::env::var("JELLYRIN_ARTWORK_CACHE_MAX_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value >= 256 * 1024 * 1024)
+            .unwrap_or(DEFAULT_ARTWORK_CACHE_MAX_BYTES)
+    })
+}
+
+/// Rewrites one oversized entry as a bounded JPEG, returning its new size when it was replaced.
+async fn compact_one_artwork_file(
+    path: &FsPath,
+    original_len: u64,
+    bound: ImageResize,
+) -> anyhow::Result<Option<u64>> {
+    let source = tokio::fs::read(path).await?;
+    let encoded = tokio::task::spawn_blocking(move || encode_bounded_jpeg(source, bound)).await??;
+    let Some(encoded) = encoded else {
+        return Ok(None);
+    };
+    let encoded_len = encoded.len() as u64;
+    if encoded_len >= original_len {
+        return Ok(None);
+    }
+    let target = path.with_extension("jpg");
+    let temporary = target.with_extension(format!("jpg.tmp.{}", Uuid::new_v4().simple()));
+    tokio::fs::write(&temporary, &encoded).await?;
+    if let Err(error) = tokio::fs::rename(&temporary, &target).await {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return Err(error.into());
+    }
+    // `IMAGE_FORMATS` resolves PNG before JPEG, so removing the superseded original is the step
+    // that publishes the smaller entry. Until it lands the previous artwork stays servable.
+    if path != target {
+        tokio::fs::remove_file(path).await?;
+    }
+    Ok(Some(encoded_len))
+}
+
+/// Return a cached, bounded JPEG derivative when Jellyfin clients request display dimensions.
+///
+/// Originals remain authoritative. Derivatives live under Jellyrin's cache (never beside a user's
+/// media), are keyed by the source path/mtime/size and requested bounds, and are generated under a
+/// single-flight lock so a grid cannot start hundreds of duplicate image decodes.
+async fn stored_image_response_sized(
+    state: &AppState,
+    path: PathBuf,
+    resize: Option<ImageResize>,
+) -> Result<axum::response::Response, ApiError> {
+    let Some(resize) = resize else {
+        return stored_image_response(path).await;
+    };
+    let metadata = tokio::fs::metadata(&path).await?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map(|value| value.as_nanos())
+        .unwrap_or_default();
+    let key = format!(
+        "{}\0{}\0{}\0{}x{}",
+        path.to_string_lossy(),
+        metadata.len(),
+        modified,
+        resize.max_width,
+        resize.max_height
+    );
+    let digest = format!("{:x}", Sha256::digest(key.as_bytes()));
+    let derivative = api_cache_root(&state.log_dir)
+        .join("metadata")
+        .join("thumbnails")
+        .join(&digest[..2])
+        .join(format!("{digest}.jpg"));
+    if tokio::fs::metadata(&derivative)
+        .await
+        .is_ok_and(|value| value.is_file() && value.len() > 0)
+    {
+        return stored_image_response(derivative).await;
+    }
+
+    let image_lock = trickplay_tile_lock(&derivative).await;
+    let _guard = image_lock.lock().await;
+    if tokio::fs::metadata(&derivative)
+        .await
+        .is_ok_and(|value| value.is_file() && value.len() > 0)
+    {
+        return stored_image_response(derivative).await;
+    }
+
+    let source = tokio::fs::read(&path).await?;
+    let encoded = tokio::task::spawn_blocking(move || encode_bounded_jpeg(source, resize))
+        .await
+        .map_err(|error| ApiError::internal(format!("image resize worker failed: {error}")))?;
+
+    let encoded = match encoded {
+        Ok(Some(encoded)) => encoded,
+        Ok(None) => return stored_image_response(path).await,
+        Err(error) => {
+            tracing::warn!(?error, "stored image resize failed; serving original");
+            return stored_image_response(path).await;
+        }
+    };
+    let parent = derivative
+        .parent()
+        .ok_or_else(|| ApiError::internal("thumbnail cache path has no parent"))?;
+    tokio::fs::create_dir_all(parent).await?;
+    let temporary = derivative.with_extension(format!("jpg.tmp.{}", Uuid::new_v4().simple()));
+    tokio::fs::write(&temporary, &encoded).await?;
+    match tokio::fs::rename(&temporary, &derivative).await {
+        Ok(()) => {}
+        Err(error) if tokio::fs::metadata(&derivative).await.is_ok() => {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            tracing::debug!(?error, "thumbnail was published concurrently");
+        }
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(error.into());
+        }
+    }
+    stored_image_response(derivative).await
 }
 
 pub(crate) async fn find_stored_image(
@@ -62505,12 +66128,12 @@ mod tests {
         enrich_media_streams_with_context, ensure_package_install_not_cancelled,
         external_id_infos_for_item_type, ffmpeg_job_allowed_for_mode, ffmpeg_listing_components,
         filter_package_list, format_time_for_json, generate_missing_hls_segment,
-        get_valid_filename, hdhomerun_bool_field, hls_effective_start_position_ticks,
-        hls_event_playlist_required, hls_on_demand_generation_lock,
-        hls_segment_start_position_ticks, hls_segment_ticks, hls_start_segment_number,
-        hls_storage_segment_id, hls_subtitle_language_tag, hls_transcode_dedupe_key,
-        hls_transcode_session_input_path, internal_remote_relay_target, is_live_tv_channel_id,
-        json_string_field, json_value_i64, last_system_lifecycle_command,
+        generated_item_placeholder_response, get_valid_filename, hdhomerun_bool_field,
+        hls_effective_start_position_ticks, hls_event_playlist_required,
+        hls_on_demand_generation_lock, hls_segment_start_position_ticks, hls_segment_ticks,
+        hls_start_segment_number, hls_storage_segment_id, hls_subtitle_language_tag,
+        hls_transcode_dedupe_key, hls_transcode_session_input_path, internal_remote_relay_target,
+        is_live_tv_channel_id, json_string_field, json_value_i64, last_system_lifecycle_command,
         live_hls_session_registry, live_tv_channel_is_remote, live_tv_channel_media_source,
         live_tv_channel_stable_uuid, live_tv_configuration_json, live_tv_guide_info,
         live_tv_hls_transcoding_profile_supported, live_tv_lookup_id,
@@ -62547,6 +66170,22 @@ mod tests {
         xtream_probe_lock_for, xtream_remote_media_probe_current, xtream_remote_source_revision,
         xtream_vod_info_current,
     };
+
+    #[test]
+    fn internal_remote_relay_debug_redacts_plugin_user_context() {
+        let target = InternalRemoteRelayTarget::MediaItem {
+            item_id: Uuid::nil(),
+            user_context: Some(jellyrin_plugin_sdk::PluginUserContext {
+                user_id: "private-user-canary".to_string(),
+                device_id: "private-device-canary".to_string(),
+                is_administrator: false,
+            }),
+        };
+        let debug = format!("{target:?}");
+        assert!(debug.contains("user_context_present: true"));
+        assert!(!debug.contains("private-user-canary"));
+        assert!(!debug.contains("private-device-canary"));
+    }
     use crate::Database;
     use crate::dlna;
     use crate::live_tv_xtream::{
@@ -62556,7 +66195,8 @@ mod tests {
     };
     use axum::{
         body::Body,
-        http::{Method, Request, StatusCode, header},
+        http::{HeaderMap, Method, Request, StatusCode, header},
+        response::IntoResponse,
     };
     use base64::{Engine as _, engine::general_purpose};
     use futures_util::{SinkExt, StreamExt};
@@ -62581,6 +66221,115 @@ mod tests {
     use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn missing_catalog_artwork_is_a_visible_raster_tile() {
+        let item_id = "11111111-2222-3333-4444-555555555555";
+        assert_eq!(
+            super::default_primary_image_tag(item_id),
+            format!("generated-raster-v1-{item_id}"),
+            "the image tag must invalidate the legacy transparent fallback cache"
+        );
+        assert_eq!(
+            super::primary_image_tag_for_metadata(
+                item_id,
+                Some(&serde_json::json!({ "PluginVodImageAvailable": true })),
+            ),
+            format!("provider-raster-v6-{item_id}"),
+            "resolved provider art must have a distinct client cache key"
+        );
+        assert_eq!(
+            super::primary_image_tag_for_metadata(
+                item_id,
+                Some(&serde_json::json!({
+                    "Provider": "plugin:example",
+                    "TunerId": "test-tuner",
+                    "ProviderReference": "provider:v1:item-1"
+                })),
+            ),
+            format!("provider-probe-v5-{item_id}"),
+            "remote plugin art must be requested before its first cache hydration"
+        );
+        let response = generated_item_placeholder_response(item_id, "Primary", 0);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("image/png")
+        );
+        assert!(response.headers().contains_key(header::ETAG));
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(body.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert_eq!(u32::from_be_bytes(body[16..20].try_into().unwrap()), 512);
+        assert_eq!(u32::from_be_bytes(body[20..24].try_into().unwrap()), 512);
+        assert!(
+            body.len() > 1_000,
+            "catalog fallback must not be transparent"
+        );
+    }
+
+    #[test]
+    fn plugin_episode_advertises_its_virtual_series_poster_to_android_tv() {
+        let series_id = Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_8888);
+        let episode = tv_refresh_test_item(
+            42,
+            Uuid::from_u128(7),
+            "Example S01E01",
+            "/Example/Season 01/Example S01E01.mkv",
+            "Video",
+            Some("tvshows"),
+        );
+        let metadata = serde_json::json!({
+            "Provider": "plugin:example",
+            "TunerId": "test-tuner",
+            "ProviderReference": "provider:v1:episode-1",
+            "PluginVodKind": "episode",
+            "SeriesId": series_id.simple().to_string(),
+            "SeriesName": "Example"
+        });
+
+        let value = super::media_item_to_json_with_playback_and_metadata(
+            &episode,
+            "server",
+            None,
+            Some(&metadata),
+        );
+
+        assert_eq!(value["SeriesId"], series_id.simple().to_string());
+        assert_eq!(
+            value["SeriesPrimaryImageTag"],
+            super::primary_image_tag_for_metadata(&series_id.simple().to_string(), Some(&metadata),)
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_http_json_responses_are_gzip_compressed() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/System/Info/Public")
+                    .header(header::ACCEPT_ENCODING, "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_ENCODING).unwrap(),
+            "gzip"
+        );
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(bytes.starts_with(&[0x1f, 0x8b]));
+    }
 
     #[tokio::test]
     async fn live_tv_guide_info_exposes_a_parseable_ordered_utc_window() {
@@ -62822,6 +66571,184 @@ mod tests {
             std::path::PathBuf::from("/var/cache/jellyrin/metadata/images/items/movie-1")
         );
         assert!(!path.starts_with("/var/log"));
+    }
+
+    #[tokio::test]
+    async fn artwork_cache_quota_evicts_least_recently_used_and_spares_user_uploads() {
+        let cache = tempfile::tempdir().expect("temp cache");
+        let images = cache.path().join("metadata").join("images");
+        let items = images.join("items").join("owner");
+        let users = images.join("users").join("owner");
+        for directory in [&items, &users] {
+            tokio::fs::create_dir_all(directory).await.expect("mkdir");
+        }
+        // One byte over the smallest quota the parser accepts, split across three entries.
+        let payload = vec![0_u8; 128 * 1024 * 1024];
+        for name in ["primary_0.jpg", "primary_1.jpg", "primary_2.jpg"] {
+            tokio::fs::write(items.join(name), &payload)
+                .await
+                .expect("write artwork");
+        }
+        tokio::fs::write(users.join("primary_0.jpg"), &payload)
+            .await
+            .expect("write upload");
+        // Make one entry unambiguously the oldest so eviction order is deterministic.
+        let oldest = items.join("primary_0.jpg");
+        let stale = std::fs::File::options()
+            .write(true)
+            .open(&oldest)
+            .expect("open oldest");
+        let long_ago = std::time::SystemTime::UNIX_EPOCH + StdDuration::from_secs(1);
+        stale
+            .set_times(std::fs::FileTimes::new().set_accessed(long_ago))
+            .expect("set access time");
+
+        unsafe { std::env::set_var("JELLYRIN_ARTWORK_CACHE_MAX_BYTES", "268435456") };
+        let report = super::enforce_artwork_cache_quota(cache.path()).await;
+
+        assert!(
+            report.evicted >= 1,
+            "an over-budget cache must reclaim space"
+        );
+        assert!(!report.truncated);
+        assert!(
+            !oldest.exists(),
+            "the least recently used entry must be evicted first"
+        );
+        assert!(
+            users.join("primary_0.jpg").exists(),
+            "operator uploads are not a regenerable cache and must survive"
+        );
+    }
+
+    /// Prints size/quality trade-offs for one real cached poster. Set JELLYRIN_ARTWORK_SAMPLE to a
+    /// file path and run with `--ignored --nocapture` to compare bounds before changing them.
+    #[test]
+    #[ignore = "requires a local artwork sample"]
+    fn artwork_bounds_report_size_for_a_real_poster() {
+        let Ok(sample) = std::env::var("JELLYRIN_ARTWORK_SAMPLE") else {
+            return;
+        };
+        let source = std::fs::read(&sample).expect("sample artwork must be readable");
+        println!("original: {} bytes", source.len());
+        for edge in [640_u32, 720, 900, 1080] {
+            let encoded = super::encode_bounded_jpeg(
+                source.clone(),
+                super::ImageResize {
+                    max_width: edge,
+                    max_height: edge,
+                },
+            )
+            .expect("bounded encode must succeed")
+            .expect("a large poster must be downscaled");
+            println!(
+                "edge {edge:>4}: {:>8} bytes  ({:.1}x smaller)",
+                encoded.len(),
+                source.len() as f64 / encoded.len() as f64
+            );
+        }
+    }
+
+    #[test]
+    fn image_resize_queries_are_bounded_and_catalog_flags_shape_payloads() {
+        assert_eq!(
+            super::ImageResizeQuery {
+                max_width: Some(200),
+                max_height: None,
+                ..super::ImageResizeQuery::default()
+            }
+            .normalized(),
+            Some(super::ImageResize {
+                max_width: 200,
+                max_height: 4096,
+            })
+        );
+        assert_eq!(
+            super::ImageResizeQuery {
+                max_width: Some(99_999),
+                max_height: Some(0),
+                ..super::ImageResizeQuery::default()
+            }
+            .normalized(),
+            Some(super::ImageResize {
+                max_width: 4096,
+                max_height: 4096,
+            })
+        );
+
+        // Jellyfin Web requests grid cards with fillWidth/fillHeight. Ignoring them served the
+        // full-size original for every tile, so they must bound the derivative too.
+        assert_eq!(
+            super::ImageResizeQuery {
+                fill_width: Some(316),
+                fill_height: Some(474),
+                ..super::ImageResizeQuery::default()
+            }
+            .normalized(),
+            Some(super::ImageResize {
+                max_width: 316,
+                max_height: 474,
+            })
+        );
+        // An explicit max bound stays authoritative when a client sends both families.
+        assert_eq!(
+            super::ImageResizeQuery {
+                max_width: Some(200),
+                fill_width: Some(316),
+                fill_height: Some(474),
+                ..super::ImageResizeQuery::default()
+            }
+            .normalized(),
+            Some(super::ImageResize {
+                max_width: 200,
+                max_height: 474,
+            })
+        );
+        assert_eq!(super::ImageResizeQuery::default().normalized(), None);
+
+        let query = super::parse_items_query(Some(
+            "Fields=Overview&EnableImages=false&EnableUserData=false&EnableTotalRecordCount=false",
+        ));
+        let item = super::shape_catalog_item_for_query(
+            json!({
+                "Id": "item",
+                "Name": "Example",
+                "Overview": "kept",
+                "MediaSources": [{ "Path": "removed" }],
+                "ImageTags": { "Primary": "removed" },
+                "UserData": { "Played": false },
+            }),
+            &query,
+        );
+        assert_eq!(item["Overview"], "kept");
+        assert!(item.get("MediaSources").is_none());
+        assert!(item.get("ImageTags").is_none());
+        assert!(item.get("UserData").is_none());
+        assert_eq!(
+            super::query_flag(&query._enable_total_record_count),
+            Some(false)
+        );
+
+        let response = (
+            [
+                (header::ETAG, "thumbnail-tag"),
+                (header::CONTENT_TYPE, "image/jpeg"),
+            ],
+            vec![1_u8, 2, 3],
+        )
+            .into_response();
+        let mut request_headers = HeaderMap::new();
+        request_headers.insert(
+            header::IF_NONE_MATCH,
+            "W/\"other\", \"thumbnail-tag\"".parse().unwrap(),
+        );
+        let response = super::conditional_image_response(&request_headers, response);
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert!(response.headers().get(header::CONTENT_TYPE).is_none());
+        assert_eq!(
+            response.headers().get(header::ETAG).unwrap(),
+            "thumbnail-tag"
+        );
     }
 
     #[test]
@@ -63291,6 +67218,9 @@ mod tests {
         ));
         assert!(!super::external_process_environment_pattern_valid(
             "JELLYRIN_TEST_POSTGRES_URL"
+        ));
+        assert!(!super::external_process_environment_pattern_valid(
+            "JELLYRIN_REDIS_URL"
         ));
         assert!(!super::external_process_environment_pattern_valid(
             "PGPASSWORD"
@@ -65158,7 +69088,11 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             assert!(
                 !relay_registry.values().any(|entry| {
-                    entry.target == super::InternalRemoteRelayTarget::MediaItem(movie_id)
+                    matches!(
+                        &entry.target,
+                        super::InternalRemoteRelayTarget::MediaItem { item_id, .. }
+                            if *item_id == movie_id
+                    )
                 }),
                 "the bounded probe relay lease must be removed after the request completes"
             );
@@ -65256,6 +69190,7 @@ mod tests {
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         json!({
+                            "Id": "vod-tuner-1",
                             "Type": format!("plugin:{plugin_id}"),
                             "PluginId": plugin_id,
                             "FriendlyName": "VOD Tuner",
@@ -65332,6 +69267,7 @@ mod tests {
 
         // The explicit admin refresh re-runs the same import and reports sanitized counts.
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
@@ -65349,7 +69285,82 @@ mod tests {
             counts,
             json!({ "MovieCount": 1, "SeriesCount": 1, "EpisodeCount": 1 })
         );
+
+        super::stage_live_tv_plugin_tuner_credentials(
+            &db,
+            json!({
+                "Id": "vod-tuner-2",
+                "Type": format!("plugin:{plugin_id}"),
+                "PluginId": plugin_id,
+                "FriendlyName": "Second VOD Tuner",
+                "Username": "vod-user-2",
+                "Password": "vod-pass-2"
+            }),
+            &format!("plugin:{plugin_id}"),
+        )
+        .await
+        .unwrap();
+
+        // The explicit refresh imports both tuner instances into one atomic stage.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/Plugins/{plugin_id}/VodLibrary/Refresh"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let counts: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            counts,
+            json!({ "MovieCount": 2, "SeriesCount": 2, "EpisodeCount": 2 })
+        );
+        let folders = db.virtual_folders().await.unwrap();
+        let movies = folders
+            .iter()
+            .find(|folder| folder.name == "VOD Provider Movies")
+            .unwrap();
+        let movie_items = db
+            .media_items_for_virtual_folders(&[movies.id])
+            .await
+            .unwrap();
+        assert_eq!(movie_items.len(), 2);
+        assert!(movie_items.iter().any(|item| item.name == "Movie One"));
+        assert!(movie_items.iter().any(|item| item.name == "Movie Two"));
         super::stop_external_plugin_host(plugin_id).await;
+    }
+
+    #[tokio::test]
+    async fn vod_library_plugin_collects_all_tuner_instances_in_stable_order() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let plugin_id = "55555555-6666-4777-8888-999999999999";
+        db.update_named_configuration(
+            "livetv",
+            json!({
+                "TunerHosts": [
+                    { "Id": "source-z", "Type": format!("plugin:{plugin_id}"), "PluginId": plugin_id },
+                    { "Id": "unrelated", "Type": "m3u" },
+                    { "Id": "source-a", "Type": "plugin", "PluginId": plugin_id },
+                    { "Id": "other-plugin", "Type": "plugin:aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee" }
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+
+        let tuners = super::vod_library_plugin_tuner_configurations(&db, plugin_id)
+            .await
+            .unwrap();
+        let ids = tuners
+            .iter()
+            .map(|tuner| tuner["Id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["source-a", "source-z"]);
     }
 
     #[test]
@@ -65878,6 +69889,158 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     #[serial(plugin_host)]
+    async fn authenticated_plugin_vod_grid_image_progressively_fills_cache_once() {
+        let plugin_id = "66666666-7777-4888-9999-000000000000";
+        let (db, tmp, api_key, movie_id) = prepare_vod_playback_environment(plugin_id).await;
+        let expected_image = test_distinct_png_bytes();
+        let mut proxy_response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            expected_image.len()
+        )
+        .into_bytes();
+        proxy_response.extend_from_slice(&expected_image);
+        let (proxy_endpoint, image_request) = spawn_single_raw_http_response(proxy_response).await;
+        let _proxy_guard =
+            ProviderEgressProxyGuard::set(proxy_endpoint.trim_end_matches("/image").to_string());
+        let image_url = "http://artwork.invalid/channel-image.png".to_string();
+        tokio::fs::write(tmp.path().join("vod-image-url"), &image_url)
+            .await
+            .unwrap();
+        let app = router(AppState {
+            db: db.clone(),
+            web_dir: ".".into(),
+            log_dir: tmp.path().join("logs"),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+        let image_uri = format!("/Items/{}/Images/Primary", movie_id.simple());
+
+        // Public image routes may serve already-cached bytes, but cannot initiate a credentialed
+        // provider call without an authenticated Jellyfin request.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&image_uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let public_body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_ne!(public_body.as_ref(), expected_image.as_slice());
+        let invokes_before = tokio::fs::read_to_string(tmp.path().join("external-invokes"))
+            .await
+            .unwrap();
+        assert_eq!(
+            invokes_before
+                .lines()
+                .filter(|line| line.contains("\"Action\":\"ResolveMetadata\""))
+                .count(),
+            0
+        );
+
+        let movies_folder_id = db
+            .virtual_folders()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|folder| folder.name == "VOD Provider Movies")
+            .expect("VOD movies folder")
+            .id;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items/Latest?ParentId={}&IncludeItemTypes=Movie&Limit=1",
+                        movies_folder_id.simple()
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Jellyfin Web deliberately omits credentials from `<img>` URLs. The authenticated Latest
+        // listing must therefore queue the provider fill before the public image request arrives.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&image_uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let listing_warmed_body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(listing_warmed_body.as_ref(), expected_image.as_slice());
+        let upstream_request = image_request.await.unwrap();
+        assert!(upstream_request.starts_with(&format!("GET {image_url} HTTP/1.1")));
+
+        // A repeat is served from the durable image cache and must not invoke either metadata or
+        // the remote image endpoint again.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&image_uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let cached_body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(cached_body.as_ref(), expected_image.as_slice());
+
+        // Android TV uses the hyphenated UUID in image URLs even when catalogue responses use the
+        // compact Jellyfin form. Both spellings must address the same durable artwork cache entry.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items/{movie_id}/Images/Primary"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let hyphenated_body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(hyphenated_body.as_ref(), expected_image.as_slice());
+        let invokes = tokio::fs::read_to_string(tmp.path().join("external-invokes"))
+            .await
+            .unwrap();
+        assert_eq!(
+            invokes
+                .lines()
+                .filter(|line| line.contains("\"Action\":\"ResolveMetadata\""))
+                .count(),
+            1
+        );
+        let metadata = super::metadata_payload_for_item(&db, movie_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            super::json_field_case_insensitive(&metadata, "PluginVodImageAvailable")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        let metadata_text = serde_json::to_string(&metadata).unwrap();
+        assert!(!metadata_text.contains(&image_url));
+        assert!(!metadata_text.contains("http://"));
+
+        super::stop_external_plugin_host(plugin_id).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial(plugin_host)]
     async fn plugin_vod_playback_resolves_signed_url_and_proxies_mpegts() {
         use std::sync::atomic::Ordering;
 
@@ -65897,10 +70060,15 @@ mod tests {
 
         // The resolver keeps only allowlisted track descriptors and never opens the upstream on
         // its own. Provider URLs and credentials have no field through which to cross.
-        let playback =
-            super::resolve_plugin_vod_playback(&db, plugin_id, "vod-tuner", "provider:v1:movie-1")
-                .await
-                .unwrap();
+        let playback = super::resolve_plugin_vod_playback(
+            &db,
+            plugin_id,
+            "vod-tuner",
+            "provider:v1:movie-1",
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(playback.source_url.expose_secret(), signed_url);
         assert_eq!(playback.media_streams.len(), 4);
         assert_eq!(playback.media_streams[1]["Language"], "spa");
@@ -65974,6 +70142,83 @@ mod tests {
             resolve["Payload"]["Arguments"]["SecretGrant"]["TunerId"],
             "vod-tuner"
         );
+        super::stop_external_plugin_host(plugin_id).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial(plugin_host)]
+    async fn plugin_vod_internal_relay_reuses_one_grant_for_ffmpeg_range_opens() {
+        let plugin_id = "66666666-7777-4888-9999-000000000031";
+        let ts_payload = vec![0x47_u8; 188 * 4];
+        let (upstream_base, _) = start_fixed_ts_upstream(ts_payload.clone()).await;
+        let (db, tmp, _api_key, movie_id) = prepare_vod_playback_environment(plugin_id).await;
+        let signed_url = format!("{upstream_base}/vod/seek.ts?signature=relay-cache-secret");
+        tokio::fs::write(tmp.path().join("vod-source-url"), &signed_url)
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("vod-delivery-mode"), "mpegts")
+            .await
+            .unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let state = AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: tmp.path().join("logs"),
+            local_address: format!("http://{address}"),
+        };
+        let relay = super::register_internal_remote_relay(
+            &state,
+            super::InternalRemoteRelayTarget::MediaItem {
+                item_id: movie_id,
+                user_context: None,
+            },
+            StdDuration::from_secs(60),
+        )
+        .unwrap();
+        let relay_url = relay.url().to_string();
+        let app = router(state);
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        for range in ["bytes=0-187", "bytes=188-375", "bytes=376-563"] {
+            let response = client
+                .get(&relay_url)
+                .header(header::RANGE, range)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.bytes().await.unwrap().as_ref(),
+                ts_payload.as_slice()
+            );
+        }
+
+        let invokes = tokio::fs::read_to_string(tmp.path().join("external-invokes"))
+            .await
+            .unwrap();
+        assert_eq!(
+            invokes
+                .lines()
+                .filter(|line| line.contains("\"Action\":\"ResolvePlayback\""))
+                .count(),
+            1,
+            "one relay lease must reuse one in-memory provider grant across FFmpeg range opens"
+        );
+        assert!(!invokes.contains("relay-cache-secret"));
+
+        drop(relay);
+        server.abort();
         super::stop_external_plugin_host(plugin_id).await;
     }
 
@@ -66172,6 +70417,24 @@ mod tests {
                 detail["MediaSources"][0]["RunTimeTicks"],
                 expected_runtime_ticks
             );
+            let detail_text = serde_json::to_string(&detail).unwrap();
+            for secret in [
+                "signed-vod-secret",
+                "signed-subtitle-secret",
+                "vod-user",
+                "vod-pass",
+                "vod-canary-token-0123456789",
+            ] {
+                assert!(!detail_text.contains(secret), "{detail_text}");
+            }
+            let detail_streams = detail["MediaSources"][0]["MediaStreams"]
+                .as_array()
+                .unwrap();
+            assert_eq!(detail_streams.len(), 4);
+            assert_eq!(detail_streams[1]["Language"], "spa");
+            assert_eq!(detail_streams[2]["Language"], "eng");
+            assert_eq!(detail_streams[3]["Type"], "Subtitle");
+            assert_eq!(detail_streams[3]["Language"], "spa");
             let persisted = db
                 .media_item_by_id_visible(item_id)
                 .await
@@ -66311,6 +70574,21 @@ mod tests {
             movie_id.simple(),
             api_key
         );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Videos/{0}/{0}/Subtitles/3/Stream.srt",
+                        movie_id.simple()
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
         let response = app
             .clone()
             .oneshot(
@@ -66491,6 +70769,7 @@ mod tests {
             plugin_id,
             "missing-tuner",
             "provider:v1:movie-1",
+            None,
         )
         .await
         .expect_err("an unknown tuner must fail closed");
@@ -66506,10 +70785,15 @@ mod tests {
         }
 
         // Unknown provider reference: the plugin is invoked but its error surfaces sanitized.
-        let error =
-            super::resolve_plugin_vod_playback(&db, plugin_id, "vod-tuner", "provider:v1:unknown")
-                .await
-                .expect_err("the fixture rejects unknown provider references");
+        let error = super::resolve_plugin_vod_playback(
+            &db,
+            plugin_id,
+            "vod-tuner",
+            "provider:v1:unknown",
+            None,
+        )
+        .await
+        .expect_err("the fixture rejects unknown provider references");
         assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
         let message = error.error.to_string();
         for secret in [
@@ -69719,10 +74003,24 @@ while IFS= read -r line; do
       printf '%s\n' "$line" >> '__INVOKE_FILE__'
       case "$line" in
         *'"ContinuationToken":"vod-page-2"'*)
-          printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"MediaItems":[{"ItemType":"Episode","ProviderReference":"provider:v1:episode-1","Name":"Pilot","SeriesReference":"provider:v1:series-1","SeriesName":"Show One","SeasonNumber":1,"EpisodeNumber":1}],"EpisodeCount":1}}}\n' "$corr"
+          case "$line" in
+            *'"Id":"vod-tuner-2"'*)
+              printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"MediaItems":[{"ItemType":"Episode","ProviderReference":"provider:v1:episode-2","Name":"Second Pilot","SeriesReference":"provider:v1:series-2","SeriesName":"Show Two","SeasonNumber":1,"EpisodeNumber":1}],"EpisodeCount":1}}}\n' "$corr"
+              ;;
+            *)
+              printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"MediaItems":[{"ItemType":"Episode","ProviderReference":"provider:v1:episode-1","Name":"Pilot","SeriesReference":"provider:v1:series-1","SeriesName":"Show One","SeasonNumber":1,"EpisodeNumber":1}],"EpisodeCount":1}}}\n' "$corr"
+              ;;
+          esac
           ;;
         *'"Action":"ImportMedia"'*)
-          printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"MediaItems":[{"ItemType":"Movie","ProviderReference":"provider:v1:movie-1","Name":"Movie One"},{"ItemType":"Series","ProviderReference":"provider:v1:series-1","Name":"Show One"}],"MovieCount":1,"SeriesCount":1,"ContinuationToken":"vod-page-2","HasMore":true}}}\n' "$corr"
+          case "$line" in
+            *'"Id":"vod-tuner-2"'*)
+              printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"MediaItems":[{"ItemType":"Movie","ProviderReference":"provider:v1:movie-2","Name":"Movie Two"},{"ItemType":"Series","ProviderReference":"provider:v1:series-2","Name":"Show Two"}],"MovieCount":1,"SeriesCount":1,"ContinuationToken":"vod-page-2","HasMore":true}}}\n' "$corr"
+              ;;
+            *)
+              printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"MediaItems":[{"ItemType":"Movie","ProviderReference":"provider:v1:movie-1","Name":"Movie One"},{"ItemType":"Series","ProviderReference":"provider:v1:series-1","Name":"Show One"}],"MovieCount":1,"SeriesCount":1,"ContinuationToken":"vod-page-2","HasMore":true}}}\n' "$corr"
+              ;;
+          esac
           ;;
         *'"Action":"ImportChannels"'*)
           printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"Channels":[{"Id":"one","Name":"One","ProviderReference":"provider:v1:one"}],"Categories":[{"Id":"all","Name":"All"}]}}}\n' "$corr"
@@ -69799,10 +74097,20 @@ while IFS= read -r line; do
         *'"Action":"ResolveMetadata"'*)
           case "$line" in
             *'"ProviderReference":"provider:v1:movie-1"'*)
-              printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"Status":"Executed","Metadata":{"Overview":"Movie metadata","RuntimeTicks":54000000000}}}}\n' "$corr"
+              image_url="$(cat '__IMAGE_URL_FILE__' 2>/dev/null)"
+              if [ -n "$image_url" ]; then
+                printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"Status":"Executed","Metadata":{"Overview":"Movie metadata","RuntimeTicks":54000000000,"ImageUrl":"%s"}}}}\n' "$corr" "$image_url"
+              else
+                printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"Status":"Executed","Metadata":{"Overview":"Movie metadata","RuntimeTicks":54000000000}}}}\n' "$corr"
+              fi
               ;;
             *'"ProviderReference":"provider:v1:episode-1"'*)
-              printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"Status":"Executed","Metadata":{"Overview":"Episode metadata","RuntimeTicks":27000000000}}}}\n' "$corr"
+              image_url="$(cat '__IMAGE_URL_FILE__' 2>/dev/null)"
+              if [ -n "$image_url" ]; then
+                printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"Status":"Executed","Metadata":{"Overview":"Episode metadata","RuntimeTicks":27000000000,"ImageUrl":"%s"}}}}\n' "$corr" "$image_url"
+              else
+                printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"Status":"Executed","Metadata":{"Overview":"Episode metadata","RuntimeTicks":27000000000}}}}\n' "$corr"
+              fi
               ;;
             *)
               printf '{"ProtocolVersion":1,"CorrelationId":"%s","Ok":true,"Result":{"Value":{"Status":"Failed","Error":"unknown provider reference"}}}\n' "$corr"
@@ -69891,6 +74199,10 @@ done
         .replace(
             "__SUBTITLE_URL_FILE__",
             &root.join("vod-subtitle-url").to_string_lossy(),
+        )
+        .replace(
+            "__IMAGE_URL_FILE__",
+            &root.join("vod-image-url").to_string_lossy(),
         );
         tokio::fs::write(&path, script).await.unwrap();
         let mut permissions = tokio::fs::metadata(&path).await.unwrap().permissions();
@@ -70182,12 +74494,46 @@ done
         ]
     }
 
+    fn test_distinct_png_bytes() -> Vec<u8> {
+        let image = image::RgbaImage::from_pixel(2, 1, image::Rgba([220, 40, 60, 255]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        bytes.into_inner()
+    }
+
     // These guards mutate process-global statics (TEST_RUST_WASI_HOST_BINARY_PATH and
     // TEST_DOTNET_HOST_BINARY_PATH).  Tests that set them carry #[serial(plugin_host)] so
     // they never run concurrently; without serialisation concurrent tests can read a
     // neighbour's host path and fail with assertion or 500 errors.
     struct RustWasiHostPathGuard {
         previous: Option<PathBuf>,
+    }
+
+    struct ProviderEgressProxyGuard {
+        previous: Option<String>,
+    }
+
+    impl ProviderEgressProxyGuard {
+        fn set(proxy: String) -> Self {
+            let mut configured = super::TEST_PROVIDER_EGRESS_PROXY
+                .get_or_init(|| std::sync::Mutex::new(None))
+                .lock()
+                .expect("test provider egress proxy lock poisoned");
+            Self {
+                previous: configured.replace(proxy),
+            }
+        }
+    }
+
+    impl Drop for ProviderEgressProxyGuard {
+        fn drop(&mut self) {
+            *super::TEST_PROVIDER_EGRESS_PROXY
+                .get_or_init(|| std::sync::Mutex::new(None))
+                .lock()
+                .expect("test provider egress proxy lock poisoned") = self.previous.take();
+        }
     }
 
     impl RustWasiHostPathGuard {
@@ -74282,7 +78628,10 @@ done
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["FileName"], "clientlog.log");
         let client_log = std::fs::read_to_string(log_dir.join("clientlog.log")).unwrap();
         assert!(client_log.contains("client failed"));
         assert!(client_log.contains(user.id.simple().to_string().as_str()));
@@ -74306,7 +78655,10 @@ done
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["FileName"], "clientlog.log");
         let client_log = std::fs::read_to_string(log_dir.join("clientlog.log")).unwrap();
         let uploaded_log: Value = serde_json::from_str(client_log.lines().last().unwrap()).unwrap();
         assert_eq!(
@@ -78753,6 +83105,10 @@ done
         assert_eq!(fallback_programs["Items"][0]["ChannelName"], "News HD");
         assert_eq!(fallback_programs["Items"][0]["IsLive"], true);
         assert_eq!(fallback_programs["Items"][0]["IsNews"], true);
+        assert_eq!(
+            fallback_programs["Items"][0]["RunTimeTicks"],
+            864_000_000_000_i64
+        );
         let fallback_program_id = fallback_programs["Items"][0]["Id"].as_str().unwrap();
 
         let response = app
@@ -88098,10 +92454,7 @@ done
         session_id: &str,
     ) -> Value {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        loop {
-            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
-                break;
-            };
+        while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
             let event = tokio::time::timeout(remaining, receiver.recv())
                 .await
                 .unwrap_or_else(|_| {
@@ -90263,6 +94616,90 @@ done
     }
 
     #[tokio::test]
+    async fn live_tv_items_return_empty_sidecars_instead_of_not_found() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("live-sidecar-user".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "live-sidecar-key")
+            .await
+            .unwrap();
+
+        let mut config = default_live_tv_configuration();
+        config["TunerHosts"] = serde_json::json!([{
+            "Id": "live-sidecar-tuner",
+            "FriendlyName": "Live sidecar tuner",
+            "Type": "m3u",
+            "Url": "http://127.0.0.1/live.m3u",
+            "Channels": [{
+                "Id": "live-sidecar-channel",
+                "Name": "Live sidecar channel",
+                "Number": "1",
+                "Path": "http://127.0.0.1/live.ts",
+                "ChannelType": "TV"
+            }]
+        }]);
+        db.update_named_configuration("livetv", live_tv_configuration_json(config))
+            .await
+            .unwrap();
+
+        let channel_id = crate::live_tv_channel_public_id("live-sidecar-channel");
+        let user_id = user.id.simple().to_string();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: ".".into(),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        for endpoint in [
+            format!("/Items/{channel_id}/Intros"),
+            format!("/Users/{user_id}/Items/{channel_id}/Intros"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let result: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(result["Items"], serde_json::json!([]));
+            assert_eq!(result["TotalRecordCount"], 0);
+            assert_eq!(result["StartIndex"], 0);
+        }
+
+        for endpoint in [
+            format!("/Items/{channel_id}/LocalTrailers"),
+            format!("/Items/{channel_id}/SpecialFeatures"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let result: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(result, serde_json::json!([]));
+        }
+    }
+
+    #[tokio::test]
     async fn library_mediafolders_physicalpaths_and_refresh_scan() {
         let tmp = tempfile::tempdir().unwrap();
         let storage_root = tempfile::tempdir().unwrap();
@@ -90614,6 +95051,9 @@ done
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let theme_media: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(theme_media["ThemeSongsResult"]["OwnerId"], item_id);
+        assert_eq!(theme_media["ThemeVideosResult"]["OwnerId"], item_id);
+        assert_eq!(theme_media["SoundtrackSongsResult"]["OwnerId"], item_id);
         assert_eq!(theme_media["ThemeSongsResult"]["TotalRecordCount"], 2);
         assert_eq!(theme_media["ThemeSongsResult"]["Items"][0]["Name"], "theme");
         assert_eq!(
@@ -90718,6 +95158,7 @@ done
             let body = response.into_body().collect().await.unwrap().to_bytes();
             let theme_items: Value = serde_json::from_slice(&body).unwrap();
             let expected_total = if media_type == "Audio" { 2 } else { 1 };
+            assert_eq!(theme_items["OwnerId"], item_id);
             assert_eq!(theme_items["TotalRecordCount"], expected_total);
             assert_eq!(theme_items["Items"][0]["Name"], "theme");
             assert_eq!(theme_items["Items"][0]["MediaType"], media_type);
@@ -90939,6 +95380,119 @@ done
         assert_eq!(ratings[0]["Name"], "Unrated");
         assert_eq!(ratings[43]["Name"], "TV-MA");
         assert_eq!(ratings[43]["Value"], 17);
+    }
+
+    /// Characterize what a bare `ParentId` browse returns for a TV library.
+    ///
+    /// This pins current behaviour rather than desired behaviour. The shape returns every episode
+    /// row in the folder *plus* a synthesized Folder node and a Series and Season node per series,
+    /// so its response grows with the episode count: a library holding 460k episodes is asked for
+    /// ~470k items in one response. That is why the bounded catalogue repository deliberately
+    /// declines this shape (`media_catalog_query_for_items` requires an explicit page size) and why
+    /// narrowing the source alone cannot make it affordable. Any future redesign has to page the
+    /// union of persisted rows and synthesized nodes; this test is the baseline it must preserve.
+    #[tokio::test]
+    // Creating a library bumps the process-wide DLNA content-directory counter, which other tests
+    // assert on exactly. Share the serialization key the neighbouring library tests already use.
+    #[serial(playback_events)]
+    async fn bare_parent_browse_on_tv_library_returns_every_episode_and_synthesized_nodes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage_root = tempfile::tempdir().unwrap();
+        let season = tmp.path().join("Show One").join("Season 01");
+        tokio::fs::create_dir_all(&season).await.unwrap();
+        let season_two = tmp.path().join("Show Two").join("Season 01");
+        tokio::fs::create_dir_all(&season_two).await.unwrap();
+        // Distinct byte lengths: the scanner identifies items by size, so equal-sized fixtures
+        // collapse into a single row and would misrepresent what this shape returns.
+        for (index, (dir, episode)) in [
+            (&season, "Show One S01E01.mkv"),
+            (&season, "Show One S01E02.mkv"),
+            (&season_two, "Show Two S01E01.mkv"),
+            (&season_two, "Show Two S01E02.mkv"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            tokio::fs::write(dir.join(episode), vec![b'v'; 1_024 + index])
+                .await
+                .unwrap();
+        }
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        let user_id = user.id.simple().to_string();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: storage_root.path().join("logs"),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Library/VirtualFolders?name=Shows&collectionType=tvshows&paths={}",
+                        tmp.path().to_string_lossy()
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let json_for = |uri: String| {
+            let app = app.clone();
+            let api_key = api_key.clone();
+            async move {
+                let response = app
+                    .oneshot(
+                        Request::builder()
+                            .uri(uri)
+                            .header("X-Emby-Token", &api_key)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                serde_json::from_slice::<Value>(
+                    &response.into_body().collect().await.unwrap().to_bytes(),
+                )
+                .unwrap()
+            }
+        };
+
+        // Only the persisted episode rows exist without a parent scope.
+        let all = json_for(format!("/Users/{user_id}/Items")).await;
+        assert_eq!(all["TotalRecordCount"], 4);
+        let parent_id = all["Items"][0]["ParentId"].as_str().unwrap().to_string();
+
+        let bare = json_for(format!("/Users/{user_id}/Items?ParentId={parent_id}")).await;
+        let mut counts = BTreeMap::<String, usize>::new();
+        for item in bare["Items"].as_array().unwrap() {
+            *counts
+                .entry(item["Type"].as_str().unwrap().to_string())
+                .or_default() += 1;
+        }
+        // Every episode survives alongside one Series and one Season node per series, plus the
+        // physical folder: the response is the whole folder, not a page of it.
+        assert_eq!(bare["TotalRecordCount"], 9);
+        assert_eq!(counts.get("Episode").copied(), Some(4));
+        assert_eq!(counts.get("Series").copied(), Some(2));
+        assert_eq!(counts.get("Season").copied(), Some(2));
+        assert_eq!(counts.get("Folder").copied(), Some(1));
     }
 
     #[tokio::test]
@@ -93743,7 +98297,10 @@ done
         assert_eq!(ancestors.as_array().unwrap().len(), 2);
         assert_eq!(ancestors[0]["Id"], parent_id);
         assert_eq!(ancestors[0]["Type"], "CollectionFolder");
-        assert_eq!(ancestors[0]["ImageTags"]["Primary"], "placeholder");
+        assert_eq!(
+            ancestors[0]["ImageTags"]["Primary"],
+            super::generated_folder_primary_image_tag(parent_id)
+        );
         assert_eq!(ancestors[0]["ParentId"], ancestors[1]["Id"]);
         assert_eq!(ancestors[1]["Type"], "Folder");
 
@@ -96017,7 +100574,10 @@ done
                         json!({ "Type": "Video", "Index": 0, "Codec": "h264" }),
                         json!({ "Type": "Subtitle", "Index": 1, "Language": "spa" }),
                     ],
-                    metadata: json!({ "Overview": "Beta overview" }),
+                    metadata: json!({
+                        "Overview": "Beta overview",
+                        "People": [{ "Name": "Catalog Person", "Role": "Tester" }]
+                    }),
                 },
             ],
         )
@@ -96063,6 +100623,31 @@ done
                 .sort
                 .iter()
                 .all(|(_, direction)| *direction == jellyrin_db::SortDirection::Descending)
+        );
+        let wholphin_sorts = super::media_catalog_query_for_items(
+            &super::parse_items_query(Some(
+                "Limit=25&SortBy=PremiereDate,SeriesSortName,AiredEpisodeOrder&SortOrder=Descending,Ascending,Descending&IncludeItemTypes=Episode",
+            )),
+            Some(user.id),
+        )
+        .unwrap()
+        .expect("Wholphin episode shelves should use database paging");
+        assert_eq!(
+            wholphin_sorts.sort,
+            vec![(
+                jellyrin_db::MediaItemCatalogSortField::PremiereDate,
+                jellyrin_db::SortDirection::Descending,
+            )]
+        );
+        let mut plugin_series = super::parse_items_query(Some(
+            "Limit=25&SortBy=CommunityRating&SortOrder=Descending&IncludeItemTypes=Series",
+        ));
+        plugin_series.allowed_plugin_tuner_ids = Some(vec!["test-tuner".to_string()]);
+        assert!(
+            super::media_catalog_query_for_items(&plugin_series, Some(user.id))
+                .unwrap()
+                .is_some(),
+            "plugin Series anchors must not fall back to a catalogue-wide scan"
         );
         let genre_query = super::media_catalog_query_for_items(
             &super::parse_items_query(Some("GenreIds=Drama,genre-id&Limit=10")),
@@ -96300,6 +100885,33 @@ done
         assert_eq!(fallback["Items"][0]["Id"], beta_id);
         assert_eq!(fallback["Items"][0]["UserData"]["Played"], true);
 
+        // Wholphin hydrates a detail page's people with an exact Ids lookup and no Limit. People
+        // are projected metadata facets, not media rows; this request must stay bounded in SQL
+        // and still return the synthetic entity rather than scanning the complete catalogue.
+        let person_id = stable_entity_id("Person", "Catalog Person");
+        let cached_person = super::recent_metadata_entity(&person_id)
+            .expect("rendering the catalogue page should retain its synthetic person entity");
+        assert_eq!(cached_person.name, "Catalog Person");
+        assert_eq!(cached_person.item_type, "Person");
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items?Ids={person_id}"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let exact_ids: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(exact_ids["TotalRecordCount"], 1);
+        assert_eq!(exact_ids["Items"][0]["Id"], person_id);
+        assert_eq!(exact_ids["Items"][0]["Name"], "Catalog Person");
+        assert_eq!(exact_ids["Items"][0]["Type"], "Person");
+
         let response = app
             .oneshot(
                 Request::builder()
@@ -96430,6 +101042,50 @@ done
         })
         .await
         .unwrap();
+
+        let persisted_series = db
+            .replace_remote_media_library_snapshot(
+                "Plugin Series",
+                "tvshows",
+                "plugin-vod://catalog-parent-fast-path",
+                vec![RemoteMediaItemUpsert {
+                    id: stable_entity_id("catalog-parent-fast-path", "plugin-series"),
+                    name: "Persisted Plugin Series".to_string(),
+                    path: "plugin-vod://catalog-parent-fast-path/series".to_string(),
+                    media_type: "Series".to_string(),
+                    collection_type: "tvshows".to_string(),
+                    runtime_ticks: None,
+                    bitrate: None,
+                    width: None,
+                    height: None,
+                    media_streams: Vec::new(),
+                    metadata: json!({
+                        "PluginVodKind": "series",
+                        "CommunityRating": 8.5
+                    }),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let persisted_series_query = super::parse_items_query(Some(&format!(
+            "ParentId={}&IncludeItemTypes=Series&Limit=20&SortBy=CommunityRating&SortOrder=Descending&EnableTotalRecordCount=false",
+            persisted_series.id.simple()
+        )));
+        let persisted_series_mapping = super::resolved_media_catalog_query_for_items(
+            &db,
+            &persisted_series_query,
+            Some(user.id),
+        )
+        .await
+        .unwrap()
+        .expect("a plugin VOD Series shelf should use SQL even without an authorization filter");
+        assert_eq!(
+            persisted_series_mapping.virtual_folder_ids,
+            vec![persisted_series.id]
+        );
+        assert!(persisted_series_mapping.allowed_plugin_tuner_ids.is_none());
+        let persisted_series_id = persisted_series.id.simple().to_string();
 
         let direct_query = super::parse_items_query(Some(&format!(
             "ParentId={}&IncludeItemTypes=Movie&Limit=10&Recursive=false",
@@ -96575,6 +101231,27 @@ done
         });
         let parent_id = parent.id.simple();
         let user_id = user.id.simple();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items/Latest?ParentId={persisted_series_id}&Fields=Overview&Fields=CanDelete&ImageTypeLimit=1&Limit=25&GroupItems=true"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let latest: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(latest.as_array().map(Vec::len), Some(1));
+        assert_eq!(latest[0]["Type"], "Series");
+        assert_eq!(latest[0]["IsFolder"], true);
+        assert_eq!(latest[0]["MediaType"], "Video");
+
         let response = app
             .clone()
             .oneshot(
@@ -97266,6 +101943,26 @@ done
             .oneshot(
                 Request::builder()
                     .uri(format!(
+                        "/shows/nextup?UserId={}&Limit=1&EnableTotalRecordCount=false",
+                        user.id
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let next_up_without_total: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(next_up_without_total["TotalRecordCount"], 0);
+        assert_eq!(next_up_without_total["Items"].as_array().unwrap().len(), 1);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
                         "/shows/nextup?UserId={}&SeriesId={series_id}&Limit=10",
                         user.id
                     ))
@@ -97354,6 +102051,61 @@ done
             .oneshot(
                 Request::builder()
                     .uri(format!(
+                        "/Items?ParentId={series_id}&Recursive=false&IncludeItemTypes=Season&StartIndex=0&Limit=20&SortBy=IndexNumber&EnableUserData=false&EnableTotalRecordCount=true&EnableImages=true"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let item_seasons: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(item_seasons["TotalRecordCount"], 1);
+        assert_eq!(item_seasons["Items"][0]["Id"], season_id);
+        assert_eq!(item_seasons["Items"][0]["Type"], "Season");
+        assert_eq!(item_seasons["Items"][0]["ChildCount"], 3);
+
+        let hyphenated_series_id = parse_jellyfin_uuid(series_id)
+            .unwrap()
+            .hyphenated()
+            .to_string();
+        let hyphenated_season_id = parse_jellyfin_uuid(season_id)
+            .unwrap()
+            .hyphenated()
+            .to_string();
+        for endpoint in [
+            format!("/Items/{hyphenated_series_id}/ThemeSongs?InheritFromParent=false"),
+            format!("/Items/{hyphenated_season_id}/SpecialFeatures"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(&endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let empty: Value = serde_json::from_slice(&body).unwrap();
+            if let Some(items) = empty.as_array() {
+                assert!(items.is_empty(), "{endpoint}");
+            } else {
+                assert_eq!(empty["TotalRecordCount"], 0, "{endpoint}");
+                assert!(empty["Items"].as_array().unwrap().is_empty(), "{endpoint}");
+            }
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
                         "/shows/{series_id}/episodes?UserId={}&SeasonId={season_id}",
                         user.id
                     ))
@@ -97378,6 +102130,59 @@ done
         assert_eq!(
             episodes_result["Items"][2]["Id"],
             third.id.simple().to_string()
+        );
+
+        // Android TV loads additional series-detail rows through generic `/Items` pagination.
+        // This must stay scoped to the one series rather than falling back to the full catalogue.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items?StartIndex=1&Limit=1&ParentId={series_id}&Fields=MediaSources&Fields=MediaStreams&Fields=Overview&IncludeItemTypes=Episode&EnableTotalRecordCount=true&EnableImages=true"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let generic_episodes: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(generic_episodes["TotalRecordCount"], 3);
+        assert_eq!(generic_episodes["StartIndex"], 1);
+        assert_eq!(generic_episodes["Items"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            generic_episodes["Items"][0]["Id"],
+            second.id.simple().to_string()
+        );
+        assert_eq!(generic_episodes["Items"][0]["Type"], "Episode");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items?StartIndex=1&Limit=1&ParentId={season_id}&Fields=MediaSources&Fields=MediaStreams&Fields=Overview&IncludeItemTypes=Episode&EnableTotalRecordCount=true&EnableImages=true"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let season_episodes: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(season_episodes["TotalRecordCount"], 3);
+        assert_eq!(season_episodes["StartIndex"], 1);
+        assert_eq!(season_episodes["Items"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            season_episodes["Items"][0]["Id"],
+            second.id.simple().to_string()
         );
 
         for (endpoint, expected_id, expected_start_index) in [
@@ -97445,6 +102250,218 @@ done
         assert_eq!(upcoming["Items"][0]["Id"], third.id.simple().to_string());
         assert_eq!(upcoming["Items"][0]["Type"], "Episode");
         assert_eq!(upcoming["Items"][0]["IndexNumber"], 3);
+    }
+
+    #[tokio::test]
+    async fn plugin_series_anchor_id_resolves_to_its_canonical_series_for_seasons() {
+        let storage = tempfile::tempdir().unwrap();
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "plugin-series-anchor-seasons-key")
+            .await
+            .unwrap();
+        let anchor_id = stable_entity_id("plugin-series-anchor", "public-item");
+        let canonical_series_id = stable_entity_id("plugin-series-anchor", "provider-series");
+        let season_id = stable_entity_id("plugin-series-anchor", "provider-season-1");
+        let mut items = vec![RemoteMediaItemUpsert {
+            id: anchor_id.clone(),
+            name: "Anchored Show".to_string(),
+            path: "plugin-vod://anchor-test/series".to_string(),
+            media_type: "Series".to_string(),
+            collection_type: "tvshows".to_string(),
+            runtime_ticks: None,
+            bitrate: None,
+            width: None,
+            height: None,
+            media_streams: Vec::new(),
+            metadata: json!({
+                "PluginVodKind": "series",
+                "SeriesId": canonical_series_id,
+                "SeriesName": "Anchored Show"
+            }),
+        }];
+        for episode_number in 1..=2 {
+            items.push(RemoteMediaItemUpsert {
+                id: stable_entity_id("plugin-series-anchor", &format!("episode-{episode_number}")),
+                name: format!("Anchored Show S01E{episode_number:02}"),
+                path: format!("plugin-vod://anchor-test/series/episode-{episode_number}"),
+                media_type: "Video".to_string(),
+                collection_type: "tvshows".to_string(),
+                runtime_ticks: Some(600_000_000),
+                bitrate: Some(1_000_000),
+                width: Some(1280),
+                height: Some(720),
+                media_streams: Vec::new(),
+                metadata: json!({
+                    "PluginVodKind": "episode",
+                    "SeriesId": canonical_series_id,
+                    "SeriesName": "Anchored Show",
+                    "SeasonId": season_id,
+                    "ParentIndexNumber": 1,
+                    "IndexNumber": episode_number
+                }),
+            });
+        }
+        db.replace_remote_media_library_snapshot(
+            "Anchor Test",
+            "tvshows",
+            "plugin-vod://anchor-test",
+            items,
+        )
+        .await
+        .unwrap();
+        let state = AppState {
+            db: db.clone(),
+            web_dir: ".".into(),
+            log_dir: storage.path().join("logs"),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        };
+        let expected_image = test_distinct_png_bytes();
+        super::store_image_bytes(
+            &state,
+            super::ImageOwner::Item(&anchor_id),
+            "Primary",
+            0,
+            expected_image.clone(),
+        )
+        .await
+        .unwrap();
+        let app = router(state);
+
+        for endpoint in [
+            format!(
+                "/Items?ParentId={anchor_id}&Recursive=false&IncludeItemTypes=Season&StartIndex=0&Limit=20&SortBy=IndexNumber&EnableUserData=true&EnableTotalRecordCount=true&EnableImages=true"
+            ),
+            format!("/Shows/{anchor_id}/Seasons?UserId={}", user.id),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(&endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            let seasons: Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(seasons["TotalRecordCount"], 1, "{endpoint}");
+            assert_eq!(seasons["Items"][0]["Type"], "Season", "{endpoint}");
+            assert_eq!(seasons["Items"][0]["ChildCount"], 2, "{endpoint}");
+            assert_eq!(
+                seasons["Items"][0]["SeriesName"], "Anchored Show",
+                "{endpoint}"
+            );
+            assert_eq!(
+                seasons["Items"][0]["SeriesId"], canonical_series_id,
+                "{endpoint}"
+            );
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Shows/NextUp?UserId={}&SeriesId={anchor_id}&Limit=10",
+                        user.id
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let next_up: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(next_up["TotalRecordCount"], 1);
+        assert_eq!(next_up["Items"][0]["Type"], "Episode");
+        assert_eq!(next_up["Items"][0]["SeriesId"], canonical_series_id);
+
+        for endpoint in [
+            format!("/Items/{anchor_id}/SpecialFeatures"),
+            format!("/Items/{anchor_id}/ThemeSongs?InheritFromParent=false"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(&endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            let body: Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            if let Some(items) = body.as_array() {
+                assert!(items.is_empty(), "{endpoint}");
+            } else {
+                assert_eq!(body["TotalRecordCount"], 0, "{endpoint}");
+                assert!(body["Items"].as_array().unwrap().is_empty(), "{endpoint}");
+            }
+        }
+
+        // Jellyfin Web opens a season through its item-detail routes after loading the season
+        // list. A canonical SeasonId must be classified as a season before the synthetic-series
+        // fallback and must trust the imported numbering instead of parsing the opaque path.
+        for endpoint in [
+            format!("/Items/{season_id}"),
+            format!("/Users/{}/Items/{season_id}", user.id),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(&endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            let detail: Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(detail["Type"], "Season", "{endpoint}");
+            assert_eq!(detail["Name"], "Season 1", "{endpoint}");
+            assert_eq!(detail["IndexNumber"], 1, "{endpoint}");
+            assert_eq!(detail["ChildCount"], 2, "{endpoint}");
+            assert_eq!(detail["SeriesName"], "Anchored Show", "{endpoint}");
+        }
+
+        let image_response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items/{season_id}/Images/Primary"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(image_response.status(), StatusCode::OK);
+        let image_body = image_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(image_body.as_ref(), expected_image.as_slice());
     }
 
     #[tokio::test]
@@ -97695,6 +102712,33 @@ done
         assert_eq!(seasons["Items"][0]["UserData"]["UnplayedItemCount"], 1);
         assert_eq!(seasons["Items"][0]["Overview"], "Inline metadata");
 
+        // Wholphin loads a series' seasons through the generic Items endpoint. Synthetic series
+        // ids must use the bounded no-canonical-SeriesId fallback instead of scanning all TV rows.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items?StartIndex=0&Limit=20&Recursive=false&ParentId={series_id}&Fields=PrimaryImageAspectRatio&Fields=CanDelete&IncludeItemTypes=Season&SortBy=IndexNumber&EnableUserData=true&EnableTotalRecordCount=true&EnableImages=true"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let wholphin_seasons: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(wholphin_seasons["TotalRecordCount"], 1);
+        assert_eq!(wholphin_seasons["Items"][0]["Type"], "Season");
+        assert_eq!(wholphin_seasons["Items"][0]["ChildCount"], 2);
+        assert_eq!(
+            wholphin_seasons["Items"][0]["UserData"]["ItemId"],
+            wholphin_seasons["Items"][0]["Id"]
+        );
+
         let response = app
             .oneshot(
                 Request::builder()
@@ -97898,6 +102942,7 @@ done
         );
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/Items/Filters2?IncludeItemTypes=Movie,Series")
@@ -97926,6 +102971,24 @@ done
                 { "Name": "French", "Value": "fra" }
             ])
         );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/Genres?IncludeItemTypes=Movie,Series")
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let genres: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(genres["TotalRecordCount"], 2);
+        assert_eq!(genres["Items"][0]["Name"], "Movie Genre");
+        assert_eq!(genres["Items"][1]["Name"], "Series Genre");
     }
 
     #[tokio::test]
@@ -98251,6 +103314,14 @@ done
         assert_eq!(result["Items"].as_array().unwrap().len(), 1);
         assert_eq!(result["Items"][0]["Name"], "Needle Other");
         assert_eq!(result["Items"][0]["Type"], "Genre");
+        assert_eq!(
+            result["Items"][0]["UserData"]["Key"],
+            result["Items"][0]["Id"]
+        );
+        assert_eq!(
+            result["Items"][0]["UserData"]["ItemId"],
+            result["Items"][0]["Id"]
+        );
 
         for (endpoint, expected_name, expected_type) in [
             (
@@ -98291,6 +103362,14 @@ done
             assert_eq!(result["TotalRecordCount"], 1, "{endpoint}");
             assert_eq!(result["Items"][0]["Name"], expected_name, "{endpoint}");
             assert_eq!(result["Items"][0]["Type"], expected_type, "{endpoint}");
+            assert_eq!(
+                result["Items"][0]["UserData"]["Key"], result["Items"][0]["Id"],
+                "{endpoint}"
+            );
+            assert_eq!(
+                result["Items"][0]["UserData"]["ItemId"], result["Items"][0]["Id"],
+                "{endpoint}"
+            );
         }
 
         let other_id = other_folder.id.simple();
@@ -100977,12 +106056,199 @@ done
     }
 
     #[test]
+    fn generated_live_tv_tile_is_memoized_per_tag() {
+        let item = json!({});
+        let etag = |response: &axum::response::Response| {
+            response
+                .headers()
+                .get(header::ETAG)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        };
+
+        let first = super::live_tv_generated_image_response(&item, "item-a", "http://host/a.png");
+        let key = super::live_tv_image_tag("item-a", "http://host/a.png");
+        assert!(
+            super::live_tv_generated_image_cache()
+                .lock()
+                .unwrap()
+                .contains_key(&key),
+            "the rasterized tile is retained for the next request"
+        );
+
+        // Same tag, same tile: the second request must not rasterize again to answer identically.
+        let second = super::live_tv_generated_image_response(&item, "item-a", "http://host/a.png");
+        assert_eq!(etag(&first), etag(&second));
+        assert_eq!(etag(&first), Some(key));
+
+        // A different item still gets its own tile.
+        let other = super::live_tv_generated_image_response(&item, "item-b", "http://host/a.png");
+        assert_ne!(etag(&first), etag(&other));
+    }
+
+    #[test]
+    fn unnumbered_season_presented_as_first_keeps_a_reachable_id() {
+        let mut seasons = BTreeMap::new();
+        seasons.insert(None, super::TvSeasonSummary::new(None));
+        super::present_unnumbered_season_as_first(&mut seasons, "Show One");
+
+        let summary = seasons
+            .remove(&Some(1))
+            .expect("the lone unnumbered season is presented as season one");
+        assert_eq!(summary.season_number, Some(1));
+        // The episodes still parse as unnumbered, so the advertised id has to stay the one
+        // `tv_episode_matches_season` derives; the numbered id would resolve no episode.
+        assert_eq!(
+            summary.id.as_deref(),
+            Some(super::tv_season_id("Show One", None).as_str())
+        );
+        assert_ne!(
+            summary.id.as_deref(),
+            Some(super::tv_season_id("Show One", Some(1)).as_str())
+        );
+    }
+
+    #[test]
+    fn compression_predicate_skips_media_and_byte_ranges() {
+        use tower_http::compression::predicate::Predicate;
+
+        let predicate = super::response_compression_predicate();
+        let response = |status: StatusCode, content_type: &str, byte_range: bool| {
+            let mut builder = axum::http::Response::builder()
+                .status(status)
+                .header(header::CONTENT_TYPE, content_type)
+                .header(header::CONTENT_LENGTH, "4096");
+            if byte_range {
+                builder = builder.header(header::CONTENT_RANGE, "bytes 0-1023/4096");
+            }
+            builder
+                .body(axum::body::Body::from(vec![0u8; 4096]))
+                .unwrap()
+        };
+
+        // Ordinary API and web payloads still compress.
+        assert!(predicate.should_compress(&response(StatusCode::OK, "application/json", false)));
+        assert!(predicate.should_compress(&response(StatusCode::OK, "text/vtt", false)));
+
+        // Media is already compressed, so gzipping it only burns CPU per byte served.
+        for content_type in [
+            "video/mp4",
+            "video/mp2t",
+            "audio/mpeg",
+            "application/vnd.apple.mpegurl",
+            "application/x-mpegurl",
+        ] {
+            assert!(
+                !predicate.should_compress(&response(StatusCode::OK, content_type, false)),
+                "{content_type}"
+            );
+        }
+
+        // A compressed byte range leaves Content-Range describing bytes the client never receives.
+        assert!(!predicate.should_compress(&response(
+            StatusCode::PARTIAL_CONTENT,
+            "application/json",
+            true
+        )));
+        assert!(!predicate.should_compress(&response(StatusCode::OK, "application/json", true)));
+    }
+
+    #[test]
+    fn live_tv_guide_authorizes_listing_provider_programs_through_their_channel() {
+        let channels = vec![
+            json!({ "Id": "channel-allowed", "JellyrinChannelId": "raw-allowed", "TunerHostId": "tuner-allowed" }),
+            json!({ "Id": "channel-denied", "JellyrinChannelId": "raw-denied", "TunerHostId": "tuner-denied" }),
+        ];
+        let mut programs = vec![
+            // EPG rows carry the listing provider id, not a tuner id.
+            json!({ "Name": "epg-allowed", "TunerHostId": "listings-1", "ChannelId": "channel-allowed" }),
+            json!({ "Name": "epg-denied", "TunerHostId": "listings-1", "ChannelId": "channel-denied" }),
+            json!({ "Name": "epg-unmapped", "TunerHostId": "listings-1", "ChannelId": "channel-missing" }),
+            // Tuner-sourced rows name the tuner directly.
+            json!({ "Name": "tuner-allowed", "TunerHostId": "tuner-allowed" }),
+            json!({ "Name": "tuner-denied", "TunerHostId": "tuner-denied" }),
+        ];
+
+        super::retain_authorized_live_tv_programs(
+            &mut programs,
+            &channels,
+            &["tuner-allowed".to_string()],
+        );
+
+        let names = programs
+            .iter()
+            .map(|program| program["Name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["epg-allowed", "tuner-allowed"]);
+    }
+
+    #[test]
+    fn cached_facet_page_declines_plugin_scoped_queries() {
+        // The shared facet page is keyed by folder and item type only. A caller whose plugin
+        // catalogues are restricted must fall through to the per-user path, or it could enumerate
+        // facet values from a catalogue the item endpoints refuse to list for it.
+        let mut query = ItemsQuery::default();
+        assert!(super::metadata_facet_query_is_supported(&query));
+        query.allowed_plugin_tuner_ids = Some(vec!["tuner-a".to_string()]);
+        assert!(!super::metadata_facet_query_is_supported(&query));
+        query.allowed_plugin_tuner_ids = Some(Vec::new());
+        assert!(!super::metadata_facet_query_is_supported(&query));
+    }
+
+    #[test]
+    fn plugin_catalog_authorization_cache_key_separates_users_and_devices() {
+        let context = |user: &str, device: &str| jellyrin_plugin_sdk::PluginUserContext {
+            user_id: user.to_string(),
+            device_id: device.to_string(),
+            is_administrator: false,
+        };
+        let key = |user: &str, device: &str| {
+            super::plugin_catalog_authorization_cache_key(
+                "plugin",
+                "tuner",
+                &context(user, device),
+                b"{}",
+            )
+        };
+
+        // A plugin may answer per device, so one device's verdict must not be reused for another.
+        assert_ne!(key("user-a", "device-a"), key("user-a", "device-b"));
+        assert_ne!(key("user-a", "device-a"), key("user-b", "device-a"));
+        assert_eq!(key("user-a", "device-a"), key("user-a", "device-a"));
+
+        // A client picks its own device id. Length prefixes keep it from shifting the separator to
+        // land on another identity's key: "a:b" + "c" must not collide with "a" + "b:c".
+        assert_ne!(key("a:b", "c"), key("a", "b:c"));
+
+        // Administrator state and the provider configuration stay part of the identity.
+        let mut elevated = context("user-a", "device-a");
+        elevated.is_administrator = true;
+        assert_ne!(
+            super::plugin_catalog_authorization_cache_key("plugin", "tuner", &elevated, b"{}"),
+            key("user-a", "device-a")
+        );
+        assert_ne!(
+            super::plugin_catalog_authorization_cache_key(
+                "plugin",
+                "tuner",
+                &context("user-a", "device-a"),
+                b"{\"Host\":\"other\"}",
+            ),
+            key("user-a", "device-a")
+        );
+    }
+
+    #[test]
     fn next_up_sql_candidate_gate_is_conservative() {
         let mut common = super::parse_items_query(Some(
             "UserId=00000000000000000000000000000001&Limit=20&IncludeItemTypes=Episode",
         ));
         common.is_played = Some(false);
         assert!(super::is_common_next_up_query(&common));
+
+        let mut scoped = common.clone();
+        scoped.parent_id = Some(Uuid::new_v4().simple().to_string());
+        assert!(super::is_common_next_up_query(&scoped));
 
         let mut searched = common.clone();
         searched.search_term = Some("show".to_string());
@@ -105071,6 +110337,24 @@ done
     }
 
     #[test]
+    fn plugin_vod_retries_consumed_or_expired_playback_grants_only() {
+        for status in [
+            reqwest::StatusCode::BAD_REQUEST,
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::FORBIDDEN,
+        ] {
+            assert!(super::plugin_vod_playback_grant_was_rejected(status));
+        }
+        for status in [
+            reqwest::StatusCode::NOT_FOUND,
+            reqwest::StatusCode::RANGE_NOT_SATISFIABLE,
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            assert!(!super::plugin_vod_playback_grant_was_rejected(status));
+        }
+    }
+
+    #[test]
     fn xtream_probe_revision_changes_with_central_tuner_configuration() {
         let metadata = json!({
             "Provider": "xtream",
@@ -105189,7 +110473,10 @@ done
         let token = input.as_str().rsplit('/').next().unwrap();
         assert_eq!(
             internal_remote_relay_target(token),
-            Some(InternalRemoteRelayTarget::MediaItem(item.id))
+            Some(InternalRemoteRelayTarget::MediaItem {
+                item_id: item.id,
+                user_context: None,
+            })
         );
         let persisted = db
             .media_item_metadata_by_item_ids(&HashSet::from([item.id]))
@@ -105307,6 +110594,8 @@ done
         assert!(direct_stream_url.starts_with(&format!("/Videos/{item_id}/stream.mkv?")));
         assert!(!direct_stream_url.contains("user/pass"));
         assert!(!direct_stream_url.contains(&upstream_address.to_string()));
+        assert_eq!(media_source["TranscodingUrl"], direct_stream_url);
+        assert_eq!(media_source["TranscodingContainer"], "mkv");
         assert!(test_db.transcode_sessions().await.unwrap().is_empty());
 
         let response = app
@@ -105642,6 +110931,14 @@ done
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            if endpoint == format!("/Items/{parent_id}")
+                || endpoint == format!("/Users/{user_id}/Items/{parent_id}")
+            {
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                let folder: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(folder["Type"], "CollectionFolder", "{endpoint}");
+                assert_eq!(folder["CollectionType"], "movies", "{endpoint}");
+            }
         }
     }
 
@@ -106035,6 +111332,146 @@ done
             FfmpegMode::Enabled,
         );
         assert_eq!(native_decision.delivery, DeliveryMode::DirectProxy);
+        assert!(super::text_subtitle_profile_supports_external(
+            &item, &native
+        ));
+        assert!(!super::selected_text_subtitle_can_use_external(
+            &item, &native
+        ));
+
+        let mut android_tv_initial = playback_info_options_from_body(&json!({
+            "EnableDirectPlay": true,
+            "EnableDirectStream": true,
+            "EnableTranscoding": true,
+            "SubtitleStreamIndex": -1,
+            "DeviceProfile": {
+                "DirectPlayProfiles": [{
+                    "Container": "ts,mpegts",
+                    "Type": "Video",
+                    "VideoCodec": "h264,hevc,mpeg2video",
+                    "AudioCodec": "aac,mp2,mp3,ac3,eac3"
+                }],
+                "TranscodingProfiles": [{
+                    "Container": "ts", "Type": "Video", "VideoCodec": "h264",
+                    "AudioCodec": "aac", "Protocol": "hls", "Context": "Streaming"
+                }],
+                "SubtitleProfiles": [{ "Format": "webvtt", "Method": "Hls" }]
+            }
+        }));
+        super::apply_plugin_vod_stream_selection_hls_policy(
+            &item,
+            Some(&metadata),
+            "Jellyfin Android TV",
+            &mut android_tv_initial,
+        );
+        assert!(super::text_subtitle_profile_supports_external(
+            &item,
+            &android_tv_initial
+        ));
+        assert!(!super::selected_text_subtitle_prefers_hls(
+            &android_tv_initial
+        ));
+        assert!(
+            !android_tv_initial.plugin_vod_selection_hls,
+            "initial playback only needs external subtitle sources, not an A/V restart"
+        );
+
+        let mut selected_native_item = item.clone();
+        selected_native_item.media_streams[0]["Codec"] = json!("hevc");
+        let mut selected_native = playback_info_options_from_body(&json!({
+            "EnableDirectPlay": true,
+            "EnableDirectStream": true,
+            "EnableTranscoding": true,
+            "AudioStreamIndex": 2,
+            "SubtitleStreamIndex": 3,
+            "DeviceProfile": {
+                "Name": "Native TV stream selection",
+                "DirectPlayProfiles": [{
+                    "Container": "ts,mpegts",
+                    "Type": "Video",
+                    "VideoCodec": "h264,hevc,mpeg2video",
+                    "AudioCodec": "aac,mp2,mp3,ac3,eac3"
+                }],
+                "TranscodingProfiles": [{
+                    "Container": "ts",
+                    "Type": "Video",
+                    "VideoCodec": "h264",
+                    "AudioCodec": "aac",
+                    "Protocol": "hls",
+                    "Context": "Streaming"
+                }],
+                "SubtitleProfiles": [
+                    { "Format": "webvtt", "Method": "Hls" },
+                    { "Format": "webvtt", "Method": "External" }
+                ]
+            }
+        }));
+        super::apply_plugin_vod_stream_selection_hls_policy(
+            &selected_native_item,
+            Some(&metadata),
+            "Wholphin",
+            &mut selected_native,
+        );
+        assert!(super::selected_text_subtitle_can_use_external(
+            &selected_native_item,
+            &selected_native,
+        ));
+        assert!(!super::selected_text_subtitle_prefers_hls(&selected_native,));
+        let selected_native_decision = playback_delivery_decision_with_ffmpeg_mode(
+            &selected_native_item,
+            Some(&metadata),
+            &selected_native,
+            FfmpegMode::Enabled,
+        );
+        assert_eq!(
+            selected_native_decision.delivery,
+            DeliveryMode::HlsTranscode
+        );
+        assert_eq!(selected_native_decision.video, HlsStreamMode::Copy);
+        assert_eq!(selected_native_decision.audio, HlsStreamMode::Encode);
+
+        let mut selected_native_source = json!({
+            "IsRemote": true,
+            "MediaStreams": selected_native_item.media_streams.clone(),
+        });
+        super::apply_hls_transcode_stream_contract(
+            selected_native_source.as_object_mut().unwrap(),
+            "Video",
+            "secret-token",
+            "movie-id",
+            "play-session",
+            &selected_native,
+            &selected_native_decision,
+        );
+        let selected_subtitle = &selected_native_source["MediaStreams"][3];
+        assert_eq!(selected_subtitle["DeliveryMethod"], "External");
+        assert_eq!(selected_subtitle["IsExternal"], true);
+        assert_eq!(selected_subtitle["SupportsExternalStream"], true);
+        assert!(
+            selected_subtitle["DeliveryUrl"]
+                .as_str()
+                .is_some_and(|url| url.contains("/Subtitles/3/Stream.vtt?"))
+        );
+
+        let mut initial_native_source = json!({ "MediaStreams": item.media_streams.clone() });
+        if super::text_subtitle_profile_supports_external(&item, &native) {
+            super::apply_direct_external_text_subtitle_contract(
+                initial_native_source.as_object_mut().unwrap(),
+                "secret-token",
+                "movie-id",
+                "play-session",
+                true,
+            );
+        }
+        assert_eq!(
+            initial_native_source["MediaStreams"][3]["SupportsExternalStream"],
+            true
+        );
+        assert!(
+            initial_native_source["MediaStreams"][3]["DeliveryUrl"]
+                .as_str()
+                .is_some_and(|url| url.contains("/Subtitles/3/Stream.vtt?"))
+        );
 
         let mut known_incompatible = item.clone();
         known_incompatible.media_streams[0]["Codec"] = json!("vp9");
@@ -110310,6 +115747,24 @@ done
             .clone()
             .oneshot(
                 Request::builder()
+                    .uri(format!("/Items/{metadata_folder_id}"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let folder_detail: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(folder_detail["UserData"]["Key"], metadata_folder_id);
+        assert_eq!(folder_detail["UserData"]["ItemId"], metadata_folder_id);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
                     .uri(format!("/Items/{item_id}/MetadataEditor"))
                     .header("X-Emby-Token", &api_key)
                     .body(Body::empty())
@@ -111773,9 +117228,14 @@ done
                 }
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
             }
-            panic!(
-                "legacy HLS stop must release tuner: {:?}",
-                events.lock().unwrap()
+            // The release requests can arrive during the final sleep. Check once more at the
+            // deadline so the assertion observes the full interval instead of an instant just
+            // before it.
+            let events = events.lock().unwrap().clone();
+            assert!(
+                events.iter().any(|event| event == "/tuner0/target=none")
+                    && events.iter().any(|event| event == "/tuner0/lockkey=none"),
+                "legacy HLS stop must release tuner: {events:?}"
             );
         }
 
@@ -112494,6 +117954,7 @@ done
                 None,
                 "Video",
                 uuid::Uuid::nil(),
+                None,
                 None,
             )
             .await;

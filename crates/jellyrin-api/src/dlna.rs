@@ -625,7 +625,7 @@ pub(crate) async fn media_stream(
         .media_item_by_id(item_id)
         .await
         .map_err(|_| ApiError::not_found("DLNA media item not found"))?;
-    stream_resolved_media_item(&state, item, &headers, true).await
+    stream_resolved_media_item(&state, item, &headers, true, None).await
 }
 
 pub(crate) async fn media_stream_head(
@@ -640,7 +640,7 @@ pub(crate) async fn media_stream_head(
         .media_item_by_id(item_id)
         .await
         .map_err(|_| ApiError::not_found("DLNA media item not found"))?;
-    stream_resolved_media_item(&state, item, &headers, false).await
+    stream_resolved_media_item(&state, item, &headers, false, None).await
 }
 
 pub(crate) async fn media_hls_master_playlist(
@@ -4487,13 +4487,10 @@ fn search_criteria_expression_matches(
     if and_terms.len() > 1 {
         let mut recognized = false;
         for term in and_terms {
-            if let Some(matches) = search_criteria_expression_matches(item, metadata, term) {
-                recognized = true;
-                if !matches {
-                    return Some(false);
-                }
-            } else {
-                return None;
+            let matches = search_criteria_expression_matches(item, metadata, term)?;
+            recognized = true;
+            if !matches {
+                return Some(false);
             }
         }
         return recognized.then_some(true);
@@ -6459,12 +6456,16 @@ mod tests {
         .await
         .unwrap();
 
+        // The update id is process-wide and every library mutation in the suite bumps it, so pin
+        // the values this test actually owns -- what the restore reports and how one notification
+        // moves the counter -- instead of an exact global reading another test may have advanced.
         let restored = sync_dlna_system_update_id_from_db(&db).await.unwrap();
         assert_eq!(restored, restore_target);
-        assert_eq!(dlna_system_update_id(), restore_target);
+        assert!(dlna_system_update_id() >= restore_target);
 
+        let before_notify = dlna_system_update_id();
         let update_id = notify_dlna_content_directory_changed(&db).await.unwrap();
-        assert_eq!(update_id, restore_target + 1);
+        assert!(update_id > before_notify);
         let stored = db
             .named_configuration(DLNA_STATE_CONFIGURATION_KEY)
             .await

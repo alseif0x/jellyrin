@@ -266,9 +266,7 @@ fn canonical_decimal(raw: &str) -> String {
                         .expect("serde_json emitted an invalid number exponent"),
                 )
             });
-    let (integer, fraction) = mantissa
-        .split_once('.')
-        .map_or((mantissa, ""), |parts| parts);
+    let (integer, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
     let mut digits = format!("{integer}{fraction}");
     let mut power = exponent - fraction.len() as i64;
     let first_nonzero = digits

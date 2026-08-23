@@ -37,7 +37,8 @@ pub(crate) const POSTGRES_REPEATABLE_READ_ONLY_BEGIN: &str =
     "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY";
 pub(crate) const POSTGRES_SERIALIZABLE_BEGIN: &str =
     "BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE";
-// Keep this declaration in the dependency graph whenever a new embedded migration is added.
+// Embedded through 202608230001. Bump this marker whenever a migration file is added so
+// incremental builds re-evaluate sqlx's directory macro.
 pub(crate) static POSTGRES_MIGRATOR: sqlx::migrate::Migrator =
     sqlx::migrate!("./migrations-postgres");
 

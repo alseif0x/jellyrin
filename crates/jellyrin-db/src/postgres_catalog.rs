@@ -27,7 +27,7 @@ use super::{
     MediaItemQueryFilterSelection, MediaItemQueryFilterValues, PostgresDatabase,
     REMOTE_MEDIA_CATALOG_STAGE_MAX_LIBRARY_ITEMS, ReadyRemoteMediaCatalogStage,
     RemoteMediaCatalogStage, RemoteMediaItemUpsert, RemoteMediaLibrarySnapshot,
-    RemoteMediaLibraryStageSpec, SortDirection, TV_SERIES_CATALOG_PROJECTION_VERSION,
+    RemoteMediaLibraryStageSpec, SortDirection, TV_SERIES_CATALOG_PROJECTION_VERSION, TvNextUpPage,
     TvSeriesCatalogKey, TvSeriesCatalogNameFilter, TvSeriesCatalogNamePatterns,
     TvSeriesCatalogPage, catalog_lock_jitter_seed, catalog_sync_duration_millis,
     encode_media_item_query_filter_position, extract_media_item_facets,
@@ -871,6 +871,34 @@ impl PostgresDatabase {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    /// Bounded source for the trailer endpoints.
+    ///
+    /// `/Trailers` used to materialise the whole catalogue in Rust to find the few items carrying
+    /// a `RemoteTrailers` array, which exceeded the statement timeout on a real library. The key
+    /// test runs in PostgreSQL instead; the caller still applies the exact URL-shape filter, so a
+    /// generous predicate here cannot admit a trailer the API would not have produced anyway.
+    pub async fn media_items_with_remote_trailers(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MediaItem>> {
+        let rows = sqlx::query_as::<_, PostgresMediaItemRow>(
+            r#"
+            SELECT id, virtual_folder_id, name, path, media_type, collection_type,
+                   file_size, runtime_ticks, bitrate, width, height, media_streams,
+                   created_at, updated_at
+            FROM media_items
+            WHERE missing_since IS NULL
+              AND (metadata @? '$."RemoteTrailers"' OR metadata @? '$."Trailers"')
+            ORDER BY lower(name), name
+            LIMIT $1
+            "#,
+        )
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
     pub async fn media_items_by_name_search(
         &self,
         search_term: &str,
@@ -950,15 +978,18 @@ impl PostgresDatabase {
             .begin_with(POSTGRES_REPEATABLE_READ_ONLY_BEGIN)
             .await?;
 
-        let mut count = QueryBuilder::<Postgres>::new("SELECT COUNT(*)::bigint ");
-        push_postgres_catalog_from(&mut count, query);
-        push_postgres_catalog_filters(&mut count, query);
-        let total_record_count = count
-            .build_query_scalar::<i64>()
-            .fetch_one(&mut *transaction)
-            .await?;
-        let total_record_count =
-            usize::try_from(total_record_count).context("media catalog count exceeded usize")?;
+        let total_record_count = if query.include_total_record_count {
+            let mut count = QueryBuilder::<Postgres>::new("SELECT COUNT(*)::bigint ");
+            push_postgres_catalog_count_from(&mut count, query);
+            push_postgres_catalog_filters(&mut count, query);
+            let count = count
+                .build_query_scalar::<i64>()
+                .fetch_one(&mut *transaction)
+                .await?;
+            usize::try_from(count).context("media catalog count exceeded usize")?
+        } else {
+            0
+        };
 
         let effective_limit = query.limit.min(MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE);
         if effective_limit == 0 {
@@ -1240,22 +1271,40 @@ impl PostgresDatabase {
     ) -> anyhow::Result<Option<MediaItemQueryFilterValues>> {
         let covered = sqlx::query_scalar::<_, bool>(
             r#"
-            SELECT count(*) = cardinality($1::uuid[])
-               AND COALESCE(bool_and(
-                       coverage.projection_version = $2
-                       AND coverage.source_revision = revision.source_revision
-                       AND revision.reconciled_revision = revision.source_revision
-                   ), FALSE)
-            FROM media_item_query_filter_summary_coverage AS coverage
-            JOIN media_item_query_filter_summary_revisions AS revision
-              ON revision.virtual_folder_id = coverage.virtual_folder_id
-            WHERE coverage.virtual_folder_id = ANY($1)
-              AND coverage.effective_item_type = $3
+            WITH expected AS (
+                SELECT folder.id AS virtual_folder_id,
+                       requested.effective_item_type
+                FROM virtual_folders AS folder
+                CROSS JOIN unnest($3::text[]) AS requested(effective_item_type)
+                WHERE folder.id = ANY($1)
+                  AND (
+                      (requested.effective_item_type = 'movie'
+                       AND lower(COALESCE(folder.collection_type, '')) = 'movies')
+                      OR
+                      (requested.effective_item_type = 'episode'
+                       AND lower(COALESCE(folder.collection_type, ''))
+                           IN ('tvshows', 'tvshow', 'series'))
+                  )
+            )
+            SELECT EXISTS(SELECT 1 FROM expected)
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM expected
+                   LEFT JOIN media_item_query_filter_summary_coverage AS coverage
+                     ON coverage.virtual_folder_id = expected.virtual_folder_id
+                    AND coverage.effective_item_type = expected.effective_item_type
+                   LEFT JOIN media_item_query_filter_summary_revisions AS revision
+                     ON revision.virtual_folder_id = expected.virtual_folder_id
+                   WHERE coverage.virtual_folder_id IS NULL
+                      OR coverage.projection_version <> $2
+                      OR coverage.source_revision <> revision.source_revision
+                      OR revision.reconciled_revision <> revision.source_revision
+               )
             "#,
         )
         .bind(folder_ids)
         .bind(MEDIA_ITEM_QUERY_FILTER_SUMMARY_VERSION)
-        .bind(&effective_item_types[0])
+        .bind(effective_item_types)
         .fetch_one(&mut *connection)
         .await?;
         if !covered {
@@ -1716,12 +1765,9 @@ impl PostgresDatabase {
     /// The same candidates restricted to one persisted `SeasonId`.
     ///
     /// Opening a season otherwise materializes every episode in the library just to keep the
-    /// handful
-    /// that belong to it. There is no index on this expression, but evaluating it over the visible
-    /// TV
-    /// rows costs a fraction of transferring their stream payloads, and the remaining predicates
-    /// match
-    /// `tv_series_lookup_candidates` exactly so the result is a strict subset of it.
+    /// handful that belong to it. The partial index on `btrim(metadata->>'SeasonId')` keeps this
+    /// lookup bounded; the remaining predicates match `tv_series_lookup_candidates` exactly so
+    /// the result is a strict subset of it.
     pub async fn tv_series_lookup_candidates_for_season(
         &self,
         season_id: &str,
@@ -1810,6 +1856,7 @@ impl PostgresDatabase {
             virtual_folder_id,
             start_index,
             limit,
+            true,
             TvSeriesCatalogNameFilter::default(),
         )
         .await
@@ -1820,6 +1867,7 @@ impl PostgresDatabase {
         virtual_folder_id: Option<Uuid>,
         start_index: usize,
         limit: usize,
+        include_total_record_count: bool,
         filter: TvSeriesCatalogNameFilter,
     ) -> anyhow::Result<Option<TvSeriesCatalogPage>> {
         let search_pattern = filter
@@ -1914,7 +1962,7 @@ impl PostgresDatabase {
         .fetch_one(&mut *transaction)
         .await?;
         if !projection_covered {
-            let page = Self::tv_series_catalog_page_from_live(
+            let mut page = Self::tv_series_catalog_page_from_live(
                 &mut transaction,
                 virtual_folder_id,
                 start_index,
@@ -1922,15 +1970,23 @@ impl PostgresDatabase {
                 name_patterns,
             )
             .await?;
+            if !include_total_record_count && let Some(page) = page.as_mut() {
+                page.total_record_count = 0;
+            }
             transaction.commit().await?;
             return Ok(page);
         }
         let requested_limit = limit;
-        let mut series = sqlx::query_as::<_, (String, String, i64)>(
+        let total_projection = if include_total_record_count {
+            "COUNT(*) OVER ()"
+        } else {
+            "0::bigint"
+        };
+        let series_sql = format!(
             r#"
             SELECT series_id,
                    min(series_name) AS series_name,
-                   COUNT(*) OVER () AS total_series
+                   {total_projection} AS total_series
             FROM media_item_tv_series AS series
             JOIN media_item_tv_series_coverage AS coverage
               ON coverage.virtual_folder_id = series.virtual_folder_id
@@ -1945,18 +2001,24 @@ impl PostgresDatabase {
             ORDER BY lower(min(series_name)), min(series_name), series_id
             LIMIT $2 OFFSET $3
             "#,
-        )
-        .bind(virtual_folder_id)
-        .bind(i64::try_from(limit.max(1))?)
-        .bind(i64::try_from(start_index)?)
-        .bind(TV_SERIES_CATALOG_PROJECTION_VERSION)
-        .bind(search_pattern.as_deref())
-        .bind(starts_with_pattern.as_deref())
-        .bind(lower_bound.as_deref())
-        .bind(upper_bound.as_deref())
-        .fetch_all(&mut *transaction)
-        .await?;
-        let total = if let Some((_, _, total)) = series.first() {
+        );
+        // The only interpolated fragment is one of the two fixed aggregate projections above;
+        // every request-controlled value remains a bind parameter.
+        let mut series =
+            sqlx::query_as::<_, (String, String, i64)>(sqlx::AssertSqlSafe(series_sql.as_str()))
+                .bind(virtual_folder_id)
+                .bind(i64::try_from(limit.max(1))?)
+                .bind(i64::try_from(start_index)?)
+                .bind(TV_SERIES_CATALOG_PROJECTION_VERSION)
+                .bind(search_pattern.as_deref())
+                .bind(starts_with_pattern.as_deref())
+                .bind(lower_bound.as_deref())
+                .bind(upper_bound.as_deref())
+                .fetch_all(&mut *transaction)
+                .await?;
+        let total = if !include_total_record_count {
+            0
+        } else if let Some((_, _, total)) = series.first() {
             *total
         } else if start_index == 0 {
             0
@@ -2797,6 +2859,227 @@ impl PostgresDatabase {
         result
     }
 
+    /// Return only the requested NextUp page from the narrow TV projection.
+    ///
+    /// The previous repository call selected one row for every visible series and transferred
+    /// tens of thousands of rows to the API before it retained a small page. This query keeps the
+    /// same one-per-series and ordering rules while paging inside PostgreSQL. A lateral page joined
+    /// to the count deliberately returns one nullable row even when the requested offset is past
+    /// the end, preserving Jellyfin's exact total.
+    pub async fn tv_next_up_candidate_page(
+        &self,
+        user_id: Uuid,
+        virtual_folder_id: Option<Uuid>,
+        start_index: usize,
+        limit: usize,
+        include_total_record_count: bool,
+    ) -> anyhow::Result<TvNextUpPage> {
+        let observation = self.telemetry.start_operation(
+            DatabaseOperation::CatalogNextUpCandidates,
+            DatabasePoolRole::Api,
+        );
+        let result = async {
+            let projection_covered: bool = sqlx::query_scalar(
+                r#"
+                SELECT NOT EXISTS (
+                    SELECT 1
+                    FROM virtual_folders AS folder
+                    LEFT JOIN media_item_tv_series_coverage AS coverage
+                      ON coverage.virtual_folder_id = folder.id
+                     AND coverage.projection_version = $1
+                    WHERE lower(coalesce(folder.collection_type, '')) = ANY(
+                              ARRAY['tvshows', 'tvshow', 'series']::text[]
+                          )
+                      AND ($2::uuid IS NULL OR folder.id = $2)
+                      AND coverage.virtual_folder_id IS NULL
+                )
+                AND NOT EXISTS (
+                    SELECT series_id
+                    FROM media_item_tv_series
+                    WHERE $2::uuid IS NULL OR virtual_folder_id = $2
+                    GROUP BY series_id
+                    HAVING count(*) > 1
+                )
+                "#,
+            )
+            .bind(TV_SERIES_CATALOG_PROJECTION_VERSION)
+            .bind(virtual_folder_id)
+            .fetch_one(&self.pool)
+            .await?;
+            if !projection_covered {
+                let mut items = self.tv_next_up_candidate_items(user_id).await?;
+                items.retain(|item| {
+                    virtual_folder_id.is_none_or(|folder_id| item.virtual_folder_id == folder_id)
+                });
+                items.sort_by(compare_tv_episode_items);
+                let total_record_count = if include_total_record_count {
+                    items.len()
+                } else {
+                    0
+                };
+                let items = items.into_iter().skip(start_index).take(limit).collect();
+                return anyhow::Ok(TvNextUpPage {
+                    items,
+                    total_record_count,
+                    start_index,
+                });
+            }
+
+            let offset = i64::try_from(start_index).unwrap_or(i64::MAX);
+            let page_limit = i64::try_from(limit).unwrap_or(i64::MAX);
+            if !include_total_record_count {
+                let rows = sqlx::query_as::<_, PostgresProjectedNextUpCandidateRow>(
+                    r#"
+                    SELECT candidate.item_id, candidate.virtual_folder_id,
+                           candidate.item_name, candidate.item_path
+                        FROM media_item_tv_series AS series
+                    JOIN LATERAL (
+                        SELECT member.item_id, member.virtual_folder_id,
+                               member.item_name, member.item_path
+                        FROM media_item_tv_series_members AS member
+                        WHERE member.series_id = series.series_id
+                          AND member.virtual_folder_id = series.virtual_folder_id
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM playback_states AS playback
+                              WHERE playback.item_id = member.item_id
+                                AND playback.user_id = $1
+                                AND playback.played
+                          )
+                        ORDER BY member.season_number, member.episode_number,
+                                 member.sort_name, member.item_id
+                        LIMIT 1
+                    ) AS candidate ON true
+                    WHERE $2::uuid IS NULL OR series.virtual_folder_id = $2
+                    ORDER BY lower(series.series_name), series.series_name,
+                             series.series_id, series.virtual_folder_id
+                    OFFSET $3 LIMIT $4
+                    "#,
+                )
+                .bind(user_id)
+                .bind(virtual_folder_id)
+                .bind(offset)
+                .bind(page_limit)
+                .fetch_all(&self.pool)
+                .await?;
+                return anyhow::Ok(TvNextUpPage {
+                    items: rows.into_iter().map(MediaItem::from).collect(),
+                    total_record_count: 0,
+                    start_index,
+                });
+            }
+            let rows = sqlx::query_as::<_, PostgresProjectedNextUpPageRow>(
+                r#"
+                WITH affected AS MATERIALIZED (
+                    SELECT DISTINCT played_member.series_id,
+                                    played_member.virtual_folder_id
+                    FROM playback_states AS playback
+                    JOIN media_item_tv_series_members AS played_member
+                      ON played_member.item_id = playback.item_id
+                    WHERE playback.user_id = $1 AND playback.played
+                      AND ($2::uuid IS NULL OR played_member.virtual_folder_id = $2)
+                ),
+                completed AS MATERIALIZED (
+                    SELECT affected.series_id, affected.virtual_folder_id
+                    FROM affected
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                        FROM media_item_tv_series_members AS candidate
+                        WHERE candidate.series_id = affected.series_id
+                          AND candidate.virtual_folder_id = affected.virtual_folder_id
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM playback_states AS state
+                              WHERE state.user_id = $1
+                                AND state.item_id = candidate.item_id
+                                AND state.played
+                          )
+                    )
+                ),
+                eligible_series AS MATERIALIZED (
+                    SELECT series.virtual_folder_id, series.series_id, series.series_name
+                    FROM media_item_tv_series AS series
+                    WHERE series.episode_count > 0
+                      AND ($2::uuid IS NULL OR series.virtual_folder_id = $2)
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM completed
+                          WHERE completed.series_id = series.series_id
+                            AND completed.virtual_folder_id = series.virtual_folder_id
+                      )
+                ),
+                counted AS (
+                    SELECT count(*)::bigint AS total_record_count
+                    FROM eligible_series
+                ),
+                selected_series AS (
+                    SELECT virtual_folder_id, series_id, series_name
+                    FROM eligible_series
+                    ORDER BY lower(series_name), series_name,
+                             series_id, virtual_folder_id
+                    OFFSET $3 LIMIT $4
+                )
+                SELECT page.item_id, page.virtual_folder_id, page.item_name, page.item_path,
+                       counted.total_record_count
+                FROM counted
+                LEFT JOIN LATERAL (
+                    SELECT candidate.item_id, candidate.virtual_folder_id,
+                           candidate.item_name, candidate.item_path,
+                           series.series_name, series.series_id
+                    FROM selected_series AS series
+                    JOIN LATERAL (
+                        SELECT member.item_id, member.virtual_folder_id,
+                               member.item_name, member.item_path
+                        FROM media_item_tv_series_members AS member
+                        WHERE member.series_id = series.series_id
+                          AND member.virtual_folder_id = series.virtual_folder_id
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM playback_states AS playback
+                              WHERE playback.item_id = member.item_id
+                                AND playback.user_id = $1
+                                AND playback.played
+                          )
+                        ORDER BY member.season_number, member.episode_number,
+                                 member.sort_name, member.item_id
+                        LIMIT 1
+                    ) AS candidate ON true
+                    ORDER BY lower(series.series_name), series.series_name,
+                             series.series_id, series.virtual_folder_id
+                ) AS page ON true
+                ORDER BY lower(page.series_name), page.series_name,
+                         page.series_id, page.virtual_folder_id
+                "#,
+            )
+            .bind(user_id)
+            .bind(virtual_folder_id)
+            .bind(offset)
+            .bind(page_limit)
+            .fetch_all(&self.pool)
+            .await?;
+            let total_record_count = rows
+                .first()
+                .map(|row| {
+                    usize::try_from(nonnegative_count(row.total_record_count)).unwrap_or(usize::MAX)
+                })
+                .unwrap_or(0);
+            let items = rows
+                .into_iter()
+                .filter_map(PostgresProjectedNextUpPageRow::into_media_item)
+                .collect();
+            anyhow::Ok(TvNextUpPage {
+                items,
+                total_record_count,
+                start_index,
+            })
+        }
+        .await;
+        observation.finish_result(&result, |page| {
+            u64::try_from(page.items.len()).unwrap_or(u64::MAX)
+        });
+        result
+    }
+
     /// Exact visible items for a bounded id list, preserving the caller's order.
     ///
     /// This hydrates a page whose selection ran on rows without `media_streams`.
@@ -3149,6 +3432,16 @@ impl PostgresDatabase {
         kind: MediaItemFacetKind,
         virtual_folder_ids: &[Uuid],
     ) -> anyhow::Result<Vec<MediaItemFacetValue>> {
+        self.media_item_facet_values_for_effective_types(kind, virtual_folder_ids, &[])
+            .await
+    }
+
+    pub async fn media_item_facet_values_for_effective_types(
+        &self,
+        kind: MediaItemFacetKind,
+        virtual_folder_ids: &[Uuid],
+        effective_item_types: &[String],
+    ) -> anyhow::Result<Vec<MediaItemFacetValue>> {
         let mut query = QueryBuilder::<Postgres>::new(
             r#"
             SELECT normalized_value, display_value, stable_id, payload
@@ -3172,6 +3465,14 @@ impl PostgresDatabase {
                 separated.push_bind(*folder_id);
             }
             separated.push_unseparated(")");
+        }
+        if !effective_item_types.is_empty() {
+            query
+                .push(" AND (")
+                .push(POSTGRES_MEDIA_ITEM_TYPE_SQL)
+                .push(") = ANY(")
+                .push_bind(effective_item_types)
+                .push(")");
         }
         query.push(
             ") AS ranked WHERE facet_rank = 1 ORDER BY normalized_value, display_value, stable_id",
@@ -3332,6 +3633,11 @@ impl PostgresDatabase {
             query.push(")");
         }
         query.push(" ORDER BY facet.item_id");
+        if let Some(limit) = query_spec.limit {
+            query
+                .push(" LIMIT ")
+                .push_bind(i64::try_from(limit).unwrap_or(i64::MAX));
+        }
         Ok(query
             .build_query_scalar::<Uuid>()
             .fetch_all(&self.pool)
@@ -3788,6 +4094,12 @@ impl PostgresDatabase {
     ) -> anyhow::Result<()> {
         let stage_id = stage.parsed_id()?;
         let mut tx = self.worker_pool.begin().await?;
+        // A ready stage may contain hundreds of thousands of rows. Cascading its deletion must
+        // have the same bounded maintenance budget as publication; the general worker timeout is
+        // intentionally much shorter and otherwise leaves a failed import impossible to clean up.
+        sqlx::query("SET LOCAL statement_timeout = '60min'")
+            .execute(&mut *tx)
+            .await?;
         let stage_state = sqlx::query_as::<_, (String, i32)>(
             "SELECT status, extractor_version \
              FROM remote_media_catalog_stages WHERE id = $1 FOR UPDATE",
@@ -3854,7 +4166,7 @@ impl PostgresDatabase {
         // statement timeout while PostgreSQL maintains indexes and statement-level transition
         // table triggers. Keep this operation bounded, but give it enough time to finish without
         // forcing the provider catalogue to be downloaded again.
-        sqlx::query("SET LOCAL statement_timeout = '15min'")
+        sqlx::query("SET LOCAL statement_timeout = '60min'")
             .execute(&mut *tx)
             .await?;
         sqlx::query("SET LOCAL jit = off").execute(&mut *tx).await?;
@@ -5705,6 +6017,9 @@ impl PostgresDatabase {
 }
 
 const POSTGRES_MEDIA_ITEM_TYPE_SQL: &str = r#"CASE
+    WHEN item.media_type = 'Series'
+         AND lower(coalesce(item.metadata->>'PluginVodKind', '')) = 'series'
+        THEN 'series'
     WHEN item.media_type = 'Video' AND item.collection_type = 'movies' THEN 'movie'
     WHEN item.media_type = 'Video'
          AND item.collection_type IN ('musicvideos', 'musicvideo') THEN 'musicvideo'
@@ -5771,7 +6086,7 @@ fn postgres_query_filter_summary_scope(
     let mut effective_item_types = normalized_catalog_values(&query.include_item_types);
     effective_item_types.sort_unstable();
     effective_item_types.dedup();
-    if effective_item_types.len() != 1
+    if effective_item_types.is_empty()
         || effective_item_types
             .iter()
             .any(|item_type| item_type != "movie" && item_type != "episode")
@@ -5799,6 +6114,21 @@ fn postgres_query_filter_summary_scope(
 
 fn push_postgres_catalog_from(builder: &mut QueryBuilder<Postgres>, query: &MediaItemCatalogQuery) {
     let selector_groups = normalized_postgres_filter_selector_groups(query);
+    if selector_groups.is_empty()
+        && query.is_played == Some(true)
+        && let Some(user_id) = query.user_id
+    {
+        // Watched/recently-played shelves are normally tiny relative to the media catalogue. Drive
+        // them from the per-user playback index so DatePlayed never scans every episode first.
+        builder
+            .push(
+                " FROM playback_states AS playback \
+                 JOIN media_items AS item ON item.id = playback.item_id \
+                 AND playback.user_id = ",
+            )
+            .push_bind(user_id);
+        return;
+    }
     if selector_groups.is_empty() {
         builder.push(" FROM media_items AS item ");
     } else {
@@ -5840,6 +6170,23 @@ fn push_postgres_catalog_from(builder: &mut QueryBuilder<Postgres>, query: &Medi
     }
 }
 
+/// Builds the source for a page's total count without joining user playback rows when no playback
+/// predicate needs them. The page projection still joins playback data for `UserData`, but carrying
+/// that join into `COUNT(*)` made a cold 450k-item plugin folder compete with artwork warming and
+/// exceed the statement timeout even though the matching Series page itself was indexed.
+fn push_postgres_catalog_count_from(
+    builder: &mut QueryBuilder<Postgres>,
+    query: &MediaItemCatalogQuery,
+) {
+    let needs_playback_filter =
+        query.is_played.is_some() || query.favorite.is_some() || query.is_resumable;
+    if normalized_postgres_filter_selector_groups(query).is_empty() && !needs_playback_filter {
+        builder.push(" FROM media_items AS item ");
+    } else {
+        push_postgres_catalog_from(builder, query);
+    }
+}
+
 fn normalized_postgres_filter_selector_groups(
     query: &MediaItemCatalogQuery,
 ) -> Vec<(&'static str, Vec<String>)> {
@@ -5865,6 +6212,24 @@ fn push_postgres_catalog_filters(
 ) {
     builder.push(" WHERE item.missing_since IS NULL");
 
+    if let Some(allowed) = query.allowed_plugin_tuner_ids.as_ref() {
+        builder.push(" AND (item.path NOT LIKE 'plugin-vod://%' OR ");
+        if allowed.is_empty() {
+            builder.push("FALSE");
+        } else {
+            builder
+                .push("lower(coalesce(item.metadata->>'TunerId', '')) = ANY(")
+                .push_bind(
+                    allowed
+                        .iter()
+                        .map(|value| value.to_ascii_lowercase())
+                        .collect::<Vec<_>>(),
+                )
+                .push(")");
+        }
+        builder.push(")");
+    }
+
     if !query.ids.is_empty() {
         builder
             .push(" AND item.id = ANY(")
@@ -5872,10 +6237,21 @@ fn push_postgres_catalog_filters(
             .push(")");
     }
     if !query.virtual_folder_ids.is_empty() {
-        builder
-            .push(" AND item.virtual_folder_id = ANY(")
-            .push_bind(query.virtual_folder_ids.clone())
-            .push(")");
+        // A single-folder Latest request is the overwhelmingly common client shape. Keep it as
+        // scalar equality so PostgreSQL can preserve the ordering of the covering
+        // `(virtual_folder_id, updated_at, lower(name), id)` index and stop at LIMIT. Expressing
+        // the same predicate as `= ANY($1)` gives the prepared generic plan no array-cardinality
+        // information; on large plugin catalogues it can scan and sort the entire folder instead.
+        if let [folder_id] = query.virtual_folder_ids.as_slice() {
+            builder
+                .push(" AND item.virtual_folder_id = ")
+                .push_bind(*folder_id);
+        } else {
+            builder
+                .push(" AND item.virtual_folder_id = ANY(")
+                .push_bind(query.virtual_folder_ids.clone())
+                .push(")");
+        }
     }
 
     let include_item_types = normalized_catalog_values(&query.include_item_types);
@@ -6160,6 +6536,7 @@ fn push_postgres_include_item_types_filter(
         "movie",
         "musicvideo",
         "episode",
+        "series",
         "video",
         "audio",
         "photo",
@@ -6179,6 +6556,9 @@ fn push_postgres_include_item_types_filter(
             }
             "episode" => {
                 "(item.collection_type IN ('tvshows', 'tvshow', 'series') AND item.media_type = 'Video' AND lower(item.path) !~ '(^|/)(extras|featurettes|special features|behind the scenes|deleted scenes|interviews|trailers)(/|$)')"
+            }
+            "series" => {
+                "(item.media_type = 'Series' AND lower(coalesce(item.metadata->>'PluginVodKind', '')) = 'series')"
             }
             "video" => {
                 "(item.media_type = 'Video' AND ((item.collection_type IN ('tvshows', 'tvshow', 'series') AND lower(item.path) ~ '(^|/)(extras|featurettes|special features|behind the scenes|deleted scenes|interviews|trailers)(/|$)') OR item.collection_type IS NULL OR item.collection_type NOT IN ('movies', 'musicvideos', 'musicvideo', 'tvshows', 'tvshow', 'series')))"
@@ -6254,6 +6634,13 @@ fn push_postgres_catalog_order(
             MediaItemCatalogSortField::SortName => "lower(item.name)",
             MediaItemCatalogSortField::DateCreated => "item.created_at",
             MediaItemCatalogSortField::DateLastMediaAdded => "item.updated_at",
+            MediaItemCatalogSortField::PremiereDate => {
+                "public.jellyrin_metadata_timestamp(item.metadata, ARRAY['PremiereDate', 'AirDate', 'DateCreated'])"
+            }
+            MediaItemCatalogSortField::CommunityRating => {
+                "public.jellyrin_metadata_number(item.metadata, ARRAY['CommunityRating', 'Rating'])"
+            }
+            MediaItemCatalogSortField::DatePlayed => "playback.updated_at",
         });
         builder.push(match direction {
             SortDirection::Ascending => " ASC",
@@ -6571,6 +6958,36 @@ impl From<PostgresProjectedNextUpCandidateRow> for MediaItem {
             created_at: OffsetDateTime::UNIX_EPOCH,
             updated_at: OffsetDateTime::UNIX_EPOCH,
         }
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct PostgresProjectedNextUpPageRow {
+    item_id: Option<Uuid>,
+    virtual_folder_id: Option<Uuid>,
+    item_name: Option<String>,
+    item_path: Option<String>,
+    total_record_count: i64,
+}
+
+impl PostgresProjectedNextUpPageRow {
+    fn into_media_item(self) -> Option<MediaItem> {
+        Some(MediaItem {
+            id: self.item_id?,
+            virtual_folder_id: self.virtual_folder_id?,
+            name: self.item_name?,
+            path: self.item_path?,
+            media_type: "Video".to_string(),
+            collection_type: Some("tvshows".to_string()),
+            file_size: None,
+            runtime_ticks: None,
+            bitrate: None,
+            width: None,
+            height: None,
+            media_streams: Vec::new(),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+        })
     }
 }
 
@@ -7360,6 +7777,20 @@ mod tests {
         push_postgres_catalog_from(&mut builder, &query);
         push_postgres_catalog_filters(&mut builder, &query);
         assert!(builder.sql().as_str().contains("AND (FALSE)"));
+    }
+
+    #[test]
+    fn postgres_query_filter_summary_accepts_combined_movie_and_episode_domains() {
+        let folder_id = Uuid::new_v4();
+        let query = MediaItemCatalogQuery {
+            virtual_folder_ids: vec![folder_id],
+            include_item_types: vec!["Episode".to_string(), "Movie".to_string()],
+            ..MediaItemCatalogQuery::default()
+        };
+        let (folder_ids, item_types) = postgres_query_filter_summary_scope(&query)
+            .expect("movie and episode must share the exact summary path");
+        assert_eq!(folder_ids, vec![folder_id]);
+        assert_eq!(item_types, vec!["episode", "movie"]);
     }
 
     #[tokio::test]
@@ -9522,6 +9953,49 @@ mod tests {
             assert!(!filters2_values.has_subtitles);
             assert!(!filters2_values.has_trailer);
 
+            let episode_folder = test
+                .database
+                .replace_remote_media_library_snapshot(
+                    "Episode Filters",
+                    "tvshows",
+                    "provider://episode-filters",
+                    vec![remote_item(
+                        Uuid::new_v4(),
+                        "Target Episode",
+                        "provider://episode-filters/target.mkv",
+                        "Video",
+                        "tvshows",
+                        json!({"Genres": ["Episode Genre"]}),
+                    )],
+                )
+                .await?;
+            let mixed_library_query = MediaItemCatalogQuery {
+                start_index: 0,
+                limit: 0,
+                virtual_folder_ids: vec![target_folder.id, episode_folder.id],
+                include_item_types: vec!["Movie".to_owned(), "Episode".to_owned()],
+                ..MediaItemCatalogQuery::default()
+            };
+            let mixed_library_values = test
+                .database
+                .media_item_query_filter_values(
+                    &mixed_library_query,
+                    MediaItemQueryFilterSelection::GENRES_ONLY,
+                )
+                .await?;
+            assert!(
+                mixed_library_values
+                    .genres
+                    .iter()
+                    .any(|value| value == "Drama")
+            );
+            assert!(
+                mixed_library_values
+                    .genres
+                    .iter()
+                    .any(|value| value == "Episode Genre")
+            );
+
             let multi_folder_query = MediaItemCatalogQuery {
                 start_index: 0,
                 limit: 0,
@@ -10314,6 +10788,51 @@ mod tests {
             let mut expected = vec![unplayed_id, other_series_id];
             expected.sort_unstable();
             assert_eq!(bounded, expected);
+
+            let first_page = test
+                .database
+                .tv_next_up_candidate_page(user.id, None, 0, 1, true)
+                .await?;
+            assert_eq!(first_page.total_record_count, 2);
+            assert_eq!(first_page.items.len(), 1);
+            let second_page = test
+                .database
+                .tv_next_up_candidate_page(user.id, None, 1, 1, true)
+                .await?;
+            assert_eq!(second_page.total_record_count, 2);
+            assert_eq!(second_page.items.len(), 1);
+            assert_ne!(first_page.items[0].id, second_page.items[0].id);
+            let past_end = test
+                .database
+                .tv_next_up_candidate_page(user.id, None, 10, 1, true)
+                .await?;
+            assert_eq!(past_end.total_record_count, 2);
+            assert!(past_end.items.is_empty());
+            let without_total = test
+                .database
+                .tv_next_up_candidate_page(user.id, None, 0, 1, false)
+                .await?;
+            assert_eq!(without_total.total_record_count, 0);
+            assert_eq!(without_total.items.len(), 1);
+            test.database
+                .upsert_playback_state(crate::UpsertPlaybackState {
+                    user_id: user.id,
+                    item_id: other_series_id,
+                    media_source_id: None,
+                    audio_stream_index: None,
+                    subtitle_stream_index: None,
+                    position_ticks: 0,
+                    is_paused: false,
+                    played: true,
+                })
+                .await?;
+            let after_completing_series = test
+                .database
+                .tv_next_up_candidate_page(user.id, None, 0, 10, true)
+                .await?;
+            assert_eq!(after_completing_series.total_record_count, 1);
+            assert_eq!(after_completing_series.items.len(), 1);
+            assert_eq!(after_completing_series.items[0].id, unplayed_id);
             anyhow::Ok(())
         }
         .await;
@@ -10492,6 +11011,7 @@ mod tests {
                     None,
                     0,
                     20,
+                    true,
                     TvSeriesCatalogNameFilter {
                         search_term: Some("example".to_string()),
                         ..TvSeriesCatalogNameFilter::default()
@@ -10502,12 +11022,26 @@ mod tests {
             assert_eq!(searched.total_record_count, 1);
             assert_eq!(searched.series.len(), 1);
             assert_eq!(searched.series[0].name, "Example Show");
+            let without_total = test
+                .database
+                .tv_series_catalog_search_page(
+                    None,
+                    0,
+                    20,
+                    false,
+                    TvSeriesCatalogNameFilter::default(),
+                )
+                .await?
+                .unwrap();
+            assert_eq!(without_total.total_record_count, 0);
+            assert_eq!(without_total.series.len(), 1);
             let letter_page = test
                 .database
                 .tv_series_catalog_search_page(
                     None,
                     0,
                     20,
+                    true,
                     TvSeriesCatalogNameFilter {
                         starts_with: Some("E".to_string()),
                         starts_with_or_greater: Some("E".to_string()),
@@ -10525,6 +11059,7 @@ mod tests {
                     None,
                     0,
                     20,
+                    true,
                     TvSeriesCatalogNameFilter {
                         search_term: Some("missing".to_string()),
                         ..TvSeriesCatalogNameFilter::default()

@@ -22,7 +22,9 @@ use jellyrin_core::{
     effective_media_item_type,
 };
 #[cfg(any(test, feature = "sqlite"))]
-use jellyrin_core::{StartupConfig, tv_episode_path_info};
+use jellyrin_core::{
+    StartupConfig, compare_tv_episode_items, tv_episode_path_info, tv_episode_series_key,
+};
 use jellyrin_transcode::{
     BoundedCommandOutputError, BoundedCommandOutputOptions, TranscodeJobPermit,
     acquire_multimedia_probe, run_bounded_command_output,
@@ -178,6 +180,8 @@ pub type Database = SqliteDatabase;
 #[cfg(not(test))]
 pub type Database = ProductionDatabase;
 
+// Embedded through 202608230001. Bump this marker whenever a migration file is added so
+// incremental builds re-evaluate sqlx's directory macro.
 #[cfg(any(test, feature = "sqlite"))]
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 #[cfg(any(test, feature = "sqlite"))]
@@ -287,6 +291,8 @@ impl MediaItemQueryFilterSelection {
 
     pub const FILTERS2: Self =
         Self(Self::AUDIO_LANGUAGES | Self::GENRES | Self::SUBTITLE_LANGUAGES | Self::TAGS);
+
+    pub const GENRES_ONLY: Self = Self(Self::GENRES);
 
     pub const ALL: Self = Self(Self::ITEMS_FILTERS.0 | Self::FILTERS2.0);
 
@@ -625,6 +631,9 @@ pub enum MediaItemCatalogSortField {
     SortName,
     DateCreated,
     DateLastMediaAdded,
+    PremiereDate,
+    CommunityRating,
+    DatePlayed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -657,8 +666,13 @@ pub enum MediaItemCatalogSearchScope {
 pub struct MediaItemCatalogQuery {
     pub start_index: usize,
     pub limit: usize,
+    /// Skip the potentially expensive exact COUNT when the client explicitly does not need it.
+    pub include_total_record_count: bool,
     pub ids: Vec<Uuid>,
     pub virtual_folder_ids: Vec<Uuid>,
+    /// When present, plugin-VOD rows are visible only when their persisted tuner id is in this
+    /// set. Ordinary filesystem media is unaffected. `Some(empty)` hides all plugin-VOD rows.
+    pub allowed_plugin_tuner_ids: Option<Vec<String>>,
     pub include_item_types: Vec<String>,
     pub exclude_item_types: Vec<String>,
     pub collection_types: Vec<String>,
@@ -727,8 +741,10 @@ impl Default for MediaItemCatalogQuery {
         Self {
             start_index: 0,
             limit: 100,
+            include_total_record_count: true,
             ids: Vec::new(),
             virtual_folder_ids: Vec::new(),
+            allowed_plugin_tuner_ids: None,
             include_item_types: Vec::new(),
             exclude_item_types: Vec::new(),
             collection_types: Vec::new(),
@@ -905,6 +921,17 @@ pub struct MediaItemCatalogPage {
 pub struct TvSeriesCatalogPage {
     pub series: Vec<TvSeriesCatalogKey>,
     pub episodes: Vec<MediaItemCatalogEntry>,
+    pub total_record_count: usize,
+    pub start_index: usize,
+}
+
+/// A bounded page of the first visible unplayed episode for each TV series.
+///
+/// Items intentionally omit `media_streams`; callers hydrate only this bounded page before
+/// serializing it.
+#[derive(Debug, Clone)]
+pub struct TvNextUpPage {
+    pub items: Vec<MediaItem>,
     pub total_record_count: usize,
     pub start_index: usize,
 }
@@ -1866,6 +1893,7 @@ pub trait MediaCatalogStore: DatabaseBackend {
         virtual_folder_id: Option<Uuid>,
         start_index: usize,
         limit: usize,
+        include_total_record_count: bool,
         filter: TvSeriesCatalogNameFilter,
     ) -> impl std::future::Future<Output = anyhow::Result<Option<TvSeriesCatalogPage>>> + Send + '_;
 
@@ -1890,6 +1918,16 @@ pub trait MediaCatalogStore: DatabaseBackend {
         user_id: Uuid,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItem>>> + Send + '_;
 
+    /// Database-paged form of the common `/Shows/NextUp` request.
+    fn tv_next_up_candidate_page(
+        &self,
+        user_id: Uuid,
+        virtual_folder_id: Option<Uuid>,
+        start_index: usize,
+        limit: usize,
+        include_total_record_count: bool,
+    ) -> impl std::future::Future<Output = anyhow::Result<TvNextUpPage>> + Send + '_;
+
     /// Exact visible items for a bounded id list, preserving the caller's order.
     fn media_items_by_ids<'a>(
         &'a self,
@@ -1908,6 +1946,15 @@ pub trait MediaCatalogStore: DatabaseBackend {
         &'a self,
         kind: MediaItemFacetKind,
         virtual_folder_ids: &'a [Uuid],
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemFacetValue>>> + Send + 'a;
+
+    /// Facet values restricted to the catalogue's public effective item types. An empty type
+    /// list has the same meaning as `media_item_facet_values`: every visible item.
+    fn media_item_facet_values_for_effective_types<'a>(
+        &'a self,
+        kind: MediaItemFacetKind,
+        virtual_folder_ids: &'a [Uuid],
+        effective_item_types: &'a [String],
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemFacetValue>>> + Send + 'a;
 
     fn media_item_facet_by_entity_id<'a>(
@@ -2039,6 +2086,7 @@ impl MediaCatalogStore for PostgresDatabase {
         virtual_folder_id: Option<Uuid>,
         start_index: usize,
         limit: usize,
+        include_total_record_count: bool,
         filter: TvSeriesCatalogNameFilter,
     ) -> impl std::future::Future<Output = anyhow::Result<Option<TvSeriesCatalogPage>>> + Send + '_
     {
@@ -2047,6 +2095,7 @@ impl MediaCatalogStore for PostgresDatabase {
             virtual_folder_id,
             start_index,
             limit,
+            include_total_record_count,
             filter,
         )
     }
@@ -2064,6 +2113,24 @@ impl MediaCatalogStore for PostgresDatabase {
         user_id: Uuid,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItem>>> + Send + '_ {
         PostgresDatabase::tv_next_up_candidate_items(self, user_id)
+    }
+
+    fn tv_next_up_candidate_page(
+        &self,
+        user_id: Uuid,
+        virtual_folder_id: Option<Uuid>,
+        start_index: usize,
+        limit: usize,
+        include_total_record_count: bool,
+    ) -> impl std::future::Future<Output = anyhow::Result<TvNextUpPage>> + Send + '_ {
+        PostgresDatabase::tv_next_up_candidate_page(
+            self,
+            user_id,
+            virtual_folder_id,
+            start_index,
+            limit,
+            include_total_record_count,
+        )
     }
 
     fn media_items_by_ids<'a>(
@@ -2088,6 +2155,21 @@ impl MediaCatalogStore for PostgresDatabase {
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemFacetValue>>> + Send + 'a
     {
         PostgresDatabase::media_item_facet_values(self, kind, virtual_folder_ids)
+    }
+
+    fn media_item_facet_values_for_effective_types<'a>(
+        &'a self,
+        kind: MediaItemFacetKind,
+        virtual_folder_ids: &'a [Uuid],
+        effective_item_types: &'a [String],
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemFacetValue>>> + Send + 'a
+    {
+        PostgresDatabase::media_item_facet_values_for_effective_types(
+            self,
+            kind,
+            virtual_folder_ids,
+            effective_item_types,
+        )
     }
 
     fn media_item_facet_by_entity_id<'a>(
@@ -2235,6 +2317,7 @@ impl MediaCatalogStore for SqliteDatabase {
         virtual_folder_id: Option<Uuid>,
         start_index: usize,
         limit: usize,
+        include_total_record_count: bool,
         filter: TvSeriesCatalogNameFilter,
     ) -> impl std::future::Future<Output = anyhow::Result<Option<TvSeriesCatalogPage>>> + Send + '_
     {
@@ -2243,6 +2326,7 @@ impl MediaCatalogStore for SqliteDatabase {
             virtual_folder_id,
             start_index,
             limit,
+            include_total_record_count,
             filter,
         )
     }
@@ -2260,6 +2344,24 @@ impl MediaCatalogStore for SqliteDatabase {
         user_id: Uuid,
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItem>>> + Send + '_ {
         SqliteDatabase::tv_next_up_candidate_items(self, user_id)
+    }
+
+    fn tv_next_up_candidate_page(
+        &self,
+        user_id: Uuid,
+        virtual_folder_id: Option<Uuid>,
+        start_index: usize,
+        limit: usize,
+        include_total_record_count: bool,
+    ) -> impl std::future::Future<Output = anyhow::Result<TvNextUpPage>> + Send + '_ {
+        SqliteDatabase::tv_next_up_candidate_page(
+            self,
+            user_id,
+            virtual_folder_id,
+            start_index,
+            limit,
+            include_total_record_count,
+        )
     }
 
     fn media_items_by_ids<'a>(
@@ -2284,6 +2386,21 @@ impl MediaCatalogStore for SqliteDatabase {
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemFacetValue>>> + Send + 'a
     {
         SqliteDatabase::media_item_facet_values(self, kind, virtual_folder_ids)
+    }
+
+    fn media_item_facet_values_for_effective_types<'a>(
+        &'a self,
+        kind: MediaItemFacetKind,
+        virtual_folder_ids: &'a [Uuid],
+        effective_item_types: &'a [String],
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<MediaItemFacetValue>>> + Send + 'a
+    {
+        SqliteDatabase::media_item_facet_values_for_effective_types(
+            self,
+            kind,
+            virtual_folder_ids,
+            effective_item_types,
+        )
     }
 
     fn media_item_facet_by_entity_id<'a>(
@@ -2491,6 +2608,9 @@ impl_xtream_catalog_store!(SqliteDatabase);
 
 #[cfg(any(test, feature = "sqlite"))]
 const SQLITE_MEDIA_ITEM_TYPE_SQL: &str = r#"CASE
+    WHEN item.media_type = 'Series'
+         AND lower(coalesce(json_extract(item.metadata_json, '$.PluginVodKind'), '')) = 'series'
+        THEN 'series'
     WHEN item.media_type = 'Video' AND item.collection_type = 'movies' THEN 'movie'
     WHEN item.media_type = 'Video'
          AND item.collection_type IN ('musicvideos', 'musicvideo') THEN 'musicvideo'
@@ -2534,6 +2654,21 @@ fn push_sqlite_catalog_filters(
     query: &MediaItemCatalogQuery,
 ) -> anyhow::Result<()> {
     builder.push(" WHERE item.missing_since IS NULL");
+
+    if let Some(allowed) = query.allowed_plugin_tuner_ids.as_ref() {
+        builder.push(" AND (item.path NOT LIKE 'plugin-vod://%' OR ");
+        if allowed.is_empty() {
+            builder.push("0");
+        } else {
+            builder.push("lower(coalesce(json_extract(item.metadata_json, '$.TunerId'), '')) IN (");
+            let mut separated = builder.separated(", ");
+            for value in allowed {
+                separated.push_bind(value.to_ascii_lowercase());
+            }
+            separated.push_unseparated(")");
+        }
+        builder.push(")");
+    }
 
     if !query.ids.is_empty() {
         let ids = query
@@ -2875,6 +3010,13 @@ fn push_sqlite_catalog_order(builder: &mut QueryBuilder<Sqlite>, query: &MediaIt
             MediaItemCatalogSortField::SortName => "lower(item.name)",
             MediaItemCatalogSortField::DateCreated => "item.created_at",
             MediaItemCatalogSortField::DateLastMediaAdded => "item.updated_at",
+            MediaItemCatalogSortField::PremiereDate => {
+                "COALESCE(json_extract(item.metadata_json, '$.PremiereDate'), json_extract(item.metadata_json, '$.ProductionYear'))"
+            }
+            MediaItemCatalogSortField::CommunityRating => {
+                "CAST(COALESCE(json_extract(item.metadata_json, '$.CommunityRating'), json_extract(item.metadata_json, '$.Rating')) AS REAL)"
+            }
+            MediaItemCatalogSortField::DatePlayed => "playback.updated_at",
         });
         builder.push(match direction {
             SortDirection::Ascending => " ASC",
@@ -8592,6 +8734,31 @@ impl SqliteDatabase {
         rows.into_iter().map(TryInto::try_into).collect()
     }
 
+    /// Bounded source for the trailer endpoints. See the PostgreSQL adapter for the rationale.
+    pub async fn media_items_with_remote_trailers(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MediaItem>> {
+        let rows = sqlx::query_as::<_, MediaItemRow>(
+            r#"
+            SELECT id, virtual_folder_id, name, path, media_type, collection_type,
+                   file_size, runtime_ticks, bitrate, width, height, media_streams_json,
+                   created_at, updated_at
+            FROM media_items
+            WHERE missing_since IS NULL
+              AND (json_extract(metadata_json, '$.RemoteTrailers') IS NOT NULL
+                   OR json_extract(metadata_json, '$.Trailers') IS NOT NULL)
+            ORDER BY name COLLATE NOCASE
+            LIMIT ?1
+            "#,
+        )
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
     pub async fn media_items_by_name_search(
         &self,
         search_term: &str,
@@ -8666,15 +8833,18 @@ impl SqliteDatabase {
         validate_media_item_catalog_query(query)?;
         let mut transaction = self.pool.begin().await?;
 
-        let mut count = QueryBuilder::<Sqlite>::new("SELECT COUNT(*) ");
-        push_sqlite_catalog_from(&mut count, query);
-        push_sqlite_catalog_filters(&mut count, query)?;
-        let total_record_count = count
-            .build_query_scalar::<i64>()
-            .fetch_one(&mut *transaction)
-            .await?;
-        let total_record_count =
-            usize::try_from(total_record_count).context("media catalog count exceeded usize")?;
+        let total_record_count = if query.include_total_record_count {
+            let mut count = QueryBuilder::<Sqlite>::new("SELECT COUNT(*) ");
+            push_sqlite_catalog_from(&mut count, query);
+            push_sqlite_catalog_filters(&mut count, query)?;
+            let count = count
+                .build_query_scalar::<i64>()
+                .fetch_one(&mut *transaction)
+                .await?;
+            usize::try_from(count).context("media catalog count exceeded usize")?
+        } else {
+            0
+        };
 
         let effective_limit = query.limit.min(MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE);
         if effective_limit == 0 {
@@ -9362,6 +9532,7 @@ impl SqliteDatabase {
             virtual_folder_id,
             start_index,
             limit,
+            true,
             TvSeriesCatalogNameFilter::default(),
         )
         .await
@@ -9372,6 +9543,7 @@ impl SqliteDatabase {
         virtual_folder_id: Option<Uuid>,
         start_index: usize,
         limit: usize,
+        include_total_record_count: bool,
         filter: TvSeriesCatalogNameFilter,
     ) -> anyhow::Result<Option<TvSeriesCatalogPage>> {
         let search_pattern = filter
@@ -9470,7 +9642,7 @@ impl SqliteDatabase {
         .fetch_one(&mut *transaction)
         .await?;
         if projection_covered == 0 {
-            let page = Self::tv_series_catalog_page_from_live(
+            let mut page = Self::tv_series_catalog_page_from_live(
                 &mut transaction,
                 virtual_folder_ids.as_ref(),
                 start_index,
@@ -9478,17 +9650,25 @@ impl SqliteDatabase {
                 name_patterns,
             )
             .await?;
+            if !include_total_record_count && let Some(page) = page.as_mut() {
+                page.total_record_count = 0;
+            }
             transaction.commit().await?;
             return Ok(page);
         }
         let requested_limit = limit;
         let limit = i64::try_from(limit.max(1))?;
         let offset = i64::try_from(start_index)?;
-        let mut series = sqlx::query_as::<_, (String, String, i64)>(
+        let total_projection = if include_total_record_count {
+            "COUNT(*) OVER ()"
+        } else {
+            "0"
+        };
+        let series_sql = format!(
             r#"
             SELECT series.series_id,
                    min(series.series_name) AS series_name,
-                   COUNT(*) OVER () AS total_series
+                   {total_projection} AS total_series
             FROM media_item_tv_series AS series
             JOIN media_item_tv_series_coverage AS coverage
               ON coverage.virtual_folder_id = series.virtual_folder_id
@@ -9502,27 +9682,33 @@ impl SqliteDatabase {
             ORDER BY series_name COLLATE NOCASE, series_name, series_id
             LIMIT ?3 OFFSET ?4
             "#,
-        )
-        .bind(
-            virtual_folder_ids
-                .as_ref()
-                .map(|(simple, _)| simple.as_str()),
-        )
-        .bind(
-            virtual_folder_ids
-                .as_ref()
-                .map(|(_, dashed)| dashed.as_str()),
-        )
-        .bind(limit)
-        .bind(offset)
-        .bind(TV_SERIES_CATALOG_PROJECTION_VERSION)
-        .bind(search_pattern.as_deref())
-        .bind(starts_with_pattern.as_deref())
-        .bind(lower_bound.as_deref())
-        .bind(upper_bound.as_deref())
-        .fetch_all(&mut *transaction)
-        .await?;
-        let total = if let Some((_, _, total)) = series.first() {
+        );
+        // The only interpolated fragment is one of the two fixed aggregate projections above;
+        // every request-controlled value remains a bind parameter.
+        let mut series =
+            sqlx::query_as::<_, (String, String, i64)>(sqlx::AssertSqlSafe(series_sql.as_str()))
+                .bind(
+                    virtual_folder_ids
+                        .as_ref()
+                        .map(|(simple, _)| simple.as_str()),
+                )
+                .bind(
+                    virtual_folder_ids
+                        .as_ref()
+                        .map(|(_, dashed)| dashed.as_str()),
+                )
+                .bind(limit)
+                .bind(offset)
+                .bind(TV_SERIES_CATALOG_PROJECTION_VERSION)
+                .bind(search_pattern.as_deref())
+                .bind(starts_with_pattern.as_deref())
+                .bind(lower_bound.as_deref())
+                .bind(upper_bound.as_deref())
+                .fetch_all(&mut *transaction)
+                .await?;
+        let total = if !include_total_record_count {
+            0
+        } else if let Some((_, _, total)) = series.first() {
             *total
         } else if start_index == 0 {
             0
@@ -10033,6 +10219,51 @@ impl SqliteDatabase {
         result
     }
 
+    /// SQLite/test implementation of the bounded NextUp page.
+    ///
+    /// Production PostgreSQL performs grouping, ordering and paging in SQL. SQLite retains the
+    /// exact compatibility parser here so both adapters expose the same repository contract.
+    pub async fn tv_next_up_candidate_page(
+        &self,
+        user_id: Uuid,
+        virtual_folder_id: Option<Uuid>,
+        start_index: usize,
+        limit: usize,
+        include_total_record_count: bool,
+    ) -> anyhow::Result<TvNextUpPage> {
+        let candidates = self.tv_next_up_candidate_items(user_id).await?;
+        let mut next_by_series = HashMap::<String, MediaItem>::new();
+        for candidate in candidates.into_iter().filter(|candidate| {
+            virtual_folder_id.is_none_or(|folder_id| candidate.virtual_folder_id == folder_id)
+        }) {
+            if effective_media_item_type(&candidate) != "Episode" {
+                continue;
+            }
+            let key = tv_episode_series_key(&candidate);
+            match next_by_series.get(&key) {
+                Some(existing)
+                    if compare_tv_episode_items(existing, &candidate)
+                        != std::cmp::Ordering::Greater => {}
+                _ => {
+                    next_by_series.insert(key, candidate);
+                }
+            }
+        }
+        let mut items = next_by_series.into_values().collect::<Vec<_>>();
+        items.sort_by(compare_tv_episode_items);
+        let total_record_count = if include_total_record_count {
+            items.len()
+        } else {
+            0
+        };
+        let items = items.into_iter().skip(start_index).take(limit).collect();
+        Ok(TvNextUpPage {
+            items,
+            total_record_count,
+            start_index,
+        })
+    }
+
     /// Exact visible items for a bounded id list, preserving the caller's order.
     ///
     /// This hydrates a page whose selection ran on rows without `media_streams`.
@@ -10442,6 +10673,16 @@ impl SqliteDatabase {
         kind: MediaItemFacetKind,
         virtual_folder_ids: &[Uuid],
     ) -> anyhow::Result<Vec<MediaItemFacetValue>> {
+        self.media_item_facet_values_for_effective_types(kind, virtual_folder_ids, &[])
+            .await
+    }
+
+    pub async fn media_item_facet_values_for_effective_types(
+        &self,
+        kind: MediaItemFacetKind,
+        virtual_folder_ids: &[Uuid],
+        effective_item_types: &[String],
+    ) -> anyhow::Result<Vec<MediaItemFacetValue>> {
         let mut query = QueryBuilder::<Sqlite>::new(
             r#"
             SELECT normalized_value, display_value, stable_id, payload_json
@@ -10463,6 +10704,17 @@ impl SqliteDatabase {
             let mut separated = query.separated(", ");
             for folder_id in virtual_folder_ids {
                 separated.push_bind(folder_id.to_string());
+            }
+            separated.push_unseparated(")");
+        }
+        if !effective_item_types.is_empty() {
+            query
+                .push(" AND (")
+                .push(SQLITE_MEDIA_ITEM_TYPE_SQL)
+                .push(") IN (");
+            let mut separated = query.separated(", ");
+            for item_type in effective_item_types {
+                separated.push_bind(item_type);
             }
             separated.push_unseparated(")");
         }
@@ -10635,6 +10887,11 @@ impl SqliteDatabase {
             query.push(")");
         }
         query.push(" ORDER BY facet.item_id");
+        if let Some(limit) = query_spec.limit {
+            query
+                .push(" LIMIT ")
+                .push_bind(i64::try_from(limit).unwrap_or(i64::MAX));
+        }
         query
             .build_query_scalar::<String>()
             .fetch_all(&self.pool)
@@ -16483,7 +16740,7 @@ fn ffprobe_hex_dump_bytes(value: &str, max_bytes: usize) -> Option<Vec<u8>> {
             if group.is_empty() || group.len() > 8 || group.len() % 2 != 0 {
                 return None;
             }
-            for pair in group.as_bytes().chunks_exact(2) {
+            for pair in group.as_bytes().as_chunks::<2>().0 {
                 let pair = std::str::from_utf8(pair).ok()?;
                 bytes.push(u8::from_str_radix(pair, 16).ok()?);
                 if bytes.len() > max_bytes {
@@ -16525,7 +16782,9 @@ fn ffprobe_teletext_services(stream: &Value) -> Vec<Value> {
     }
     let languages = normalized_teletext_languages(stream);
     descriptors
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .take(MAX_TELETEXT_SERVICES)
         .enumerate()
         .filter_map(|(index, descriptor)| {
@@ -19821,6 +20080,7 @@ mod tests {
                 None,
                 0,
                 20,
+                true,
                 TvSeriesCatalogNameFilter {
                     search_term: Some("example".to_string()),
                     ..TvSeriesCatalogNameFilter::default()
@@ -19832,11 +20092,19 @@ mod tests {
         assert_eq!(searched.total_record_count, 1);
         assert_eq!(searched.series.len(), 1);
         assert_eq!(searched.series[0].name, "Example Show");
+        let without_total = db
+            .tv_series_catalog_search_page(None, 0, 20, false, TvSeriesCatalogNameFilter::default())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(without_total.total_record_count, 0);
+        assert_eq!(without_total.series.len(), 1);
         let letter_page = db
             .tv_series_catalog_search_page(
                 None,
                 0,
                 20,
+                true,
                 TvSeriesCatalogNameFilter {
                     starts_with: Some("E".to_string()),
                     starts_with_or_greater: Some("E".to_string()),
@@ -19854,6 +20122,7 @@ mod tests {
                 None,
                 0,
                 20,
+                true,
                 TvSeriesCatalogNameFilter {
                     search_term: Some("missing".to_string()),
                     ..TvSeriesCatalogNameFilter::default()
@@ -19992,6 +20261,61 @@ mod tests {
             .unwrap();
         assert_eq!(empty_candidates.len(), 1);
         assert_eq!(empty_candidates[0].item.media_type, "Series");
+    }
+
+    #[tokio::test]
+    async fn sqlite_catalog_filters_plugin_vod_by_allowed_tuner_before_paging() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let item = |name: &str, tuner_id: &str| RemoteMediaItemUpsert {
+            id: Uuid::new_v4().to_string(),
+            name: name.to_string(),
+            path: format!("plugin-vod://private/{tuner_id}/{name}"),
+            media_type: "Video".to_string(),
+            collection_type: "movies".to_string(),
+            runtime_ticks: None,
+            bitrate: None,
+            width: None,
+            height: None,
+            media_streams: Vec::new(),
+            metadata: json!({
+                "Provider": "plugin:private",
+                "TunerId": tuner_id,
+                "PluginVodKind": "movie"
+            }),
+        };
+        db.replace_remote_media_library_snapshot(
+            "Private sources",
+            "movies",
+            "plugin-vod://private/catalog",
+            vec![item("Allowed", "tuner-a"), item("Denied", "tuner-b")],
+        )
+        .await
+        .unwrap();
+
+        let page = db
+            .media_item_catalog_page(&MediaItemCatalogQuery {
+                start_index: 0,
+                limit: 1,
+                allowed_plugin_tuner_ids: Some(vec!["TUNER-A".to_string()]),
+                ..MediaItemCatalogQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.total_record_count, 1);
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].item.name, "Allowed");
+
+        let hidden = db
+            .media_item_catalog_page(&MediaItemCatalogQuery {
+                start_index: 0,
+                limit: 20,
+                allowed_plugin_tuner_ids: Some(Vec::new()),
+                ..MediaItemCatalogQuery::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(hidden.total_record_count, 0);
+        assert!(hidden.items.is_empty());
     }
 
     #[tokio::test]
