@@ -33794,6 +33794,100 @@ async fn resolved_media_catalog_query_for_items(
     Ok(Some(db_query))
 }
 
+/// One shared page of the bounded catalogue.
+///
+/// Deliberately has no place to put a playback state: the payload is shared between users, and the
+/// watch state is attached to the entries after it is read. A type that cannot carry it is what
+/// makes that impossible to get wrong later.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SharedCatalogPage {
+    entries: Vec<SharedCatalogEntry>,
+    total_record_count: usize,
+    start_index: usize,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SharedCatalogEntry {
+    item: MediaItem,
+    metadata: serde_json::Value,
+}
+
+/// Whether one resolved catalogue query produces the same page for every user.
+///
+/// Played, favourite and resumable predicates select different rows per user, and ordering by the
+/// date something was played orders them differently, so those pages are never shared. Everything
+/// else differs only in the watch state attached to each row.
+fn shareable_catalog_page_cache_key(query: &MediaItemCatalogQuery) -> Option<String> {
+    if query.is_played.is_some()
+        || query.favorite.is_some()
+        || query.is_resumable
+        || query
+            .sort
+            .iter()
+            .any(|(field, _)| matches!(field, MediaItemCatalogSortField::DatePlayed))
+    {
+        return None;
+    }
+    let mut shared = query.clone();
+    shared.user_id = None;
+    // The resolved query fully determines the page, so its own representation is the fingerprint.
+    Some(catalog_cache::catalog_page_cache_key(&format!(
+        "{shared:?}"
+    )))
+}
+
+/// One page of the bounded catalogue, shared between users where the query allows it.
+async fn shared_catalog_page(
+    db: &Database,
+    db_query: &MediaItemCatalogQuery,
+    user_id: Option<Uuid>,
+) -> Result<(Vec<MediaItemCatalogEntry>, usize, usize), ApiError> {
+    let Some(cache_key) = shareable_catalog_page_cache_key(db_query) else {
+        let page = MediaCatalogStore::media_item_catalog_page(db, db_query).await?;
+        return Ok((page.items, page.total_record_count, page.start_index));
+    };
+    let shared = catalog_cache::cached_shared_payload(&cache_key, || async {
+        let page = MediaCatalogStore::media_item_catalog_page(db, db_query).await?;
+        Ok(SharedCatalogPage {
+            entries: page
+                .items
+                .into_iter()
+                .map(|entry| SharedCatalogEntry {
+                    item: entry.item,
+                    metadata: entry.metadata,
+                })
+                .collect(),
+            total_record_count: page.total_record_count,
+            start_index: page.start_index,
+        })
+    })
+    .await?;
+
+    let mut playback_by_item = HashMap::new();
+    if let Some(user_id) = user_id {
+        let item_ids = shared
+            .entries
+            .iter()
+            .map(|entry| entry.item.id)
+            .collect::<Vec<_>>();
+        playback_by_item = MediaCatalogStore::playback_states_for_items(db, user_id, &item_ids)
+            .await?
+            .into_iter()
+            .map(|state| (state.item_id, state))
+            .collect();
+    }
+    let entries = shared
+        .entries
+        .into_iter()
+        .map(|entry| MediaItemCatalogEntry {
+            playback_state: playback_by_item.get(&entry.item.id).cloned(),
+            item: entry.item,
+            metadata: entry.metadata,
+        })
+        .collect();
+    Ok((entries, shared.total_record_count, shared.start_index))
+}
+
 async fn media_catalog_items_result(
     db: &Database,
     query: &ItemsQuery,
@@ -33803,10 +33897,10 @@ async fn media_catalog_items_result(
     let Some(db_query) = resolved_media_catalog_query_for_items(db, query, user_id).await? else {
         return Ok(None);
     };
-    let page = MediaCatalogStore::media_item_catalog_page(db, &db_query).await?;
+    let (entries, total_record_count, start_index) =
+        shared_catalog_page(db, &db_query, user_id).await?;
     let compact = should_use_compact_items_result(query);
-    let items = page
-        .items
+    let items = entries
         .iter()
         .map(|entry| {
             let item = if compact {
@@ -33824,8 +33918,8 @@ async fn media_catalog_items_result(
         .collect();
     Ok(Some(Json(query_result_with_total(
         items,
-        page.total_record_count,
-        page.start_index,
+        total_record_count,
+        start_index,
     ))))
 }
 
@@ -95770,20 +95864,17 @@ done
                 (status, body)
             }
         };
-        let listing = |user: String| {
-            let call = call.clone();
-            async move {
-                let (status, body) = call(
-                    format!(
-                        "/Users/{user}/Items?ParentId=&IncludeItemTypes=Series&Recursive=true&Limit=10"
-                    )
-                    .replace("ParentId=&", ""),
-                    Method::GET,
+        let listing = |user: String| async move {
+            let (status, body) = call(
+                format!(
+                    "/Users/{user}/Items?ParentId=&IncludeItemTypes=Series&Recursive=true&Limit=10"
                 )
-                .await;
-                assert_eq!(status, StatusCode::OK);
-                serde_json::from_slice::<Value>(&body).unwrap()
-            }
+                .replace("ParentId=&", ""),
+                Method::GET,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            serde_json::from_slice::<Value>(&body).unwrap()
         };
 
         // One episode watched by the first user only.

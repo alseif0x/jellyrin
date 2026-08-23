@@ -299,6 +299,17 @@ where
     Ok(payload)
 }
 
+/// Key for one page of the bounded catalogue.
+///
+/// The fingerprint is the resolved database query with its user cleared: once a query carries no
+/// user-dependent predicate, the rows and their order are the same for everybody, and only the
+/// watch state attached afterwards differs.
+pub(crate) fn catalog_page_cache_key(query_fingerprint: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(query_fingerprint.as_bytes());
+    format!("{CACHE_NAMESPACE}:catalog-page:{:x}", digest.finalize())
+}
+
 /// Key for one page of a folder's series listing.
 ///
 /// The catalogue half of that page is the same for every user, so the key deliberately carries no
