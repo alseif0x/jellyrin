@@ -36690,13 +36690,28 @@ async fn item_detail(
     if let Some(channel) = live_tv_channel_json_by_id(&state.db, &item_id).await? {
         return Ok(Json(channel));
     }
+    if let Some((series_name, series_id, mut summary)) =
+        tv_season_summary_by_id(&state.db, &item_id, None, false).await?
+    {
+        ensure_plugin_catalog_item_visible(&state.db, &summary.metadata, &user_context).await?;
+        enrich_plugin_vod_virtual_metadata(&state, &item_id, true, &mut summary.metadata).await;
+        return Ok(Json(tv_season_json(
+            &server_id,
+            &series_name,
+            &series_id,
+            summary,
+        )));
+    }
+    // A season id is also a syntactically valid Jellyfin UUID. Resolve the indexed SeasonId
+    // projection before trying the synthetic-series fallback; doing this in the opposite order
+    // scans every legacy episode without a canonical SeriesId before a web season page can open.
     if let Some(mut summary) = tv_series_summary_by_id(&state.db, &item_id, None).await? {
         ensure_plugin_catalog_item_visible(&state.db, &summary.metadata, &user_context).await?;
         enrich_plugin_vod_virtual_metadata(&state, &item_id, false, &mut summary.metadata).await;
         return Ok(Json(tv_series_json(&server_id, summary)));
     }
     if let Some((series_name, series_id, mut summary)) =
-        tv_season_summary_by_id(&state.db, &item_id, None).await?
+        tv_season_summary_by_id(&state.db, &item_id, None, true).await?
     {
         ensure_plugin_catalog_item_visible(&state.db, &summary.metadata, &user_context).await?;
         enrich_plugin_vod_virtual_metadata(&state, &item_id, true, &mut summary.metadata).await;
@@ -36805,6 +36820,18 @@ async fn current_user_item_detail(
     if let Some(channel) = live_tv_channel_json_by_id(&state.db, &item_id).await? {
         return Ok(Json(channel));
     }
+    if let Some((series_name, series_id, mut summary)) =
+        tv_season_summary_by_id(&state.db, &item_id, Some(requested_user_id), false).await?
+    {
+        ensure_plugin_catalog_item_visible(&state.db, &summary.metadata, &user_context).await?;
+        enrich_plugin_vod_virtual_metadata(&state, &item_id, true, &mut summary.metadata).await;
+        return Ok(Json(tv_season_json(
+            &server_id,
+            &series_name,
+            &series_id,
+            summary,
+        )));
+    }
     if let Some(mut summary) =
         tv_series_summary_by_id(&state.db, &item_id, Some(requested_user_id)).await?
     {
@@ -36813,7 +36840,7 @@ async fn current_user_item_detail(
         return Ok(Json(tv_series_json(&server_id, summary)));
     }
     if let Some((series_name, series_id, mut summary)) =
-        tv_season_summary_by_id(&state.db, &item_id, Some(requested_user_id)).await?
+        tv_season_summary_by_id(&state.db, &item_id, Some(requested_user_id), true).await?
     {
         ensure_plugin_catalog_item_visible(&state.db, &summary.metadata, &user_context).await?;
         enrich_plugin_vod_virtual_metadata(&state, &item_id, true, &mut summary.metadata).await;
@@ -36908,13 +36935,25 @@ async fn user_item_detail(
     if let Some(channel) = live_tv_channel_json_by_id(&state.db, &item_id).await? {
         return Ok(Json(channel));
     }
+    if let Some((series_name, series_id, mut summary)) =
+        tv_season_summary_by_id(&state.db, &item_id, Some(user_id), false).await?
+    {
+        ensure_plugin_catalog_item_visible(&state.db, &summary.metadata, &user_context).await?;
+        enrich_plugin_vod_virtual_metadata(&state, &item_id, true, &mut summary.metadata).await;
+        return Ok(Json(tv_season_json(
+            &server_id,
+            &series_name,
+            &series_id,
+            summary,
+        )));
+    }
     if let Some(mut summary) = tv_series_summary_by_id(&state.db, &item_id, Some(user_id)).await? {
         ensure_plugin_catalog_item_visible(&state.db, &summary.metadata, &user_context).await?;
         enrich_plugin_vod_virtual_metadata(&state, &item_id, false, &mut summary.metadata).await;
         return Ok(Json(tv_series_json(&server_id, summary)));
     }
     if let Some((series_name, series_id, mut summary)) =
-        tv_season_summary_by_id(&state.db, &item_id, Some(user_id)).await?
+        tv_season_summary_by_id(&state.db, &item_id, Some(user_id), true).await?
     {
         ensure_plugin_catalog_item_visible(&state.db, &summary.metadata, &user_context).await?;
         enrich_plugin_vod_virtual_metadata(&state, &item_id, true, &mut summary.metadata).await;
@@ -37170,7 +37209,7 @@ async fn item_metadata_editor(
         })));
     }
     if let Some((series_name, series_id, summary)) =
-        tv_season_summary_by_id(&state.db, &item_id, None).await?
+        tv_season_summary_by_id(&state.db, &item_id, None, true).await?
     {
         let item = tv_season_json(&server_id, &series_name, &series_id, summary);
         return Ok(Json(serde_json::json!({
@@ -37358,7 +37397,7 @@ async fn item_external_id_infos(
     if series_name_for_id(&state.db, &item_id).await?.is_some() {
         return Ok(Json(external_id_infos_for_item_type("Series")));
     }
-    if tv_season_summary_by_id(&state.db, &item_id, None)
+    if tv_season_summary_by_id(&state.db, &item_id, None, true)
         .await?
         .is_some()
     {
@@ -49428,11 +49467,7 @@ async fn stream_plugin_vod_media_with_cache(
             )
             .await?;
         }
-        if matches!(
-            upstream.status(),
-            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
-        ) && attempt == 0
-        {
+        if plugin_vod_playback_grant_was_rejected(upstream.status()) && attempt == 0 {
             // Dropping both the response and playback value zeroizes the rejected sensitive URL
             // before asking the provider for a replacement.
             if let Some(cache) = &cache {
@@ -49445,6 +49480,18 @@ async fn stream_plugin_vod_media_with_cache(
     Err(ApiError::service_unavailable(
         "VOD provider authorization was rejected",
     ))
+}
+
+fn plugin_vod_playback_grant_was_rejected(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        // MAGSTV reports an already-consumed/expired signed VOD grant as 400, while other
+        // providers use the conventional authorization statuses. Retry each exactly once with a
+        // newly resolved in-memory grant; the source URL is still never persisted or disclosed.
+        reqwest::StatusCode::BAD_REQUEST
+            | reqwest::StatusCode::UNAUTHORIZED
+            | reqwest::StatusCode::FORBIDDEN
+    )
 }
 
 async fn plugin_vod_upstream_response(
@@ -57494,6 +57541,7 @@ async fn tv_season_summary_by_id(
     db: &Database,
     season_id: &str,
     user_id: Option<Uuid>,
+    allow_synthetic_fallback: bool,
 ) -> Result<Option<(String, String, TvSeasonSummary)>, ApiError> {
     // Resolving one season must not materialize every episode in the library along with its
     // metadata;
@@ -57502,12 +57550,13 @@ async fn tv_season_summary_by_id(
         .await?
     {
         Some(snapshot) => (snapshot.items, snapshot.metadata_by_item),
-        None => {
+        None if allow_synthetic_fallback => {
             let items = db.media_items_by_collection_type("tvshows").await?;
             let metadata_by_item =
                 media_metadata_by_item_id(db, items.iter().map(|item| item.id).collect()).await?;
             (items, metadata_by_item)
         }
+        None => return Ok(None),
     };
     let items = items
         .into_iter()
@@ -57528,10 +57577,10 @@ async fn tv_season_summary_by_id(
     let mut summary = None::<TvSeasonSummary>;
 
     for item in items {
-        let Some(info) = tv_episode_info(&item) else {
+        let metadata = metadata_by_item.get(&item.id);
+        let Some(info) = tv_episode_info_with_metadata(&item, metadata) else {
             continue;
         };
-        let metadata = metadata_by_item.get(&item.id);
         series_name.get_or_insert_with(|| info.series_name.clone());
         series_id.get_or_insert_with(|| tv_series_id_for_episode(&info, metadata));
         let playback = playback_by_item.get(&item.id);
@@ -60983,7 +61032,7 @@ fn tv_episode_matches_season(
     metadata: Option<&serde_json::Value>,
     season_id: &str,
 ) -> bool {
-    tv_episode_info(item)
+    tv_episode_info_with_metadata(item, metadata)
         .map(|info| {
             jellyfin_id_matches(&tv_season_id_for_episode(&info, metadata), season_id)
                 || jellyfin_id_matches(
@@ -61155,7 +61204,7 @@ fn tv_season_parent_from_snapshot(
         {
             return None;
         }
-        let info = tv_episode_info(item)?;
+        let info = tv_episode_info_with_metadata(item, snapshot.metadata_by_item.get(&item.id))?;
         Some((
             info.series_name.clone(),
             tv_series_id_for_episode(&info, snapshot.metadata_by_item.get(&item.id)),
@@ -102015,6 +102064,35 @@ done
             }
         }
 
+        // Jellyfin Web opens a season through its item-detail routes after loading the season
+        // list. A canonical SeasonId must be classified as a season before the synthetic-series
+        // fallback and must trust the imported numbering instead of parsing the opaque path.
+        for endpoint in [
+            format!("/Items/{season_id}"),
+            format!("/Users/{}/Items/{season_id}", user.id),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(&endpoint)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            let detail: Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(detail["Type"], "Season", "{endpoint}");
+            assert_eq!(detail["Name"], "Season 1", "{endpoint}");
+            assert_eq!(detail["IndexNumber"], 1, "{endpoint}");
+            assert_eq!(detail["ChildCount"], 2, "{endpoint}");
+            assert_eq!(detail["SeriesName"], "Anchored Show", "{endpoint}");
+        }
+
         let image_response = app
             .oneshot(
                 Request::builder()
@@ -109722,6 +109800,24 @@ done
             &stale_failed,
             "revision-a"
         ));
+    }
+
+    #[test]
+    fn plugin_vod_retries_consumed_or_expired_playback_grants_only() {
+        for status in [
+            reqwest::StatusCode::BAD_REQUEST,
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::FORBIDDEN,
+        ] {
+            assert!(super::plugin_vod_playback_grant_was_rejected(status));
+        }
+        for status in [
+            reqwest::StatusCode::NOT_FOUND,
+            reqwest::StatusCode::RANGE_NOT_SATISFIABLE,
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            assert!(!super::plugin_vod_playback_grant_was_rejected(status));
+        }
     }
 
     #[test]
