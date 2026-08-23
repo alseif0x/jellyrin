@@ -95692,6 +95692,153 @@ done
         assert_eq!(ratings[43]["Value"], 17);
     }
 
+    /// A shared series page must still report each user's own watch state.
+    ///
+    /// The catalogue half of a library page is assembled once and shared between users, so the
+    /// watch state is applied afterwards for whoever asked. This pins that separation: if the
+    /// shared payload ever carried one user's progress, the second listing here would inherit it.
+    #[tokio::test]
+    #[serial(playback_events)]
+    async fn shared_series_listing_reports_each_user_own_watch_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage_root = tempfile::tempdir().unwrap();
+        let season = tmp.path().join("Show One").join("Season 01");
+        tokio::fs::create_dir_all(&season).await.unwrap();
+        for (index, episode) in ["Show One S01E01.mkv", "Show One S01E02.mkv"]
+            .into_iter()
+            .enumerate()
+        {
+            tokio::fs::write(season.join(episode), vec![b'v'; 2_048 + index])
+                .await
+                .unwrap();
+        }
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let watcher = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let bystander = db.create_user("second", Some("secret")).await.unwrap();
+        let watcher_key = db
+            .issue_api_key_for_user(watcher.id, "watcher-key")
+            .await
+            .unwrap();
+        let watcher_id = watcher.id.simple().to_string();
+        let bystander_id = bystander.id.simple().to_string();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: storage_root.path().join("logs"),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Library/VirtualFolders?name=Shows&collectionType=tvshows&paths={}",
+                        tmp.path().to_string_lossy()
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let call = |uri: String, method: Method| {
+            let app = app.clone();
+            let key = watcher_key.clone();
+            async move {
+                let response = app
+                    .oneshot(
+                        Request::builder()
+                            .method(method)
+                            .uri(uri)
+                            .header("X-Emby-Token", &key)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from("{}"))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                (status, body)
+            }
+        };
+        let listing = |user: String| {
+            let call = call.clone();
+            async move {
+                let (status, body) = call(
+                    format!(
+                        "/Users/{user}/Items?ParentId=&IncludeItemTypes=Series&Recursive=true&Limit=10"
+                    )
+                    .replace("ParentId=&", ""),
+                    Method::GET,
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK);
+                serde_json::from_slice::<Value>(&body).unwrap()
+            }
+        };
+
+        // One episode watched by the first user only.
+        let episodes = listing(watcher_id.clone()).await;
+        let series = episodes["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["Type"] == "Series")
+            .expect("the library lists its series")
+            .clone();
+        assert_eq!(series["UserData"]["UnplayedItemCount"], 2);
+
+        let episode_id = {
+            let (status, body) = call(
+                format!(
+                    "/Shows/{}/Episodes?userId={watcher_id}",
+                    series["Id"].as_str().unwrap()
+                ),
+                Method::GET,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let episodes: Value = serde_json::from_slice(&body).unwrap();
+            episodes["Items"][0]["Id"].as_str().unwrap().to_string()
+        };
+        let (status, _) = call(
+            format!("/Users/{watcher_id}/PlayedItems/{episode_id}"),
+            Method::POST,
+        )
+        .await;
+        assert!(status.is_success(), "marking played failed: {status}");
+
+        let watcher_view = listing(watcher_id).await;
+        let bystander_view = listing(bystander_id).await;
+        let unplayed = |result: &Value| {
+            result["Items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["Type"] == "Series")
+                .map(|item| item["UserData"]["UnplayedItemCount"].clone())
+        };
+        assert_eq!(
+            unplayed(&watcher_view),
+            Some(serde_json::json!(1)),
+            "the watching user sees one episode left"
+        );
+        assert_eq!(
+            unplayed(&bystander_view),
+            Some(serde_json::json!(2)),
+            "the other user must not inherit that progress from a shared page"
+        );
+    }
+
     /// A bare `ParentId` browse of a TV library lists its series, paged.
     ///
     /// `ParentId` addresses the library level, and that level is the series. The listing used to
