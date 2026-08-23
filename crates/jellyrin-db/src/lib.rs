@@ -180,6 +180,8 @@ pub type Database = SqliteDatabase;
 #[cfg(not(test))]
 pub type Database = ProductionDatabase;
 
+// Embedded through 202608230001. Bump this marker whenever a migration file is added so
+// incremental builds re-evaluate sqlx's directory macro.
 #[cfg(any(test, feature = "sqlite"))]
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 #[cfg(any(test, feature = "sqlite"))]

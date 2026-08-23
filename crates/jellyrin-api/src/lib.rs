@@ -34114,6 +34114,102 @@ async fn parent_series_seasons_items_result(
     ))
 }
 
+/// Resolve the direct `Series -> Episode` `/Items` shape used by Android TV without loading the
+/// complete media catalogue. A UUID-shaped `ParentId` can also be a real virtual folder, so leave
+/// those parents to the indexed catalogue path below and only project application-level series.
+async fn parent_series_episodes_items_result(
+    db: &Database,
+    query: &ItemsQuery,
+    user_id: Uuid,
+    server_id: &str,
+) -> Result<Option<Json<serde_json::Value>>, ApiError> {
+    let include_types = csv_values_lowercase(&query.include_item_types).unwrap_or_default();
+    if include_types != ["episode"]
+        || query.recursive == Some(true)
+        || query.ids.is_some()
+        || query.series_id.is_some()
+        || query.season_id.is_some()
+    {
+        return Ok(None);
+    }
+    let Some(series_id) = query.parent_id.as_deref() else {
+        return Ok(None);
+    };
+    let Ok(parent_id) = parse_jellyfin_uuid(series_id) else {
+        return Ok(None);
+    };
+    if db
+        .virtual_folders()
+        .await?
+        .iter()
+        .any(|folder| folder.id == parent_id)
+    {
+        return Ok(None);
+    }
+
+    let mut episode_query = query.clone();
+    episode_query.parent_id = None;
+
+    // Jellyfin Android TV also uses this exact shape with a Season id as ParentId while loading
+    // sibling episodes on the episode-detail screen. Resolve that indexed scope before treating
+    // the parent as a Series; otherwise a valid season falls through to the legacy synthetic-id
+    // scan of the entire TV catalogue and can exceed PostgreSQL's statement timeout.
+    let season_snapshot = match tv_episode_catalog_snapshot_for_season(db, series_id).await? {
+        some @ Some(_) => some,
+        None => {
+            let fallback = tv_episode_catalog_snapshot_without_canonical_series_id(db).await?;
+            fallback
+                .items
+                .iter()
+                .any(|item| {
+                    tv_episode_matches_season(
+                        item,
+                        fallback.metadata_by_item.get(&item.id),
+                        series_id,
+                    )
+                })
+                .then_some(fallback)
+        }
+    };
+    if let Some(season_snapshot) = season_snapshot {
+        let canonical_season_id = parent_id.simple().to_string();
+        let canonical_series_id = season_snapshot
+            .items
+            .iter()
+            .filter(|item| {
+                tv_episode_matches_season(
+                    item,
+                    season_snapshot.metadata_by_item.get(&item.id),
+                    series_id,
+                )
+            })
+            .find_map(|item| {
+                let metadata = season_snapshot.metadata_by_item.get(&item.id);
+                metadata
+                    .and_then(|metadata| canonical_metadata_uuid_from_json(metadata, &["SeriesId"]))
+                    .or_else(|| {
+                        tv_episode_info(item).map(|info| tv_series_id_for_episode(&info, metadata))
+                    })
+            });
+        if let Some(canonical_series_id) = canonical_series_id {
+            episode_query.season_id = Some(canonical_season_id);
+            return Ok(Some(
+                series_episodes_result(
+                    db,
+                    &episode_query,
+                    &canonical_series_id,
+                    user_id,
+                    server_id,
+                )
+                .await?,
+            ));
+        }
+    }
+    Ok(Some(
+        series_episodes_result(db, &episode_query, series_id, user_id, server_id).await?,
+    ))
+}
+
 async fn items_result(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -34178,6 +34274,16 @@ async fn items_result(
         return Ok(result);
     }
     if let Some(result) = parent_series_seasons_items_result(
+        &state.db,
+        &query,
+        requested_user_id.unwrap_or(auth_user.id),
+        &server_id,
+    )
+    .await?
+    {
+        return Ok(result);
+    }
+    if let Some(result) = parent_series_episodes_items_result(
         &state.db,
         &query,
         requested_user_id.unwrap_or(auth_user.id),
@@ -34879,7 +34985,10 @@ async fn virtual_folder_detail_json(
     let folders = db.virtual_folders().await?;
     let item_counts = db.media_item_counts_by_virtual_folder().await?;
     let child_count = virtual_folder_recursive_count(folder, &folders, &item_counts);
-    Ok(physical_folder_item_to_json(folder, server_id, child_count))
+    // A virtual folder is the root of a Jellyfin library and is advertised as a CollectionFolder
+    // by `/UserViews`. Keep the same type when a client hydrates that id through `/Items/{id}`;
+    // Wholphin rejects a mid-navigation type change to the physical-only `Folder` variant.
+    Ok(user_view_to_json_with_count(folder, server_id, child_count))
 }
 
 fn physical_folder_item_to_json(
@@ -50105,15 +50214,26 @@ async fn series_episodes(
         query.include_item_types.push("Episode".to_string());
     }
 
+    let server_id = state.db.server_state().await?.server_id.to_string();
+    series_episodes_result(&state.db, &query, &series_id, requested_user_id, &server_id).await
+}
+
+async fn series_episodes_result(
+    db: &Database,
+    query: &ItemsQuery,
+    series_id: &str,
+    requested_user_id: Uuid,
+    server_id: &str,
+) -> Result<Json<serde_json::Value>, ApiError> {
     let (
         TvEpisodeCatalogSnapshot {
             items,
             metadata_by_item,
         },
         resolved_series_id,
-    ) = tv_episode_catalog_snapshot_scoped_to_series(&state.db, &series_id).await?;
+    ) = tv_episode_catalog_snapshot_scoped_to_series(db, series_id).await?;
     let candidate_episodes =
-        filtered_media_items(items, &query, Some(requested_user_id), &state.db).await?;
+        filtered_media_items(items, query, Some(requested_user_id), db).await?;
     let mut episodes = candidate_episodes
         .into_iter()
         .filter(|item| {
@@ -50125,11 +50245,7 @@ async fn series_episodes(
             })
         })
         .collect::<Vec<_>>();
-    if episodes.is_empty()
-        && series_name_for_id(&state.db, &resolved_series_id)
-            .await?
-            .is_none()
-    {
+    if episodes.is_empty() && series_name_for_id(db, &resolved_series_id).await?.is_none() {
         return Err(ApiError::not_found("Series not found"));
     }
     episodes.sort_by(|left, right| {
@@ -50142,11 +50258,10 @@ async fn series_episodes(
     });
 
     let total_record_count = episodes.len();
-    let server_id = state.db.server_state().await?.server_id.to_string();
     let items = items_to_json(
-        &state.db,
-        paged_media_items(episodes, &query),
-        &server_id,
+        db,
+        paged_media_items(episodes, query),
+        server_id,
         Some(requested_user_id),
         false,
     )
@@ -57560,10 +57675,18 @@ fn primary_image_tag_for_metadata(item_id: &str, metadata: Option<&serde_json::V
         })
     });
     if provider_image_is_ready {
-        // v2 invalidates television-client entries created while the provider image was still
-        // being hydrated. Those clients cache by tag and otherwise keep the earlier placeholder
-        // even after the durable provider raster becomes available.
-        format!("provider-raster-v2-{item_id}")
+        // A resolved raster must never reuse the key under which a television client may have
+        // cached the provisional generated tile.
+        format!("provider-raster-v6-{item_id}")
+    } else if metadata.is_some_and(|metadata| {
+        is_plugin_vod_remote_media(Some(metadata))
+            || json_field_case_insensitive(metadata, "PluginVodImageCandidate")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+    }) {
+        // This distinct key makes the client request the provider-backed route before hydration.
+        // Once hydration succeeds, the ready marker above changes the key again.
+        format!("provider-probe-v5-{item_id}")
     } else {
         default_primary_image_tag(item_id)
     }
@@ -57976,7 +58099,7 @@ fn apply_media_item_metadata(
                     object
                         .get("SeriesId")
                         .and_then(serde_json::Value::as_str)
-                        .map(default_primary_image_tag)
+                        .map(|series_id| primary_image_tag_for_metadata(series_id, Some(metadata)))
                 })
                 .flatten()
         });
@@ -61109,6 +61232,11 @@ impl TvSeasonSummary {
     }
 
     fn merge_episode_metadata(&mut self, metadata: &serde_json::Value) {
+        if is_plugin_vod_remote_media(Some(metadata)) {
+            // Internal presentation marker only. `tv_season_json` copies a fixed allowlist of
+            // public fields, so this cannot expose the provider reference used to derive it.
+            self.metadata["PluginVodImageCandidate"] = serde_json::json!(true);
+        }
         if self.id.is_none() {
             self.id = canonical_metadata_uuid_from_json(metadata, &["SeasonId"]);
         }
@@ -61125,6 +61253,16 @@ impl TvSeasonSummary {
                 && let Some(value) = first_metadata_value_from_json(metadata, keys)
             {
                 self.metadata[target] = serde_json::Value::String(value);
+            }
+        }
+        for field in [
+            "SeriesPluginVodImageAvailable",
+            "SeasonPluginVodImageAvailable",
+        ] {
+            if json_field_case_insensitive(metadata, field).and_then(serde_json::Value::as_bool)
+                == Some(true)
+            {
+                self.metadata[field] = serde_json::json!(true);
             }
         }
         if self.metadata.get("ProviderIds").is_none()
@@ -61179,8 +61317,8 @@ fn tv_season_json(
         .id
         .clone()
         .unwrap_or_else(|| tv_season_id(series_name, season_number));
-    let image_tag = default_primary_image_tag(&season_id);
-    let series_image_tag = default_primary_image_tag(series_id);
+    let image_tag = primary_image_tag_for_metadata(&season_id, Some(&summary.metadata));
+    let series_image_tag = primary_image_tag_for_metadata(series_id, Some(&summary.metadata));
     let (display_series_name, _) = clean_tv_series_name_and_year(series_name);
     let episode_count = summary.episode_count;
     let unplayed_count = summary.unplayed_count;
@@ -62525,8 +62663,19 @@ async fn item_image_or_placeholder(
     {
         return Ok(response);
     }
-    if let Some(stored) =
-        find_stored_image(state, ImageOwner::Item(item_id), image_type, image_index).await?
+    // Jellyfin clients freely alternate compact and hyphenated UUIDs in image paths. Durable
+    // artwork is keyed by the canonical compact owner id, so normalize before touching the cache;
+    // otherwise Android TV receives a generated tile even though the real raster is already there.
+    let canonical_item_id = parse_jellyfin_uuid(item_id)
+        .map(|id| id.simple().to_string())
+        .unwrap_or_else(|_| item_id.to_string());
+    if let Some(stored) = find_stored_image(
+        state,
+        ImageOwner::Item(&canonical_item_id),
+        image_type,
+        image_index,
+    )
+    .await?
     {
         return stored_image_response_sized(state, stored, resize).await;
     }
@@ -62582,9 +62731,14 @@ async fn item_image_or_placeholder(
     // answering with a placeholder while the fill is still running loses the artwork until a reload.
     if image_index == 0
         && normalize_image_type(image_type).eq_ignore_ascii_case("primary")
-        && let Some(path) =
-            await_pending_plugin_vod_artwork(state, item.id, item_id, image_type, image_index)
-                .await?
+        && let Some(path) = await_pending_plugin_vod_artwork(
+            state,
+            item.id,
+            &canonical_item_id,
+            image_type,
+            image_index,
+        )
+        .await?
     {
         return stored_image_response_sized(state, path, resize).await;
     }
@@ -65816,8 +65970,20 @@ mod tests {
                 item_id,
                 Some(&serde_json::json!({ "PluginVodImageAvailable": true })),
             ),
-            format!("provider-raster-v2-{item_id}"),
+            format!("provider-raster-v6-{item_id}"),
             "resolved provider art must have a distinct client cache key"
+        );
+        assert_eq!(
+            super::primary_image_tag_for_metadata(
+                item_id,
+                Some(&serde_json::json!({
+                    "Provider": "plugin:example",
+                    "TunerId": "test-tuner",
+                    "ProviderReference": "provider:v1:item-1"
+                })),
+            ),
+            format!("provider-probe-v5-{item_id}"),
+            "remote plugin art must be requested before its first cache hydration"
         );
         let response = generated_item_placeholder_response(item_id, "Primary", 0);
         assert_eq!(
@@ -65868,7 +66034,7 @@ mod tests {
         assert_eq!(value["SeriesId"], series_id.simple().to_string());
         assert_eq!(
             value["SeriesPrimaryImageTag"],
-            super::default_primary_image_tag(&series_id.simple().to_string())
+            super::primary_image_tag_for_metadata(&series_id.simple().to_string(), Some(&metadata),)
         );
     }
 
@@ -69566,6 +69732,22 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let cached_body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(cached_body.as_ref(), expected_image.as_slice());
+
+        // Android TV uses the hyphenated UUID in image URLs even when catalogue responses use the
+        // compact Jellyfin form. Both spellings must address the same durable artwork cache entry.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items/{movie_id}/Images/Primary"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let hyphenated_body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(hyphenated_body.as_ref(), expected_image.as_slice());
         let invokes = tokio::fs::read_to_string(tmp.path().join("external-invokes"))
             .await
             .unwrap();
@@ -101572,6 +101754,59 @@ done
             third.id.simple().to_string()
         );
 
+        // Android TV loads additional series-detail rows through generic `/Items` pagination.
+        // This must stay scoped to the one series rather than falling back to the full catalogue.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items?StartIndex=1&Limit=1&ParentId={series_id}&Fields=MediaSources&Fields=MediaStreams&Fields=Overview&IncludeItemTypes=Episode&EnableTotalRecordCount=true&EnableImages=true"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let generic_episodes: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(generic_episodes["TotalRecordCount"], 3);
+        assert_eq!(generic_episodes["StartIndex"], 1);
+        assert_eq!(generic_episodes["Items"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            generic_episodes["Items"][0]["Id"],
+            second.id.simple().to_string()
+        );
+        assert_eq!(generic_episodes["Items"][0]["Type"], "Episode");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Items?StartIndex=1&Limit=1&ParentId={season_id}&Fields=MediaSources&Fields=MediaStreams&Fields=Overview&IncludeItemTypes=Episode&EnableTotalRecordCount=true&EnableImages=true"
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let season_episodes: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(season_episodes["TotalRecordCount"], 3);
+        assert_eq!(season_episodes["StartIndex"], 1);
+        assert_eq!(season_episodes["Items"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            season_episodes["Items"][0]["Id"],
+            second.id.simple().to_string()
+        );
+
         for (endpoint, expected_id, expected_start_index) in [
             (
                 format!(
@@ -110066,6 +110301,14 @@ done
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            if endpoint == format!("/Items/{parent_id}")
+                || endpoint == format!("/Users/{user_id}/Items/{parent_id}")
+            {
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                let folder: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(folder["Type"], "CollectionFolder", "{endpoint}");
+                assert_eq!(folder["CollectionType"], "movies", "{endpoint}");
+            }
         }
     }
 

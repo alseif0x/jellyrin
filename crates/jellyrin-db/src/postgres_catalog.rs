@@ -980,7 +980,7 @@ impl PostgresDatabase {
 
         let total_record_count = if query.include_total_record_count {
             let mut count = QueryBuilder::<Postgres>::new("SELECT COUNT(*)::bigint ");
-            push_postgres_catalog_from(&mut count, query);
+            push_postgres_catalog_count_from(&mut count, query);
             push_postgres_catalog_filters(&mut count, query);
             let count = count
                 .build_query_scalar::<i64>()
@@ -6170,6 +6170,23 @@ fn push_postgres_catalog_from(builder: &mut QueryBuilder<Postgres>, query: &Medi
     }
 }
 
+/// Builds the source for a page's total count without joining user playback rows when no playback
+/// predicate needs them. The page projection still joins playback data for `UserData`, but carrying
+/// that join into `COUNT(*)` made a cold 450k-item plugin folder compete with artwork warming and
+/// exceed the statement timeout even though the matching Series page itself was indexed.
+fn push_postgres_catalog_count_from(
+    builder: &mut QueryBuilder<Postgres>,
+    query: &MediaItemCatalogQuery,
+) {
+    let needs_playback_filter =
+        query.is_played.is_some() || query.favorite.is_some() || query.is_resumable;
+    if normalized_postgres_filter_selector_groups(query).is_empty() && !needs_playback_filter {
+        builder.push(" FROM media_items AS item ");
+    } else {
+        push_postgres_catalog_from(builder, query);
+    }
+}
+
 fn normalized_postgres_filter_selector_groups(
     query: &MediaItemCatalogQuery,
 ) -> Vec<(&'static str, Vec<String>)> {
@@ -6220,10 +6237,21 @@ fn push_postgres_catalog_filters(
             .push(")");
     }
     if !query.virtual_folder_ids.is_empty() {
-        builder
-            .push(" AND item.virtual_folder_id = ANY(")
-            .push_bind(query.virtual_folder_ids.clone())
-            .push(")");
+        // A single-folder Latest request is the overwhelmingly common client shape. Keep it as
+        // scalar equality so PostgreSQL can preserve the ordering of the covering
+        // `(virtual_folder_id, updated_at, lower(name), id)` index and stop at LIMIT. Expressing
+        // the same predicate as `= ANY($1)` gives the prepared generic plan no array-cardinality
+        // information; on large plugin catalogues it can scan and sort the entire folder instead.
+        if let [folder_id] = query.virtual_folder_ids.as_slice() {
+            builder
+                .push(" AND item.virtual_folder_id = ")
+                .push_bind(*folder_id);
+        } else {
+            builder
+                .push(" AND item.virtual_folder_id = ANY(")
+                .push_bind(query.virtual_folder_ids.clone())
+                .push(")");
+        }
     }
 
     let include_item_types = normalized_catalog_values(&query.include_item_types);
