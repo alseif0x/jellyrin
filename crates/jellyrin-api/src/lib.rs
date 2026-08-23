@@ -35097,17 +35097,29 @@ async fn parent_browse_items_result(
 
     let start_index = query.start_index.unwrap_or(0);
     let limit = query.limit.unwrap_or(PARENT_BROWSE_DEFAULT_PAGE_SIZE);
-    // The folder nodes sort among the rows, so each one can displace a row out of the requested
-    // window. Reading that many extra rows on both ends keeps the merged page exact.
-    let node_count = 1 + child_folders.len();
+
+    // Both sources order rows by name inside the database. A byte-wise re-sort here cannot reproduce
+    // that collation, and re-sorting a page against a different order desynchronizes the window: it
+    // returned some rows on two pages and left others unreachable. So keep the source order exactly
+    // as it arrives and give the folder nodes a fixed place ahead of it. Every page is then an index
+    // slice of one known sequence.
+    let nodes = physical_folder_nodes(&state.db, folder, &child_folders, server_id, 0).await?;
+    let node_count = nodes.len();
+    let page_nodes = nodes
+        .into_iter()
+        .skip(start_index.min(node_count))
+        .take(limit)
+        .collect::<Vec<_>>();
+    let rows_wanted = limit - page_nodes.len();
     let source_start = start_index.saturating_sub(node_count);
-    let source_limit = limit.saturating_add(node_count);
+    // Ask for at least one row even when the page is entirely nodes: the source reports the total.
+    let source_limit = rows_wanted.max(1);
 
     let is_tv_library = folder
         .collection_type
         .as_deref()
         .is_some_and(|kind| kind.eq_ignore_ascii_case("tvshows"));
-    let (mut items, source_total) = if is_tv_library {
+    let (rows, source_total) = if is_tv_library {
         let mut series_query = query.clone();
         series_query.include_item_types = vec!["Series".to_string()];
         series_query.start_index = Some(source_start);
@@ -35116,8 +35128,8 @@ async fn parent_browse_items_result(
             tv_series_items_result(&state.db, &series_query, Some(requested_user_id), server_id)
                 .await?;
         let total = page.0["TotalRecordCount"].as_u64().unwrap_or_default() as usize;
-        let items = page.0["Items"].as_array().cloned().unwrap_or_default();
-        (items, total)
+        let rows = page.0["Items"].as_array().cloned().unwrap_or_default();
+        (rows, total)
     } else if let Some(page) = folder_rows_catalog_page(
         state,
         query,
@@ -35132,16 +35144,16 @@ async fn parent_browse_items_result(
     } else {
         // The repository cannot express every predicate. Those requests still read the folder and
         // page in memory, which is affordable because they are rare and still bounded by the folder.
-        let mut rows = filtered_media_items(
+        let mut items = filtered_media_items(
             media_items_source_for_query(&state.db, query).await?,
             query,
             Some(requested_user_id),
             &state.db,
         )
         .await?;
-        let total = rows.len();
-        rows.sort_by(|left, right| compare_media_items(left, right, &[SortField::SortName]));
-        let page = rows
+        let total = items.len();
+        items.sort_by(|left, right| compare_media_items(left, right, &[SortField::SortName]));
+        let page = items
             .into_iter()
             .skip(source_start)
             .take(source_limit)
@@ -35150,7 +35162,7 @@ async fn parent_browse_items_result(
             state,
             &page.iter().map(|item| item.id).collect::<Vec<_>>(),
         );
-        let items = items_to_json(
+        let rows = items_to_json(
             &state.db,
             page,
             server_id,
@@ -35158,19 +35170,13 @@ async fn parent_browse_items_result(
             should_use_compact_items_result(query),
         )
         .await?;
-        (items, total)
+        (rows, total)
     };
 
-    items.extend(
-        physical_folder_nodes(&state.db, folder, &child_folders, server_id, source_total).await?,
-    );
-    sort_json_items(&mut items, query);
+    let mut items = page_nodes;
+    items.extend(rows.into_iter().take(rows_wanted));
     Ok(Some(Json(query_result_with_total(
-        items
-            .into_iter()
-            .skip(start_index.min(node_count))
-            .take(limit)
-            .collect(),
+        items,
         source_total.saturating_add(node_count),
         start_index,
     ))))
