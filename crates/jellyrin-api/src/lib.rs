@@ -95180,6 +95180,116 @@ done
         assert_eq!(ratings[43]["Value"], 17);
     }
 
+    /// Characterize what a bare `ParentId` browse returns for a TV library.
+    ///
+    /// This pins current behaviour rather than desired behaviour. The shape returns every episode
+    /// row in the folder *plus* a synthesized Folder node and a Series and Season node per series,
+    /// so its response grows with the episode count: a library holding 460k episodes is asked for
+    /// ~470k items in one response. That is why the bounded catalogue repository deliberately
+    /// declines this shape (`media_catalog_query_for_items` requires an explicit page size) and why
+    /// narrowing the source alone cannot make it affordable. Any future redesign has to page the
+    /// union of persisted rows and synthesized nodes; this test is the baseline it must preserve.
+    #[tokio::test]
+    async fn bare_parent_browse_on_tv_library_returns_every_episode_and_synthesized_nodes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage_root = tempfile::tempdir().unwrap();
+        let season = tmp.path().join("Show One").join("Season 01");
+        tokio::fs::create_dir_all(&season).await.unwrap();
+        let season_two = tmp.path().join("Show Two").join("Season 01");
+        tokio::fs::create_dir_all(&season_two).await.unwrap();
+        // Distinct byte lengths: the scanner identifies items by size, so equal-sized fixtures
+        // collapse into a single row and would misrepresent what this shape returns.
+        for (index, (dir, episode)) in [
+            (&season, "Show One S01E01.mkv"),
+            (&season, "Show One S01E02.mkv"),
+            (&season_two, "Show Two S01E01.mkv"),
+            (&season_two, "Show Two S01E02.mkv"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            tokio::fs::write(dir.join(episode), vec![b'v'; 1_024 + index])
+                .await
+                .unwrap();
+        }
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        let user_id = user.id.simple().to_string();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: storage_root.path().join("logs"),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Library/VirtualFolders?name=Shows&collectionType=tvshows&paths={}",
+                        tmp.path().to_string_lossy()
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let json_for = |uri: String| {
+            let app = app.clone();
+            let api_key = api_key.clone();
+            async move {
+                let response = app
+                    .oneshot(
+                        Request::builder()
+                            .uri(uri)
+                            .header("X-Emby-Token", &api_key)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                serde_json::from_slice::<Value>(
+                    &response.into_body().collect().await.unwrap().to_bytes(),
+                )
+                .unwrap()
+            }
+        };
+
+        // Only the persisted episode rows exist without a parent scope.
+        let all = json_for(format!("/Users/{user_id}/Items")).await;
+        assert_eq!(all["TotalRecordCount"], 4);
+        let parent_id = all["Items"][0]["ParentId"].as_str().unwrap().to_string();
+
+        let bare = json_for(format!("/Users/{user_id}/Items?ParentId={parent_id}")).await;
+        let mut counts = BTreeMap::<String, usize>::new();
+        for item in bare["Items"].as_array().unwrap() {
+            *counts
+                .entry(item["Type"].as_str().unwrap().to_string())
+                .or_default() += 1;
+        }
+        // Every episode survives alongside one Series and one Season node per series, plus the
+        // physical folder: the response is the whole folder, not a page of it.
+        assert_eq!(bare["TotalRecordCount"], 9);
+        assert_eq!(counts.get("Episode").copied(), Some(4));
+        assert_eq!(counts.get("Series").copied(), Some(2));
+        assert_eq!(counts.get("Season").copied(), Some(2));
+        assert_eq!(counts.get("Folder").copied(), Some(1));
+    }
+
     #[tokio::test]
     #[serial(playback_events)]
     async fn virtual_folder_scan_populates_items_endpoint() {
