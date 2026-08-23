@@ -36115,6 +36115,7 @@ async fn shows_next_up(
         )));
     }
     let mut prefetched_metadata = HashMap::new();
+    let mut resolved_next_up_series_id = query.series_id.clone();
     // Only the SeriesId filter reads candidate metadata. Without it nothing downstream touches the
     // streams or metadata payloads before paging, so leave both unfetched and hydrate the retained
     // page below: one-per-series selection is derived from each episode's name and path.
@@ -36122,14 +36123,27 @@ async fn shows_next_up(
     let mut episodes = if hydrate_page {
         MediaCatalogStore::tv_next_up_candidate_items(&state.db, requested_user_id).await?
     } else if common_next_up_query {
-        let candidates =
-            MediaCatalogStore::tv_next_up_candidates(&state.db, requested_user_id).await?;
-        let mut items = Vec::with_capacity(candidates.len());
-        for candidate in candidates {
-            prefetched_metadata.insert(candidate.item.id, candidate.metadata);
-            items.push(candidate.item);
-        }
-        items
+        let series_id = query
+            .series_id
+            .as_deref()
+            .expect("common filtered NextUp query has a SeriesId");
+        // Jellyfin Web requests NextUp for the series detail it has just opened. Loading every
+        // unplayed episode in the library here makes that single-series request exceed
+        // PostgreSQL's statement timeout at catalogue scale. Resolve the persisted series (or a
+        // plugin's public series anchor) first and keep every subsequent filter bounded to it.
+        let (snapshot, resolved_series_id) =
+            tv_episode_catalog_snapshot_scoped_to_series(&state.db, series_id).await?;
+        resolved_next_up_series_id = Some(resolved_series_id);
+        prefetched_metadata = snapshot.metadata_by_item;
+        let mut scoped_query = query.clone();
+        scoped_query.series_id = None;
+        filtered_media_items(
+            snapshot.items,
+            &scoped_query,
+            Some(requested_user_id),
+            &state.db,
+        )
+        .await?
     } else {
         filtered_media_items(
             state.db.media_items_by_collection_type("tvshows").await?,
@@ -36139,7 +36153,7 @@ async fn shows_next_up(
         )
         .await?
     };
-    if let Some(series_id) = query.series_id.as_deref() {
+    if let Some(series_id) = resolved_next_up_series_id.as_deref() {
         let metadata_by_item = if prefetched_metadata.is_empty() {
             media_metadata_by_item_id(&state.db, episodes.iter().map(|item| item.id).collect())
                 .await?
@@ -102036,6 +102050,28 @@ done
                 "{endpoint}"
             );
         }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/Shows/NextUp?UserId={}&SeriesId={anchor_id}&Limit=10",
+                        user.id
+                    ))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let next_up: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(next_up["TotalRecordCount"], 1);
+        assert_eq!(next_up["Items"][0]["Type"], "Episode");
+        assert_eq!(next_up["Items"][0]["SeriesId"], canonical_series_id);
 
         for endpoint in [
             format!("/Items/{anchor_id}/SpecialFeatures"),
