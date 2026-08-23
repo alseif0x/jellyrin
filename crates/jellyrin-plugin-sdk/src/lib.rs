@@ -489,18 +489,6 @@ impl std::fmt::Debug for LiveTvProviderRequest {
 }
 
 impl LiveTvProviderRequest {
-    /// Asks the provider whether the authenticated user may discover items from this tuner.
-    /// This action uses public tuner configuration only and must not carry a secret grant.
-    pub fn authorize_user(tuner_config: Value, user_context: PluginUserContext) -> Self {
-        Self {
-            action: "AuthorizeUser".to_string(),
-            tuner_config,
-            arguments: json!({}),
-            secret_grant: None,
-            user_context: Some(user_context),
-        }
-    }
-
     pub fn import_channels(tuner_config: Value) -> Self {
         Self {
             action: "ImportChannels".to_string(),
@@ -886,18 +874,6 @@ impl std::fmt::Debug for VodLibraryProviderRequest {
 }
 
 impl VodLibraryProviderRequest {
-    /// Asks the provider whether the authenticated user may discover items from this instance.
-    /// This action uses public provider configuration only and must not carry a secret grant.
-    pub fn authorize_user(provider_config: Value, user_context: PluginUserContext) -> Self {
-        Self {
-            action: "AuthorizeUser".to_string(),
-            provider_config,
-            arguments: json!({}),
-            secret_grant: None,
-            user_context: Some(user_context),
-        }
-    }
-
     /// Imports one catalog page. The host paginates by sending back the continuation token
     /// returned by the previous [`VodLibraryProviderResult`].
     pub fn import_media(provider_config: Value) -> Self {
@@ -1582,14 +1558,22 @@ mod tests {
             device_id: "device-a".to_string(),
             is_administrator: false,
         };
-        let live =
-            LiveTvProviderRequest::authorize_user(json!({ "Id": "tuner-a" }), context.clone());
-        let vod = VodLibraryProviderRequest::authorize_user(json!({ "Id": "tuner-a" }), context);
+        // One protocol only: the host asks for catalogue authorization through
+        // CAPABILITY_USER_CATALOG_AUTHORIZATION. The provider requests used to expose a second,
+        // never-invoked "AuthorizeUser" action, which led a plugin author to implement a handler the
+        // host never calls -- and the host fails closed, so every user lost that catalogue.
         for wire in [
-            serde_json::to_value(live).unwrap(),
-            serde_json::to_value(vod).unwrap(),
+            serde_json::to_value(PluginUserAuthorizationRequest::authorize_catalog(
+                json!({ "Id": "tuner-a" }),
+                context.clone(),
+            ))
+            .unwrap(),
+            serde_json::to_value(PluginUserAuthorizationRequest::release_device(
+                json!({ "Id": "tuner-a" }),
+                context,
+            ))
+            .unwrap(),
         ] {
-            assert_eq!(wire["Action"], "AuthorizeUser");
             assert!(wire.get("SecretGrant").is_none());
             assert_eq!(wire["UserContext"]["UserId"], "user-a");
         }

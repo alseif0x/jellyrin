@@ -4579,10 +4579,45 @@ pub fn router(state: AppState) -> Router {
                 ),
         )
         // Compress ordinary JSON/web responses even when Jellyrin is exposed directly without an
-        // optional reverse proxy. tower-http's predicate leaves already encoded and multimedia
-        // bodies alone, so stream payloads are not recompressed.
-        .layer(CompressionLayer::new())
+        // optional reverse proxy.
+        .layer(CompressionLayer::new().compress_when(response_compression_predicate()))
         .with_state(state)
+}
+
+/// Never compress a byte-range response.
+///
+/// Gzipping a `206 Partial Content` body leaves its `Content-Range` describing the original bytes
+/// rather than the bytes on the wire, so a client seeking inside a stream reads the wrong offsets.
+#[derive(Clone, Copy)]
+struct NotForByteRanges;
+
+impl tower_http::compression::predicate::Predicate for NotForByteRanges {
+    fn should_compress<B>(&self, response: &axum::http::Response<B>) -> bool
+    where
+        B: http_body::Body,
+    {
+        response.status() != StatusCode::PARTIAL_CONTENT
+            && !response.headers().contains_key(header::CONTENT_RANGE)
+    }
+}
+
+/// Which responses the public router may gzip.
+///
+/// tower-http's default predicate skips only gRPC, images and server-sent events. Media is neither,
+/// so the default would spend CPU recompressing already compressed audio and video on every byte
+/// served, and would corrupt byte-range responses. Exclude both, and keep the default size and
+/// content-encoding rules for everything else.
+fn response_compression_predicate() -> impl tower_http::compression::predicate::Predicate {
+    use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
+
+    DefaultPredicate::new()
+        .and(NotForByteRanges)
+        .and(NotForContentType::const_new("video/"))
+        .and(NotForContentType::const_new("audio/"))
+        .and(NotForContentType::const_new(
+            "application/vnd.apple.mpegurl",
+        ))
+        .and(NotForContentType::const_new("application/x-mpegurl"))
 }
 
 fn safe_http_request_trace_span<B>(request: &axum::http::Request<B>) -> tracing::Span {
@@ -21283,19 +21318,31 @@ async fn live_tv_plugin_channel_provider_import(
                 .collect()
         })
         .unwrap_or_default();
+    // Resolve the remote channel id through a map rather than scanning the channel list for every
+    // program: a provider shipping a full guide sends hundreds of thousands of programs, and the
+    // scan made the import quadratic in channels times programs. `or_insert` keeps the first
+    // matching channel, which is what the scan returned.
+    let channel_ids_by_remote_id = channels
+        .iter()
+        .filter_map(|channel| {
+            let remote_id = json_string_field(channel, "RemoteId")?;
+            let id = json_string_field(channel, "Id")?;
+            Some((remote_id.to_ascii_lowercase(), id))
+        })
+        .fold(HashMap::new(), |mut ids, (remote_id, id)| {
+            ids.entry(remote_id).or_insert(id);
+            ids
+        });
     programs.retain_mut(|program| {
         let Some(remote_channel_id) = json_string_field(program, "ChannelId") else {
             return false;
         };
-        let Some(channel_id) = channels.iter().find_map(|channel| {
-            json_string_field(channel, "RemoteId")
-                .is_some_and(|id| id.eq_ignore_ascii_case(&remote_channel_id))
-                .then(|| json_string_field(channel, "Id"))
-                .flatten()
-        }) else {
+        let Some(channel_id) =
+            channel_ids_by_remote_id.get(&remote_channel_id.to_ascii_lowercase())
+        else {
             return false;
         };
-        program["ChannelId"] = serde_json::Value::String(channel_id);
+        program["ChannelId"] = serde_json::Value::String(channel_id.clone());
         true
     });
     Ok((!channels.is_empty()).then_some(LiveTvProviderImportLease {
@@ -24922,13 +24969,11 @@ async fn live_tv_program_result(
         });
     }
     if let Some(allowed) = allowed_tuner_ids {
-        programs.retain(|program| {
-            json_string_field(program, "TunerHostId").is_some_and(|id| {
-                allowed
-                    .iter()
-                    .any(|allowed| allowed.eq_ignore_ascii_case(&id))
-            })
-        });
+        retain_authorized_live_tv_programs(
+            &mut programs,
+            &live_tv_channel_items(&config, &server_id),
+            allowed,
+        );
     }
     if !channel_ids.is_empty() {
         let channel_ids = channel_ids
@@ -29173,6 +29218,49 @@ fn live_tv_subtitle_teletext_page(
         .and_then(|page| u16::try_from(page).ok())
         .filter(|page| (100..=899).contains(page))
     })
+}
+
+/// Keep only the guide rows this user's authorized tuners account for.
+///
+/// A program's `TunerHostId` is the id of the configuration entry that supplied it, so rows imported
+/// from a `ListingProviders` entry never name a tuner: comparing them against the authorized tuners
+/// emptied the guide for everyone, administrators included. Authorize those through the channel they
+/// belong to, and keep denying a program whose channel this user cannot see -- including one that
+/// matches no channel at all.
+fn retain_authorized_live_tv_programs(
+    programs: &mut Vec<serde_json::Value>,
+    channels: &[serde_json::Value],
+    allowed_tuner_ids: &[String],
+) {
+    let tuner_is_allowed = |id: &str| {
+        allowed_tuner_ids
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(id))
+    };
+    let allowed_channel_ids = channels
+        .iter()
+        .filter(|channel| {
+            json_string_field(channel, "TunerHostId").is_some_and(|id| tuner_is_allowed(&id))
+        })
+        .flat_map(|channel| {
+            json_string_field(channel, "Id")
+                .into_iter()
+                .chain(json_string_field(channel, "JellyrinChannelId"))
+        })
+        .collect::<Vec<_>>();
+    programs.retain(|program| {
+        if json_string_field(program, "TunerHostId").is_some_and(|id| tuner_is_allowed(&id)) {
+            return true;
+        }
+        json_string_field(program, "ChannelId")
+            .into_iter()
+            .chain(json_string_field(program, "JellyrinChannelId"))
+            .any(|channel_id| {
+                allowed_channel_ids
+                    .iter()
+                    .any(|allowed| jellyfin_id_matches(allowed, &channel_id))
+            })
+    });
 }
 
 fn live_tv_program_items(config: &serde_json::Value, server_id: &str) -> Vec<serde_json::Value> {
@@ -34435,8 +34523,22 @@ async fn user_items_result(
     {
         return live_tv_channel_items_result(&state.db, &query, &server_id, None).await;
     }
+    // Keep the bounded projections in the same order as `/Items`. This route is the one Android TV
+    // and Jellyfin Web actually call, so a projection that exists only on the unscoped sibling
+    // leaves the user-scoped request on the legacy application-level scan.
+    if let Some(result) =
+        exact_id_items_result(&state.db, &query, &server_id, Some(requested_user_id)).await?
+    {
+        return Ok(result);
+    }
     if let Some(result) =
         parent_series_seasons_items_result(&state.db, &query, requested_user_id, &server_id).await?
+    {
+        return Ok(result);
+    }
+    if let Some(result) =
+        parent_series_episodes_items_result(&state.db, &query, requested_user_id, &server_id)
+            .await?
     {
         return Ok(result);
     }
@@ -34956,7 +35058,7 @@ async fn parent_virtual_items(
         let series_name = summary.source_name.clone();
         values.push(tv_series_json(server_id, summary));
         if let Some(mut seasons) = seasons_by_series.remove(&series_name) {
-            present_unnumbered_season_as_first(&mut seasons);
+            present_unnumbered_season_as_first(&mut seasons, &series_name);
             for season in seasons.into_values() {
                 values.push(tv_season_json(server_id, &series_name, &series_id, season));
             }
@@ -50453,7 +50555,7 @@ async fn series_seasons_result(
             entry.merge_episode_metadata(metadata);
         }
     }
-    present_unnumbered_season_as_first(&mut seasons);
+    present_unnumbered_season_as_first(&mut seasons, &series_name);
     let mut season_items = seasons
         .into_values()
         .map(|summary| tv_season_json(server_id, &series_name, &series_id, summary))
@@ -53930,10 +54032,14 @@ async fn authenticated_similar_trailer_items(
     scope_query.limit = None;
     scope_query.sort_by = None;
     scope_query.sort_order = None;
+    // This path resolves one exact trailer id rather than serving a page, so the paging cap the
+    // listing uses would make it wrong by construction: every trailer whose parent sorts past the
+    // cap answered "Similar source not found". The predicate already restricts the read to items
+    // that carry a trailer array, which is a small slice of a catalogue.
     let scoped_items = filtered_media_items(
         state
             .db
-            .media_items_with_remote_trailers(REMOTE_TRAILER_SOURCE_MAX_ITEMS)
+            .media_items_with_remote_trailers(usize::MAX)
             .await?,
         &scope_query,
         Some(requested_user_id),
@@ -54110,15 +54216,27 @@ async fn similar_items_for_media_source(
     } else {
         Vec::new()
     };
-    let Some(mut db_query) = media_catalog_query_for_items(&items_query, Some(requested_user_id))?
-    else {
-        return Ok(Json(query_result_with_total(Vec::new(), 0, 0)));
+    // The bounded catalogue page cannot express every shape: a persisted Series source is one, and
+    // answering those with an empty page removed Similar for every series while leaving the
+    // caller's fallback unreachable, because an empty page is still `Ok`. Score the type-scoped
+    // candidate read instead -- Series rows are a small fraction of the episode catalogue.
+    let candidates = match media_catalog_query_for_items(&items_query, Some(requested_user_id))? {
+        Some(mut db_query) => {
+            db_query.virtual_folder_ids = vec![source.virtual_folder_id];
+            db_query.include_total_record_count = false;
+            MediaCatalogStore::media_item_catalog_page(&state.db, &db_query)
+                .await?
+                .items
+        }
+        None => {
+            MediaCatalogStore::media_items_with_metadata_by_effective_types(
+                &state.db,
+                std::slice::from_ref(&source_type),
+            )
+            .await?
+        }
     };
-    db_query.virtual_folder_ids = vec![source.virtual_folder_id];
-    db_query.include_total_record_count = false;
-    let page = MediaCatalogStore::media_item_catalog_page(&state.db, &db_query).await?;
-    let mut scored = page
-        .items
+    let mut scored = candidates
         .into_iter()
         .filter_map(|entry| {
             let item = entry.item;
@@ -61394,13 +61512,22 @@ impl TvSeasonSummary {
 /// unnumbered and the series showed one "Season Unknown" folder, which is wrong for the shape it
 /// actually has: a flat run of episodes that is season one. A series that mixes numbered and
 /// unnumbered episodes keeps its unknown bucket, because there the gap is real information.
-fn present_unnumbered_season_as_first(seasons: &mut BTreeMap<Option<i32>, TvSeasonSummary>) {
+fn present_unnumbered_season_as_first(
+    seasons: &mut BTreeMap<Option<i32>, TvSeasonSummary>,
+    series_name: &str,
+) {
     if seasons.len() != 1 || !seasons.contains_key(&None) {
         return;
     }
     let Some(mut summary) = seasons.remove(&None) else {
         return;
     };
+    // Relabel the presentation only. The episodes still parse as unnumbered and
+    // `tv_episode_matches_season` derives their season id from that, so advertising the numbered id
+    // would leave the season unreachable: its detail page would resolve no episode at all.
+    if summary.id.is_none() {
+        summary.id = Some(tv_season_id(series_name, None));
+    }
     summary.season_number = Some(1);
     seasons.insert(Some(1), summary);
 }
@@ -62303,12 +62430,34 @@ async fn precache_single_live_tv_logo(
     }
 }
 
+/// Memoized bodies for the generated Live TV tiles.
+///
+/// The tile is a pure function of the image tag, so rasterizing 512x512 pixels and encoding a PNG
+/// on every request is the wrong cost for a fallback that one grid screen asks for dozens of times.
+/// The map is capped and cleared wholesale, like the other in-process caches here: it exists to
+/// absorb a page load, not to retain every tile a server ever produced.
+fn live_tv_generated_image_cache() -> &'static std::sync::Mutex<HashMap<String, axum::body::Bytes>>
+{
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, axum::body::Bytes>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+const LIVE_TV_GENERATED_IMAGE_CACHE_MAX_ENTRIES: usize = 512;
+
 fn live_tv_generated_image_response(
     _item: &serde_json::Value,
     item_id: &str,
     image_url: &str,
 ) -> axum::response::Response {
     let hash = live_tv_image_tag(item_id, image_url);
+    if let Some(png) = live_tv_generated_image_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&hash).cloned())
+    {
+        return live_tv_generated_image_reply(&hash, png);
+    }
     let color = |offset: usize| {
         64_u8.saturating_add(
             u8::from_str_radix(hash.get(offset..offset + 2).unwrap_or("00"), 16).unwrap_or(0) % 160,
@@ -62340,6 +62489,17 @@ fn live_tv_generated_image_response(
     image::DynamicImage::ImageRgba8(bitmap)
         .write_to(&mut png, image::ImageFormat::Png)
         .expect("generated Android TV artwork must encode as PNG");
+    let png = axum::body::Bytes::from(png.into_inner());
+    if let Ok(mut cache) = live_tv_generated_image_cache().lock() {
+        if cache.len() >= LIVE_TV_GENERATED_IMAGE_CACHE_MAX_ENTRIES {
+            cache.clear();
+        }
+        cache.insert(hash.clone(), png.clone());
+    }
+    live_tv_generated_image_reply(&hash, png)
+}
+
+fn live_tv_generated_image_reply(hash: &str, png: axum::body::Bytes) -> axum::response::Response {
     let mut headers = HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, "image/png".parse().unwrap());
     headers.insert(
@@ -62347,7 +62507,7 @@ fn live_tv_generated_image_response(
         "public, max-age=3600".parse().unwrap(),
     );
     headers.insert(header::ETAG, hash.parse().unwrap());
-    (headers, png.into_inner()).into_response()
+    (headers, png).into_response()
 }
 
 async fn live_tv_item_image_response(
@@ -62755,11 +62915,6 @@ async fn item_image_or_placeholder(
             image_index,
         ));
     }
-    if let Some(response) =
-        virtual_folder_image_response(&state.db, item_id, image_type, image_index).await?
-    {
-        return Ok(response);
-    }
     if let Some(channel_item) = channel_content_item_by_id(&state.db, item_id).await?
         && let Some(response) = channel_item_image_response(&channel_item, image_type, image_index)?
     {
@@ -62780,6 +62935,14 @@ async fn item_image_or_placeholder(
     .await?
     {
         return stored_image_response_sized(state, stored, resize).await;
+    }
+    // Only synthesize the library tile once no real artwork exists. Resolving it first shadowed
+    // every poster an operator uploaded for a library, which is the opposite of what this fallback
+    // is for.
+    if let Some(response) =
+        virtual_folder_image_response(&state.db, item_id, image_type, image_index).await?
+    {
+        return Ok(response);
     }
     let item = match media_item_by_id(&state.db, item_id).await {
         Ok(item) => item,
@@ -105890,6 +106053,133 @@ done
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn generated_live_tv_tile_is_memoized_per_tag() {
+        let item = json!({});
+        let etag = |response: &axum::response::Response| {
+            response
+                .headers()
+                .get(header::ETAG)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        };
+
+        let first = super::live_tv_generated_image_response(&item, "item-a", "http://host/a.png");
+        let key = super::live_tv_image_tag("item-a", "http://host/a.png");
+        assert!(
+            super::live_tv_generated_image_cache()
+                .lock()
+                .unwrap()
+                .contains_key(&key),
+            "the rasterized tile is retained for the next request"
+        );
+
+        // Same tag, same tile: the second request must not rasterize again to answer identically.
+        let second = super::live_tv_generated_image_response(&item, "item-a", "http://host/a.png");
+        assert_eq!(etag(&first), etag(&second));
+        assert_eq!(etag(&first), Some(key));
+
+        // A different item still gets its own tile.
+        let other = super::live_tv_generated_image_response(&item, "item-b", "http://host/a.png");
+        assert_ne!(etag(&first), etag(&other));
+    }
+
+    #[test]
+    fn unnumbered_season_presented_as_first_keeps_a_reachable_id() {
+        let mut seasons = BTreeMap::new();
+        seasons.insert(None, super::TvSeasonSummary::new(None));
+        super::present_unnumbered_season_as_first(&mut seasons, "Show One");
+
+        let summary = seasons
+            .remove(&Some(1))
+            .expect("the lone unnumbered season is presented as season one");
+        assert_eq!(summary.season_number, Some(1));
+        // The episodes still parse as unnumbered, so the advertised id has to stay the one
+        // `tv_episode_matches_season` derives; the numbered id would resolve no episode.
+        assert_eq!(
+            summary.id.as_deref(),
+            Some(super::tv_season_id("Show One", None).as_str())
+        );
+        assert_ne!(
+            summary.id.as_deref(),
+            Some(super::tv_season_id("Show One", Some(1)).as_str())
+        );
+    }
+
+    #[test]
+    fn compression_predicate_skips_media_and_byte_ranges() {
+        use tower_http::compression::predicate::Predicate;
+
+        let predicate = super::response_compression_predicate();
+        let response = |status: StatusCode, content_type: &str, byte_range: bool| {
+            let mut builder = axum::http::Response::builder()
+                .status(status)
+                .header(header::CONTENT_TYPE, content_type)
+                .header(header::CONTENT_LENGTH, "4096");
+            if byte_range {
+                builder = builder.header(header::CONTENT_RANGE, "bytes 0-1023/4096");
+            }
+            builder
+                .body(axum::body::Body::from(vec![0u8; 4096]))
+                .unwrap()
+        };
+
+        // Ordinary API and web payloads still compress.
+        assert!(predicate.should_compress(&response(StatusCode::OK, "application/json", false)));
+        assert!(predicate.should_compress(&response(StatusCode::OK, "text/vtt", false)));
+
+        // Media is already compressed, so gzipping it only burns CPU per byte served.
+        for content_type in [
+            "video/mp4",
+            "video/mp2t",
+            "audio/mpeg",
+            "application/vnd.apple.mpegurl",
+            "application/x-mpegurl",
+        ] {
+            assert!(
+                !predicate.should_compress(&response(StatusCode::OK, content_type, false)),
+                "{content_type}"
+            );
+        }
+
+        // A compressed byte range leaves Content-Range describing bytes the client never receives.
+        assert!(!predicate.should_compress(&response(
+            StatusCode::PARTIAL_CONTENT,
+            "application/json",
+            true
+        )));
+        assert!(!predicate.should_compress(&response(StatusCode::OK, "application/json", true)));
+    }
+
+    #[test]
+    fn live_tv_guide_authorizes_listing_provider_programs_through_their_channel() {
+        let channels = vec![
+            json!({ "Id": "channel-allowed", "JellyrinChannelId": "raw-allowed", "TunerHostId": "tuner-allowed" }),
+            json!({ "Id": "channel-denied", "JellyrinChannelId": "raw-denied", "TunerHostId": "tuner-denied" }),
+        ];
+        let mut programs = vec![
+            // EPG rows carry the listing provider id, not a tuner id.
+            json!({ "Name": "epg-allowed", "TunerHostId": "listings-1", "ChannelId": "channel-allowed" }),
+            json!({ "Name": "epg-denied", "TunerHostId": "listings-1", "ChannelId": "channel-denied" }),
+            json!({ "Name": "epg-unmapped", "TunerHostId": "listings-1", "ChannelId": "channel-missing" }),
+            // Tuner-sourced rows name the tuner directly.
+            json!({ "Name": "tuner-allowed", "TunerHostId": "tuner-allowed" }),
+            json!({ "Name": "tuner-denied", "TunerHostId": "tuner-denied" }),
+        ];
+
+        super::retain_authorized_live_tv_programs(
+            &mut programs,
+            &channels,
+            &["tuner-allowed".to_string()],
+        );
+
+        let names = programs
+            .iter()
+            .map(|program| program["Name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["epg-allowed", "tuner-allowed"]);
     }
 
     #[test]
