@@ -34376,6 +34376,16 @@ async fn items_result(
         queue_plugin_vod_artwork_prefetch_from_page(&state, &result.0);
         return Ok(result);
     }
+    if let Some(result) = parent_browse_items_result(
+        &state,
+        &query,
+        requested_user_id.unwrap_or(auth_user.id),
+        &server_id,
+    )
+    .await?
+    {
+        return Ok(result);
+    }
     if let Some(result) =
         exact_id_items_result(&state.db, &query, &server_id, requested_user_id).await?
     {
@@ -34526,6 +34536,11 @@ async fn user_items_result(
     // Keep the bounded projections in the same order as `/Items`. This route is the one Android TV
     // and Jellyfin Web actually call, so a projection that exists only on the unscoped sibling
     // leaves the user-scoped request on the legacy application-level scan.
+    if let Some(result) =
+        parent_browse_items_result(&state, &query, requested_user_id, &server_id).await?
+    {
+        return Ok(result);
+    }
     if let Some(result) =
         exact_id_items_result(&state.db, &query, &server_id, Some(requested_user_id)).await?
     {
@@ -34972,6 +34987,148 @@ fn should_include_parent_virtual_items(query: &ItemsQuery) -> bool {
         && query.is_favorite.is_none()
 }
 
+/// Bounded listing for a bare `ParentId` browse of a real library folder.
+///
+/// The legacy path hydrated every row the folder holds and paged the JSON afterwards, so a library
+/// of tens of thousands of items exceeded the API statement timeout no matter how small a page the
+/// client asked for. Page the source first and hydrate only that page.
+///
+/// A TV library answers with its series. `ParentId` addresses the library level, and that level is
+/// the series; the episodes and synthesized season nodes the legacy path mixed in belong to the
+/// series below it, where `/Shows/{id}/Seasons` and `/Shows/{id}/Episodes` already serve them. That
+/// also lets the durable series projection answer the page instead of grouping every episode in the
+/// folder on each request.
+///
+/// A request without a page size is served the repository's maximum page rather than the whole
+/// folder. `TotalRecordCount` still reports the real total, so a client can page through it.
+async fn parent_browse_items_result(
+    state: &AppState,
+    query: &ItemsQuery,
+    requested_user_id: Uuid,
+    server_id: &str,
+) -> Result<Option<Json<serde_json::Value>>, ApiError> {
+    if !should_include_parent_virtual_items(query) {
+        return Ok(None);
+    }
+    // Both sources below read ascending name order straight from an index.
+    if query
+        .sort_order
+        .as_deref()
+        .is_some_and(|order| order.eq_ignore_ascii_case("Descending"))
+    {
+        return Ok(None);
+    }
+    let Some(parent_id) = query.parent_id.as_deref() else {
+        return Ok(None);
+    };
+    let Ok(parent_id) = parse_jellyfin_uuid(parent_id) else {
+        return Ok(None);
+    };
+    let folders = state.db.virtual_folders().await?;
+    let Some(folder) = folders.iter().find(|folder| folder.id == parent_id) else {
+        return Ok(None);
+    };
+    let child_folders = child_virtual_folders(folder, &folders);
+
+    let start_index = query.start_index.unwrap_or(0);
+    let limit = query.limit.unwrap_or(MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE);
+    // The folder nodes sort among the rows, so each one can displace a row out of the requested
+    // window. Reading that many extra rows on both ends keeps the merged page exact.
+    let node_count = 1 + child_folders.len();
+    let source_start = start_index.saturating_sub(node_count);
+    let source_limit = limit.saturating_add(node_count);
+
+    let is_tv_library = folder
+        .collection_type
+        .as_deref()
+        .is_some_and(|kind| kind.eq_ignore_ascii_case("tvshows"));
+    let (mut items, source_total) = if is_tv_library {
+        let mut series_query = query.clone();
+        series_query.include_item_types = vec!["Series".to_string()];
+        series_query.start_index = Some(source_start);
+        series_query.limit = Some(source_limit);
+        let page =
+            tv_series_items_result(&state.db, &series_query, Some(requested_user_id), server_id)
+                .await?;
+        let total = page.0["TotalRecordCount"].as_u64().unwrap_or_default() as usize;
+        let items = page.0["Items"].as_array().cloned().unwrap_or_default();
+        (items, total)
+    } else {
+        let mut rows = filtered_media_items(
+            media_items_source_for_query(&state.db, query).await?,
+            query,
+            Some(requested_user_id),
+            &state.db,
+        )
+        .await?;
+        let total = rows.len();
+        rows.sort_by(|left, right| compare_media_items(left, right, &[SortField::SortName]));
+        let page = rows
+            .into_iter()
+            .skip(source_start)
+            .take(source_limit)
+            .collect::<Vec<_>>();
+        queue_plugin_vod_artwork_prefetch_ids(
+            state,
+            &page.iter().map(|item| item.id).collect::<Vec<_>>(),
+        );
+        let items = items_to_json(
+            &state.db,
+            page,
+            server_id,
+            Some(requested_user_id),
+            should_use_compact_items_result(query),
+        )
+        .await?;
+        (items, total)
+    };
+
+    items.extend(
+        physical_folder_nodes(&state.db, folder, &child_folders, server_id, source_total).await?,
+    );
+    sort_json_items(&mut items, query);
+    Ok(Some(Json(query_result_with_total(
+        items
+            .into_iter()
+            .skip(start_index.min(node_count))
+            .take(limit)
+            .collect(),
+        source_total.saturating_add(node_count),
+        start_index,
+    ))))
+}
+
+/// The folder itself plus its child folders, as browsable nodes.
+///
+/// These are the only synthesized entries a library listing needs, and there are a handful of them,
+/// so they can be built for any page without reading the folder's contents.
+async fn physical_folder_nodes(
+    db: &Database,
+    folder: &VirtualFolder,
+    child_folders: &[&VirtualFolder],
+    server_id: &str,
+    direct_child_count: usize,
+) -> Result<Vec<serde_json::Value>, ApiError> {
+    let mut values = vec![physical_folder_item_to_json(
+        folder,
+        server_id,
+        direct_child_count,
+    )];
+    if child_folders.is_empty() {
+        return Ok(values);
+    }
+    let item_counts = db.media_item_counts_by_virtual_folder().await?;
+    for child_folder in child_folders {
+        let child_count = item_counts.get(&child_folder.id).copied().unwrap_or(0);
+        values.push(physical_folder_item_to_json(
+            child_folder,
+            server_id,
+            child_count,
+        ));
+    }
+    Ok(values)
+}
+
 async fn parent_virtual_items(
     db: &Database,
     query: &ItemsQuery,
@@ -34987,24 +35144,12 @@ async fn parent_virtual_items(
     let Some(folder) = folders.iter().find(|folder| folder.id == parent_id) else {
         return Ok(Vec::new());
     };
-    let mut values = vec![physical_folder_item_to_json(
-        folder,
-        server_id,
-        direct_child_count,
-    )];
     let child_folders = child_virtual_folders(folder, &folders);
     let folder_ids = std::iter::once(folder.id)
         .chain(child_folders.iter().map(|child| child.id))
         .collect::<Vec<_>>();
-    let item_counts = db.media_item_counts_by_virtual_folder().await?;
-    for child_folder in &child_folders {
-        let child_count = item_counts.get(&child_folder.id).copied().unwrap_or(0);
-        values.push(physical_folder_item_to_json(
-            child_folder,
-            server_id,
-            child_count,
-        ));
-    }
+    let mut values =
+        physical_folder_nodes(db, folder, &child_folders, server_id, direct_child_count).await?;
     if folder.collection_type.as_deref() != Some("tvshows") {
         return Ok(values);
     }
@@ -95382,20 +95527,17 @@ done
         assert_eq!(ratings[43]["Value"], 17);
     }
 
-    /// Characterize what a bare `ParentId` browse returns for a TV library.
+    /// A bare `ParentId` browse of a TV library lists its series, paged.
     ///
-    /// This pins current behaviour rather than desired behaviour. The shape returns every episode
-    /// row in the folder *plus* a synthesized Folder node and a Series and Season node per series,
-    /// so its response grows with the episode count: a library holding 460k episodes is asked for
-    /// ~470k items in one response. That is why the bounded catalogue repository deliberately
-    /// declines this shape (`media_catalog_query_for_items` requires an explicit page size) and why
-    /// narrowing the source alone cannot make it affordable. Any future redesign has to page the
-    /// union of persisted rows and synthesized nodes; this test is the baseline it must preserve.
+    /// `ParentId` addresses the library level, and that level is the series. The listing used to
+    /// return every episode row in the folder plus a synthesized Series and Season node per series,
+    /// so its response grew with the episode count -- a library holding 460k episodes was asked for
+    /// ~470k items in one response, and no page size helped because the rows were hydrated before
+    /// paging. Episodes and seasons are reached through the series below, so this level answers from
+    /// the durable series projection instead.
     #[tokio::test]
-    // Creating a library bumps the process-wide DLNA content-directory counter, which other tests
-    // assert on exactly. Share the serialization key the neighbouring library tests already use.
     #[serial(playback_events)]
-    async fn bare_parent_browse_on_tv_library_returns_every_episode_and_synthesized_nodes() {
+    async fn bare_parent_browse_on_tv_library_lists_series_and_pages() {
         let tmp = tempfile::tempdir().unwrap();
         let storage_root = tempfile::tempdir().unwrap();
         let season = tmp.path().join("Show One").join("Season 01");
@@ -95473,26 +95615,54 @@ done
                 .unwrap()
             }
         };
+        let named = |result: &Value| {
+            result["Items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| {
+                    (
+                        item["Type"].as_str().unwrap().to_string(),
+                        item["Name"].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
 
         // Only the persisted episode rows exist without a parent scope.
         let all = json_for(format!("/Users/{user_id}/Items")).await;
         assert_eq!(all["TotalRecordCount"], 4);
         let parent_id = all["Items"][0]["ParentId"].as_str().unwrap().to_string();
 
-        let bare = json_for(format!("/Users/{user_id}/Items?ParentId={parent_id}")).await;
-        let mut counts = BTreeMap::<String, usize>::new();
-        for item in bare["Items"].as_array().unwrap() {
-            *counts
-                .entry(item["Type"].as_str().unwrap().to_string())
-                .or_default() += 1;
+        let browse = json_for(format!("/Users/{user_id}/Items?ParentId={parent_id}")).await;
+        let mut entries = named(&browse);
+        entries.sort();
+        assert_eq!(
+            entries,
+            vec![
+                ("Folder".to_string(), "Shows".to_string()),
+                ("Series".to_string(), "Show One".to_string()),
+                ("Series".to_string(), "Show Two".to_string()),
+            ],
+            "the library level lists its series and itself, not the episodes below them"
+        );
+        assert_eq!(browse["TotalRecordCount"], 3);
+
+        // The same set is reachable one page at a time, and the total does not change with paging.
+        let mut paged = Vec::new();
+        for start_index in 0..3 {
+            let page = json_for(format!(
+                "/Users/{user_id}/Items?ParentId={parent_id}&Limit=1&StartIndex={start_index}"
+            ))
+            .await;
+            assert_eq!(page["TotalRecordCount"], 3, "start index {start_index}");
+            assert_eq!(page["StartIndex"], start_index);
+            let entries = named(&page);
+            assert_eq!(entries.len(), 1, "start index {start_index}");
+            paged.extend(entries);
         }
-        // Every episode survives alongside one Series and one Season node per series, plus the
-        // physical folder: the response is the whole folder, not a page of it.
-        assert_eq!(bare["TotalRecordCount"], 9);
-        assert_eq!(counts.get("Episode").copied(), Some(4));
-        assert_eq!(counts.get("Series").copied(), Some(2));
-        assert_eq!(counts.get("Season").copied(), Some(2));
-        assert_eq!(counts.get("Folder").copied(), Some(1));
+        paged.sort();
+        assert_eq!(paged, entries, "paging must cover the listing exactly once");
     }
 
     #[tokio::test]
