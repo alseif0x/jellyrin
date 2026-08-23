@@ -34314,7 +34314,7 @@ async fn items_result(
         return tv_series_items_result(&state.db, &query, requested_user_id, &server_id).await;
     }
     let filtered_items = filtered_media_items(
-        state.db.media_items().await?,
+        media_items_source_for_query(&state.db, &query).await?,
         &query,
         requested_user_id,
         &state.db,
@@ -34449,7 +34449,7 @@ async fn user_items_result(
             .await;
     }
     let filtered_items = filtered_media_items(
-        state.db.media_items().await?,
+        media_items_source_for_query(&state.db, &query).await?,
         &query,
         Some(requested_user_id),
         &state.db,
@@ -35078,7 +35078,7 @@ async fn item_counts(
         return Ok(Json(counts));
     }
     let filtered_items = filtered_media_items(
-        state.db.media_items().await?,
+        media_items_source_for_query(&state.db, &query).await?,
         &query,
         requested_user_id,
         &state.db,
@@ -35113,7 +35113,7 @@ async fn user_item_counts(
         return Ok(Json(counts));
     }
     let filtered_items = filtered_media_items(
-        state.db.media_items().await?,
+        media_items_source_for_query(&state.db, &query).await?,
         &query,
         Some(requested_user_id),
         &state.db,
@@ -50494,7 +50494,7 @@ async fn search_hints(
     // every request shape outside the bounded repository contract.
     query.search_term = None;
     let items = filtered_media_items(
-        state.db.media_items().await?,
+        media_items_source_for_query(&state.db, &query).await?,
         &query,
         requested_user_id,
         &state.db,
@@ -54728,6 +54728,13 @@ async fn filtered_items_for_query_from_source(
     filtered_media_items(source_items, &scoped_query, requested_user_id, &state.db).await
 }
 
+/// Bounded listing source for an [`ItemsQuery`].
+///
+/// A `ParentId` query only ever retains items inside that parent's virtual-folder subtree, so
+/// materialising the whole catalogue for one only wastes work and exceeds PostgreSQL's statement
+/// timeout at catalogue scale. Narrowing here cannot change a response: [`filtered_media_items`]
+/// applies the identical folder predicate to whatever source it receives, and queries without a
+/// `ParentId` still read the full catalogue.
 async fn media_items_source_for_query(
     db: &Database,
     query: &ItemsQuery,
@@ -95178,6 +95185,145 @@ done
         assert_eq!(ratings[0]["Name"], "Unrated");
         assert_eq!(ratings[43]["Name"], "TV-MA");
         assert_eq!(ratings[43]["Value"], 17);
+    }
+
+    /// A bare `ParentId` listing must read only that parent's folder items.
+    ///
+    /// Materialising the whole catalogue to serve one library made `/Items` and
+    /// `/Users/{id}/Items` exceed the API statement timeout once the catalogue grew, so the
+    /// listing handlers share the bounded source. Telemetry proves the folder-scoped query ran;
+    /// the payloads prove narrowing did not change what either request shape returns.
+    #[tokio::test]
+    async fn bare_parent_id_listing_reads_only_the_parent_folder() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let storage_root = tempfile::tempdir().unwrap();
+        tokio::fs::write(first.path().join("First Movie.mp4"), b"fake video")
+            .await
+            .unwrap();
+        tokio::fs::write(second.path().join("Second Movie.mp4"), b"fake video")
+            .await
+            .unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let user = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let api_key = db
+            .issue_api_key_for_user(user.id, "test-key")
+            .await
+            .unwrap();
+        let user_id = user.id.simple().to_string();
+        let test_db = db.clone();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: storage_root.path().join("logs"),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        for (name, root) in [("First", first.path()), ("Second", second.path())] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(format!(
+                            "/Library/VirtualFolders?name={name}&collectionType=movies&paths={}",
+                            root.to_string_lossy()
+                        ))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        }
+
+        let folder_items_calls = |db: &Database| {
+            db.telemetry_diagnostics()
+                .operations
+                .iter()
+                .find(|operation| operation.name == "catalog.folder_items")
+                .map_or(0, |operation| operation.calls)
+        };
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Users/{user_id}/Items"))
+                    .header("X-Emby-Token", &api_key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let unscoped: Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        let names = |result: &Value| {
+            result["Items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["Name"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        let unscoped_names = names(&unscoped);
+        assert!(
+            unscoped_names.iter().any(|name| name == "First Movie")
+                && unscoped_names.iter().any(|name| name == "Second Movie"),
+            "a query without ParentId still reads the whole catalogue: {unscoped_names:?}"
+        );
+        let parent_id = unscoped["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["Name"] == "First Movie")
+            .and_then(|item| item["ParentId"].as_str())
+            .unwrap()
+            .to_string();
+
+        for uri in [
+            format!("/Users/{user_id}/Items?ParentId={parent_id}"),
+            format!("/Items?ParentId={parent_id}&UserId={user_id}"),
+        ] {
+            let before = folder_items_calls(&test_db);
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(&uri)
+                        .header("X-Emby-Token", &api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            let scoped: Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            // The bare shape also reports the physical folder itself, so assert on membership:
+            // the scoped page keeps this library and never reaches the sibling one.
+            let scoped_names = names(&scoped);
+            assert!(
+                scoped_names.iter().any(|name| name == "First Movie"),
+                "{uri} lost its own item: {scoped_names:?}"
+            );
+            assert!(
+                !scoped_names.iter().any(|name| name == "Second Movie"),
+                "{uri} leaked another library's item: {scoped_names:?}"
+            );
+            assert!(
+                folder_items_calls(&test_db) > before,
+                "{uri} must read the parent folder instead of the whole catalogue"
+            );
+        }
     }
 
     #[tokio::test]
