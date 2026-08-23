@@ -95786,6 +95786,117 @@ done
         assert_eq!(ratings[43]["Value"], 17);
     }
 
+    /// A shared catalogue page must still report each user's own watch state.
+    ///
+    /// Movie and plugin-VOD libraries answer from the bounded catalogue page, which is now shared
+    /// between users. The cached entry has no room for a playback state and one is attached per
+    /// request, so this pins the outcome of that: what one user has played stays theirs.
+    #[tokio::test]
+    #[serial(playback_events)]
+    async fn shared_catalogue_page_reports_each_user_own_watch_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage_root = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("Example Movie.mp4"), vec![b'v'; 4_096])
+            .await
+            .unwrap();
+
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let watcher = db
+            .update_first_user("admin".to_string(), "secret")
+            .await
+            .unwrap();
+        let bystander = db.create_user("second", Some("secret")).await.unwrap();
+        let api_key = db
+            .issue_api_key_for_user(watcher.id, "watcher-key")
+            .await
+            .unwrap();
+        let watcher_id = watcher.id.simple().to_string();
+        let bystander_id = bystander.id.simple().to_string();
+        let app = router(AppState {
+            db,
+            web_dir: ".".into(),
+            log_dir: storage_root.path().join("logs"),
+            local_address: "http://127.0.0.1:8097".to_string(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!(
+                        "/Library/VirtualFolders?name=Movies&collectionType=movies&paths={}",
+                        tmp.path().to_string_lossy()
+                    ))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let call = |uri: String, method: Method| {
+            let app = app.clone();
+            let api_key = api_key.clone();
+            async move {
+                let response = app
+                    .oneshot(
+                        Request::builder()
+                            .method(method)
+                            .uri(uri)
+                            .header("X-Emby-Token", &api_key)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from("{}"))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                (status, body)
+            }
+        };
+        // The bounded catalogue page serves this shape: an explicit item type and page size.
+        let listing = |user: &str| {
+            call(
+                format!(
+                    "/Users/{user}/Items?IncludeItemTypes=Movie&Recursive=true&SortBy=SortName&Limit=10"
+                ),
+                Method::GET,
+            )
+        };
+
+        let (status, body) = listing(&watcher_id).await;
+        assert_eq!(status, StatusCode::OK);
+        let first: Value = serde_json::from_slice(&body).unwrap();
+        let movie_id = first["Items"][0]["Id"].as_str().unwrap().to_string();
+        assert_eq!(first["Items"][0]["UserData"]["Played"], false);
+
+        let (status, _) = call(
+            format!("/Users/{watcher_id}/PlayedItems/{movie_id}"),
+            Method::POST,
+        )
+        .await;
+        assert!(status.is_success(), "marking played failed: {status}");
+
+        let played = |body: &[u8]| {
+            serde_json::from_slice::<Value>(body).unwrap()["Items"][0]["UserData"]["Played"].clone()
+        };
+        let (_, watcher_body) = listing(&watcher_id).await;
+        let (_, bystander_body) = listing(&bystander_id).await;
+        assert_eq!(
+            played(&watcher_body),
+            serde_json::json!(true),
+            "the watching user sees their own progress"
+        );
+        assert_eq!(
+            played(&bystander_body),
+            serde_json::json!(false),
+            "the other user must not inherit it from a shared page"
+        );
+    }
+
     /// A shared series page must still report each user's own watch state.
     ///
     /// The catalogue half of a library page is assembled once and shared between users, so the
