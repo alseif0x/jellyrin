@@ -942,6 +942,34 @@ pub struct TvSeriesCatalogKey {
     pub name: String,
 }
 
+/// One user's watch progress over a projected series.
+///
+/// A series listing is identical for every user apart from this, so it is read separately: the
+/// catalogue half can then be computed once and shared, while this half stays per user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TvSeriesPlaybackSummary {
+    pub series_id: String,
+    pub episode_count: u64,
+    pub unplayed_count: u64,
+}
+
+#[derive(sqlx::FromRow)]
+struct TvSeriesPlaybackSummaryRow {
+    series_id: String,
+    episode_count: i64,
+    unplayed_count: i64,
+}
+
+impl From<TvSeriesPlaybackSummaryRow> for TvSeriesPlaybackSummary {
+    fn from(row: TvSeriesPlaybackSummaryRow) -> Self {
+        Self {
+            series_id: row.series_id,
+            episode_count: u64::try_from(row.episode_count).unwrap_or_default(),
+            unplayed_count: u64::try_from(row.unplayed_count).unwrap_or_default(),
+        }
+    }
+}
+
 /// Name predicates applied before counting and paging the synthetic TV-Series projection.
 #[derive(Debug, Clone, Default)]
 pub struct TvSeriesCatalogNameFilter {
@@ -1838,6 +1866,14 @@ pub trait MediaCatalogStore: DatabaseBackend {
         item_ids: &'a [Uuid],
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<PlaybackState>>> + Send + 'a;
 
+    /// Episode and unplayed counts per projected series for one user.
+    fn tv_series_playback_summary<'a>(
+        &'a self,
+        virtual_folder_id: Uuid,
+        series_ids: &'a [String],
+        user_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<TvSeriesPlaybackSummary>>> + Send + 'a;
+
     /// Exact visible catalogue candidates for the requested public Jellyfin item types, with
     /// metadata loaded inline and without an artificial page limit. Type matching uses the same
     /// effective-type rules as `media_item_catalog_page`; an empty type list returns no rows.
@@ -2024,6 +2060,16 @@ impl MediaCatalogStore for PostgresDatabase {
         item_ids: &'a [Uuid],
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<PlaybackState>>> + Send + 'a {
         PostgresDatabase::playback_states_for_items(self, user_id, item_ids)
+    }
+
+    fn tv_series_playback_summary<'a>(
+        &'a self,
+        virtual_folder_id: Uuid,
+        series_ids: &'a [String],
+        user_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<TvSeriesPlaybackSummary>>> + Send + 'a
+    {
+        PostgresDatabase::tv_series_playback_summary(self, virtual_folder_id, series_ids, user_id)
     }
 
     fn media_items_with_metadata_by_effective_types<'a>(
@@ -2255,6 +2301,16 @@ impl MediaCatalogStore for SqliteDatabase {
         item_ids: &'a [Uuid],
     ) -> impl std::future::Future<Output = anyhow::Result<Vec<PlaybackState>>> + Send + 'a {
         SqliteDatabase::playback_states_for_items(self, user_id, item_ids)
+    }
+
+    fn tv_series_playback_summary<'a>(
+        &'a self,
+        virtual_folder_id: Uuid,
+        series_ids: &'a [String],
+        user_id: Uuid,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<TvSeriesPlaybackSummary>>> + Send + 'a
+    {
+        SqliteDatabase::tv_series_playback_summary(self, virtual_folder_id, series_ids, user_id)
     }
 
     fn media_items_with_metadata_by_effective_types<'a>(
@@ -9536,6 +9592,42 @@ impl SqliteDatabase {
             TvSeriesCatalogNameFilter::default(),
         )
         .await
+    }
+
+    pub async fn tv_series_playback_summary(
+        &self,
+        virtual_folder_id: Uuid,
+        series_ids: &[String],
+        user_id: Uuid,
+    ) -> anyhow::Result<Vec<TvSeriesPlaybackSummary>> {
+        if series_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Bind the identifiers as one JSON array so the statement itself stays static: this crate
+        // forbids assembling SQL text at runtime.
+        let series_ids_json = serde_json::to_string(series_ids)?;
+        let rows = sqlx::query_as::<_, TvSeriesPlaybackSummaryRow>(
+            r#"
+            SELECT member.series_id AS series_id,
+                   COUNT(*) AS episode_count,
+                   SUM(CASE WHEN COALESCE(playback.played, 0) = 0 THEN 1 ELSE 0 END)
+                       AS unplayed_count
+            FROM media_item_tv_series_members AS member
+            JOIN media_items AS item
+              ON item.id = member.item_id AND item.missing_since IS NULL
+            LEFT JOIN playback_states AS playback
+              ON playback.item_id = member.item_id AND playback.user_id = ?1
+            WHERE member.virtual_folder_id = ?2
+              AND member.series_id IN (SELECT value FROM json_each(?3))
+            GROUP BY member.series_id
+            "#,
+        )
+        .bind(user_id.to_string())
+        .bind(virtual_folder_id.to_string())
+        .bind(series_ids_json)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
     }
 
     pub async fn tv_series_catalog_search_page(

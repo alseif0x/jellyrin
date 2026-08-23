@@ -1862,6 +1862,45 @@ impl PostgresDatabase {
         .await
     }
 
+    pub async fn tv_series_playback_summary(
+        &self,
+        virtual_folder_id: Uuid,
+        series_ids: &[String],
+        user_id: Uuid,
+    ) -> anyhow::Result<Vec<super::TvSeriesPlaybackSummary>> {
+        if series_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query_as::<_, PostgresTvSeriesPlaybackSummaryRow>(
+            r#"
+            SELECT member.series_id AS series_id,
+                   COUNT(*)::bigint AS episode_count,
+                   COUNT(*) FILTER (WHERE playback.played IS NOT TRUE)::bigint AS unplayed_count
+            FROM media_item_tv_series_members AS member
+            JOIN media_items AS item
+              ON item.id = member.item_id AND item.missing_since IS NULL
+            LEFT JOIN playback_states AS playback
+              ON playback.item_id = member.item_id AND playback.user_id = $1
+            WHERE member.virtual_folder_id = $2
+              AND member.series_id = ANY($3)
+            GROUP BY member.series_id
+            "#,
+        )
+        .bind(user_id)
+        .bind(virtual_folder_id)
+        .bind(series_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| super::TvSeriesPlaybackSummary {
+                series_id: row.series_id,
+                episode_count: u64::try_from(row.episode_count).unwrap_or_default(),
+                unplayed_count: u64::try_from(row.unplayed_count).unwrap_or_default(),
+            })
+            .collect())
+    }
+
     pub async fn tv_series_catalog_search_page(
         &self,
         virtual_folder_id: Option<Uuid>,
@@ -6014,6 +6053,13 @@ impl PostgresDatabase {
         .await?;
         Ok(rows.into_iter().map(Into::into).collect())
     }
+}
+
+#[derive(sqlx::FromRow)]
+struct PostgresTvSeriesPlaybackSummaryRow {
+    series_id: String,
+    episode_count: i64,
+    unplayed_count: i64,
 }
 
 const POSTGRES_MEDIA_ITEM_TYPE_SQL: &str = r#"CASE

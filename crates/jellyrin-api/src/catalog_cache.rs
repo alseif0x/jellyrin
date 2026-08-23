@@ -17,7 +17,10 @@ use uuid::Uuid;
 use crate::Database;
 
 const CACHE_NAMESPACE: &str = "jellyrin:catalog:v2";
-const MAX_CACHE_VALUE_BYTES: usize = 64 * 1024;
+// A rendered listing page is the largest thing kept here: a hundred series serialize to roughly
+// 200 KB. Redis runs with `allkeys-lru`, so a generous ceiling costs nothing beyond evicting colder
+// keys sooner, while a 64 KB one silently refused every page.
+const MAX_CACHE_VALUE_BYTES: usize = 512 * 1024;
 const MAX_SINGLE_FLIGHT_KEYS: usize = 128;
 const STARTUP_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const FAILURE_BYPASS: Duration = Duration::from_secs(5);
@@ -262,6 +265,74 @@ async fn database_facet_display_values(
         .into_iter()
         .map(|facet| facet.display_value)
         .collect(),
+    )
+}
+
+/// Serve a shared catalogue payload, computing it once per key while it is absent.
+///
+/// The payload must be identical for every user: anything per-user is applied by the caller after
+/// this returns. The per-key lane is what keeps an expiry from fanning the same computation out
+/// across every concurrent request for it.
+pub(crate) async fn cached_shared_payload<T, F, Fut>(key: &str, compute: F) -> anyhow::Result<T>
+where
+    T: Serialize + DeserializeOwned,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    let Some(cache) = SHARED_CATALOG_CACHE.get() else {
+        return compute().await;
+    };
+    match cache.get::<T>(key).await {
+        CacheLookup::Hit(payload) => return Ok(payload),
+        CacheLookup::Unavailable => return compute().await,
+        CacheLookup::Miss => {}
+    }
+    let fill_lock = cache.fill_lock(key).await;
+    let _fill_guard = fill_lock.lock().await;
+    match cache.get::<T>(key).await {
+        CacheLookup::Hit(payload) => return Ok(payload),
+        CacheLookup::Unavailable => return compute().await,
+        CacheLookup::Miss => {}
+    }
+    let payload = compute().await?;
+    cache.put(key, &payload).await;
+    Ok(payload)
+}
+
+/// Key for one page of a folder's series listing.
+///
+/// The catalogue half of that page is the same for every user, so the key deliberately carries no
+/// user: only what changes the rows. Freshness comes from the cache TTL, which is what bounds how
+/// long a republished folder can still answer from an older page, and the visibility scope keeps a
+/// caller whose plugin catalogues are restricted from reading a page assembled for an unrestricted
+/// one.
+pub(crate) fn tv_series_listing_cache_key(
+    virtual_folder_id: Option<Uuid>,
+    start_index: usize,
+    limit: usize,
+    include_total: bool,
+    name_filter: &str,
+    visibility_scope: Option<&[String]>,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(name_filter.as_bytes());
+    digest.update([0]);
+    match visibility_scope {
+        None => digest.update(b"all"),
+        Some(scope) => {
+            let mut scope = scope.to_vec();
+            scope.sort();
+            scope.dedup();
+            for tuner in scope {
+                digest.update(tuner.as_bytes());
+                digest.update([0]);
+            }
+        }
+    }
+    format!(
+        "{CACHE_NAMESPACE}:tv-series-page:{}:{start_index}:{limit}:{include_total}:{:x}",
+        virtual_folder_id.map_or_else(|| "all".to_string(), |id| id.simple().to_string()),
+        digest.finalize()
     )
 }
 

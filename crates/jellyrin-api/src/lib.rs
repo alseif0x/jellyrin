@@ -56170,6 +56170,52 @@ fn query_requests_item_type(query: &ItemsQuery, item_type: &str) -> bool {
         .any(|include_type| include_type.eq_ignore_ascii_case(item_type))
 }
 
+/// One shared page of a library's series listing.
+///
+/// Holds the catalogue half only. `series_ids` keeps the projection's identifiers alongside the
+/// rendered rows so the per-user watch state can be applied without re-deriving them.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TvSeriesListingPage {
+    items: Vec<serde_json::Value>,
+    series_ids: Vec<String>,
+    total_record_count: usize,
+    start_index: usize,
+}
+
+/// Apply one user's watch state to a shared series page.
+///
+/// Counts come from a single aggregate over the projection's membership rows, so this stays a
+/// bounded per-request read no matter how large the library is.
+async fn overlay_tv_series_user_data(
+    db: &Database,
+    virtual_folder_id: Uuid,
+    series_ids: &[String],
+    user_id: Uuid,
+    items: &mut [serde_json::Value],
+) -> Result<(), ApiError> {
+    let summaries =
+        MediaCatalogStore::tv_series_playback_summary(db, virtual_folder_id, series_ids, user_id)
+            .await?;
+    let by_series = summaries
+        .iter()
+        .map(|summary| (summary.series_id.as_str(), summary))
+        .collect::<HashMap<_, _>>();
+    for (item, series_id) in items.iter_mut().zip(series_ids) {
+        let Some(user_data) = item.get_mut("UserData") else {
+            continue;
+        };
+        let (episode_count, unplayed_count) =
+            by_series.get(series_id.as_str()).map_or((0, 0), |summary| {
+                (summary.episode_count, summary.unplayed_count)
+            });
+        let played = episode_count > 0 && unplayed_count == 0;
+        user_data["Played"] = serde_json::json!(played);
+        user_data["UnplayedItemCount"] = serde_json::json!(unplayed_count);
+        user_data["PlayedPercentage"] = serde_json::json!(if played { 100.0 } else { 0.0 });
+    }
+    Ok(())
+}
+
 async fn tv_series_items_result(
     db: &Database,
     query: &ItemsQuery,
@@ -56202,81 +56248,116 @@ async fn tv_series_items_result(
     if query_requests_only_item_type(query, "Series")
         && fast_name_search_query_is_simple(&simple_catalog_query)
         && let Some(virtual_folder_id) = catalog_virtual_folder_id
-        && let Some(page) = db
-            .tv_series_catalog_search_page(
-                virtual_folder_id,
-                query.start_index.unwrap_or(0),
-                query
-                    .limit
-                    .unwrap_or(25)
-                    .min(MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE),
-                query_flag(&query._enable_total_record_count).unwrap_or(true),
-                TvSeriesCatalogNameFilter {
-                    search_term: query.search_term.clone(),
-                    starts_with: query.name_starts_with.clone(),
-                    starts_with_or_greater: query.name_starts_with_or_greater.clone(),
-                    less_than: query.name_less_than.clone(),
-                },
-            )
-            .await?
     {
-        // The page above is served either from the durable projection or, while that is unpublished,
-        // from the bounded live grouping. Publishing it costs seconds, so it happens in the background
-        // and the request is never delayed by it; a folder that is already published makes this a
-        // single indexed lookup.
-        if let Some(virtual_folder_id) = virtual_folder_id {
-            schedule_tv_series_projection_rebuild(db, virtual_folder_id);
-        }
-        let episode_ids = page
-            .episodes
-            .iter()
-            .map(|entry| entry.item.id)
-            .collect::<Vec<_>>();
-        let playback_by_item = if let Some(user_id) = user_id {
-            MediaCatalogStore::playback_states_for_items(db, user_id, &episode_ids)
-                .await?
-                .into_iter()
-                .map(|state| (state.item_id, state))
-                .collect::<HashMap<_, _>>()
-        } else {
-            HashMap::new()
+        let start_index = query.start_index.unwrap_or(0);
+        let limit = query
+            .limit
+            .unwrap_or(25)
+            .min(MEDIA_ITEM_CATALOG_MAX_PAGE_SIZE);
+        let include_total = query_flag(&query._enable_total_record_count).unwrap_or(true);
+        let name_filter = TvSeriesCatalogNameFilter {
+            search_term: query.search_term.clone(),
+            starts_with: query.name_starts_with.clone(),
+            starts_with_or_greater: query.name_starts_with_or_greater.clone(),
+            less_than: query.name_less_than.clone(),
         };
-        let mut grouped = HashMap::<String, TvSeriesSummary>::new();
-        for entry in &page.episodes {
-            let Some(info) = tv_episode_info(&entry.item) else {
-                continue;
-            };
-            let Some(series_id) = first_metadata_value_from_json(&entry.metadata, &["SeriesId"])
+        let filter_fingerprint = [
+            name_filter.search_term.as_deref().unwrap_or_default(),
+            name_filter.starts_with.as_deref().unwrap_or_default(),
+            name_filter
+                .starts_with_or_greater
+                .as_deref()
+                .unwrap_or_default(),
+            name_filter.less_than.as_deref().unwrap_or_default(),
+        ]
+        .join("\u{1f}");
+        let cache_key = catalog_cache::tv_series_listing_cache_key(
+            virtual_folder_id,
+            start_index,
+            limit,
+            include_total,
+            &filter_fingerprint,
+            query.allowed_plugin_tuner_ids.as_deref(),
+        );
+        // Every user browsing a library asks for the same pages of it, so assemble the catalogue
+        // half once and share it. Watch state is the only part that differs, and it is applied
+        // below for whoever is asking, so a shared entry cannot carry one user's progress to
+        // another.
+        let cached = catalog_cache::cached_shared_payload(&cache_key, || async {
+            let Some(page) = db
+                .tv_series_catalog_search_page(
+                    virtual_folder_id,
+                    start_index,
+                    limit,
+                    include_total,
+                    name_filter.clone(),
+                )
+                .await?
             else {
-                continue;
+                return Ok(None);
             };
-            let summary = grouped
-                .entry(series_id.trim().to_string())
-                .or_insert_with(|| TvSeriesSummary::new(info.series_name.clone()));
-            summary.add_episode(
-                &entry.item,
-                &info,
-                Some(&entry.metadata),
-                playback_by_item.get(&entry.item.id),
-            );
+            // The page above is served either from the durable projection or, while that is
+            // unpublished, from the bounded live grouping. Publishing it costs seconds, so it
+            // happens in the background and the request is never delayed by it; a folder that is
+            // already published makes this a single indexed lookup.
+            if let Some(virtual_folder_id) = virtual_folder_id {
+                schedule_tv_series_projection_rebuild(db, virtual_folder_id);
+            }
+            let mut grouped = HashMap::<String, TvSeriesSummary>::new();
+            for entry in &page.episodes {
+                let Some(info) = tv_episode_info(&entry.item) else {
+                    continue;
+                };
+                let Some(series_id) =
+                    first_metadata_value_from_json(&entry.metadata, &["SeriesId"])
+                else {
+                    continue;
+                };
+                let summary = grouped
+                    .entry(series_id.trim().to_string())
+                    .or_insert_with(|| TvSeriesSummary::new(info.series_name.clone()));
+                // Deliberately no playback: this payload is shared.
+                summary.add_episode(&entry.item, &info, Some(&entry.metadata), None);
+            }
+            let mut series_ids = Vec::with_capacity(page.series.len());
+            let items = page
+                .series
+                .iter()
+                .map(|series| {
+                    let mut summary = grouped
+                        .remove(&series.id)
+                        .unwrap_or_else(|| TvSeriesSummary::new(series.name.clone()));
+                    summary.id.get_or_insert_with(|| series.id.clone());
+                    series_ids.push(series.id.clone());
+                    shape_catalog_item_for_query(tv_series_json(server_id, summary), query)
+                })
+                .collect::<Vec<_>>();
+            Ok(Some(TvSeriesListingPage {
+                items,
+                series_ids,
+                total_record_count: page.total_record_count,
+                start_index: page.start_index,
+            }))
+        })
+        .await?;
+
+        if let Some(mut payload) = cached {
+            if let (Some(user_id), Some(folder_id)) = (user_id, virtual_folder_id) {
+                overlay_tv_series_user_data(
+                    db,
+                    folder_id,
+                    &payload.series_ids,
+                    user_id,
+                    &mut payload.items,
+                )
+                .await?;
+            }
+            return Ok(Json(query_result_with_total(
+                payload.items,
+                payload.total_record_count,
+                payload.start_index,
+            )));
         }
-        let items = page
-            .series
-            .iter()
-            .map(|series| {
-                let mut summary = grouped
-                    .remove(&series.id)
-                    .unwrap_or_else(|| TvSeriesSummary::new(series.name.clone()));
-                summary.id.get_or_insert_with(|| series.id.clone());
-                summary
-            })
-            .map(|summary| shape_catalog_item_for_query(tv_series_json(server_id, summary), query))
-            .collect::<Vec<_>>();
-        return Ok(Json(query_result_with_total(
-            items,
-            page.total_record_count,
-            page.start_index,
-        )));
     }
 
     let mut episode_query = query.clone();
