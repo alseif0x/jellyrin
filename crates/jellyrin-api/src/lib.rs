@@ -70370,18 +70370,29 @@ mod tests {
 
         // Jellyfin Web deliberately omits credentials from `<img>` URLs. The authenticated Latest
         // listing must therefore queue the provider fill before the public image request arrives.
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri(&image_uri)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let listing_warmed_body = response.into_body().collect().await.unwrap().to_bytes();
+        // Queueing that fill is asynchronous, so a public request can arrive before the listing has
+        // registered it and be answered with the placeholder instead of waiting. An anonymous
+        // request never starts provider work, so retrying costs nothing upstream: poll until the
+        // queued fill lands rather than depending on winning that race.
+        let mut listing_warmed_body = axum::body::Bytes::new();
+        for _ in 0..100 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(&image_uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            listing_warmed_body = response.into_body().collect().await.unwrap().to_bytes();
+            if listing_warmed_body.as_ref() == expected_image.as_slice() {
+                break;
+            }
+            tokio::time::sleep(StdDuration::from_millis(50)).await;
+        }
         assert_eq!(listing_warmed_body.as_ref(), expected_image.as_slice());
         let upstream_request = image_request.await.unwrap();
         assert!(upstream_request.starts_with(&format!("GET {image_url} HTTP/1.1")));
