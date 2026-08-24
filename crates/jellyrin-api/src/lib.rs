@@ -90794,7 +90794,10 @@ done
             "Name": "Test Channel",
             "ChannelId": "hdhr_4.1",
             "StartDate": format_time_for_json(now - Duration::seconds(5)),
-            "EndDate": format_time_for_json(now + Duration::seconds(1)),
+            // The window has to outlast starting the recording, not just the copy itself: a loaded
+            // machine can spend most of a second getting here, and a window that has already closed
+            // produces no completed recording at all.
+            "EndDate": format_time_for_json(now + Duration::seconds(4)),
             "PostPaddingSeconds": 0,
             "IsSeries": false,
         });
@@ -117762,7 +117765,9 @@ done
                 "Name": "Legacy Recording",
                 "ChannelId": "hdhr_9",
                 "StartDate": crate::format_time_for_json(now - time::Duration::seconds(1)),
-                "EndDate": crate::format_time_for_json(now + time::Duration::seconds(1)),
+                // Same reason as the tuner recording test: the window has to outlast starting the
+                // recording, and a closed window leaves no completed recording to assert on.
+                "EndDate": crate::format_time_for_json(now + time::Duration::seconds(4)),
                 "PostPaddingSeconds": 0,
                 "IsSeries": false,
             });
